@@ -205,6 +205,73 @@ for caching. `PVISOR_FS_PROFILE=1` reports Core hit/miss/eviction counters; the
 shared Core README specifies bounds and exact measurement names. No real guest
 performance claim is made by these contract tests.
 
+## 不可变只读文件的 DAX
+
+`VmConfiguration::immutable_filesystem(tag, path, window_size)` 为独立的、
+物理内容不可变的目录建立只读 virtio-fs share。当前支持 Linux x86_64/KVM，
+不支持 TEE/Nitro；其他平台通过相同 API 返回 `Unsupported`。调用方须在
+VM 生命周期内持有目录的不可变所有权，包括 metadata、目录结构、祖先、
+挂载身份与 hardlink 别名；guest 的 `ro` 挂载本身不构成这个保证。
+
+DAX 默认关闭。普通 `filesystem(..., 0)` 与 `overlay(..., 0)` 不创建 DAX
+窗口；CLI 的 staged rootfs 和 workspace 使用此默认路径。保留
+`immutable_filesystem` 作为显式启用入口，只有调用它才为独立不可变 share
+配置 DAX 窗口。
+
+显式不可变 share 的目录项及 LinuxComplete 属性 TTL 为 60 秒，guest 使用
+`dax=never` 时同样生效。普通只读 share 和可写 Overlay 保留原 TTL；
+LinuxSimplified 的属性仍不缓存，以保持请求 uid/gid 的语义。
+数据缓存策略保持原配置。
+
+```rust
+use pvisor_vm::api::{VmBuilder, VmConfiguration};
+use std::path::Path;
+
+fn attach_tools(vm: &mut VmBuilder, leased_directory: &Path) -> std::io::Result<()> {
+    vm.immutable_filesystem("tools", leased_directory, 128 << 20)
+}
+```
+
+guest 内核需要 virtio-fs DAX 支持，挂载使用
+`mount -t virtiofs -o ro,dax=inode tools /opt/tools`。同一 share 可使用
+`ro,dax=never` 关闭 guest DAX，走普通 READ；此时仍保留已配置的窗口及
+该 attachment 的生命周期、快照限制。只对宿主 regular backing
+file 返回 inode DAX hint；虚拟文件继续走普通 READ，不能对含虚拟文件的
+share 强制 `dax=always`。OPEN 和 metadata 仍经过 virtqueue；建立映射后，
+文件的 read/mmap 数据经共享窗口访问。窗口由 guest 按需回收和重映射，
+不把整个目录预读到 RAM。
+
+映射复用 OPEN 的原生 FD。Linux 的 SETUPMAPPING 使用 `fh=-1`，因此从
+该 inode 的活跃只读 handle 取得 Arc lease；没有活跃 handle 时拒绝新映射，
+不重新按路径打开文件。映射自身固定 backing，关闭 FD 不立即撤销已有映射。
+setup/remove 检查地址溢出、页对齐、窗口边界与重叠；批量 remove 先验证全部
+范围，移除后以匿名零页替换，不留下不可访问地址。尾部整页超出 EOF 时也
+使用零页，避免恶意物理地址读取引发宿主 SIGBUS。
+
+KVM 将整个窗口登记为只读 memory slot，使正常读取保持宿主文件页共享，
+guest 物理写入产生 MMIO exit。宿主映射保留 MAP_PRIVATE 的 COW 保护，
+设备 descriptor 若引用窗口也不能改写宿主 backing。guest 的 MAP_PRIVATE
+写入只改变自己的匿名页。窗口要求 2 MiB～1 GiB、以 2 MiB 为单位；它占用
+额外 guest 地址空间，resident 文件页和 COW 页仍计入宿主内存预算。
+
+可写 merged OverlayFS、普通 writable passthrough 的非零 `shm_size` 明确
+返回 `Unsupported`。DAX 与 snapshot profile、restore、freeze/capture 互斥，
+不通过省略映射状态生成不可恢复快照。该阶段只提供显式不可变 share 的
+数据路径，不声明现有 CLI 工作负载或启动时间已经加快。
+
+公开 API 的真实 guest 正确性用例为 `readonly_dax_case`：
+
+```bash
+cargo build --locked -p pvisor-vm --example readonly_dax_case
+target/debug/examples/readonly_dax_case ROOTFS FIRMWARE IMMUTABLE_DIRECTORY
+```
+
+ROOTFS 须包含 `/usr/bin/python3`，FIRMWARE 是支持 DAX 的 libkrunfw 文件；
+输入目录须含 `payload`，大小超过 6 MiB，第 i 个字节等于 `i % 251`。
+用例将 rootfs 写入隔离到临时 overlay；DAX 窗口仅 2 MiB，检查 inode hint、
+顺序/并行读取、mmap/私有 COW、关闭文件后的映射、虚拟文件普通读取和
+写入拒绝。PASS 是正确性结果，不是性能 benchmark。
+
 ## 验证入口
 
 `just test pvisor-vm` 运行设备、快照和接口契约测试；macOS 自动使用仓库既有 Hypervisor entitlement 签署测试程序。真实 HVF/KVM 和本地 socket 测试需要宿主权限。Linux 测试中创建 VM 的用例需要可用 `/dev/kvm`。
@@ -231,53 +298,101 @@ without treating their changed names as a change to the captured workload.
 
 ## virtio-fs 并发与冻结契约
 
-每个文件系统设备仍提供一个普通 request queue 和一个 hiprio queue。
-普通队列对可重叠的大 READ（请求至少 64 KiB）和目录读取，自动启动有界
-blocking I/O 线程池；即使只有一个长请求也交给线程池，避免后续 metadata
-和 hiprio 到达时队列 owner 仍在执行长 I/O。短元数据请求和需要串行的修改
-由队列 owner 内联处理。
-完成结果异步返回队列 owner，由 owner 独占 available/used ring 的更新。
-默认 worker 数为宿主可用 CPU 数，上限 4；在途请求（待执行、执行中、待发布）
-总数最多为已协商普通 virtqueue 的大小，设备最大 1024。worker 数不随队列
-深度增加。接纳完整有界队列避免长请求突发用满旧 `2 × workers` 额度后，
-停在下一条长请求上，挡住其后的短 metadata。短请求走内联路径，hiprio 的
-FORGET/INTERRUPT 也不占普通线程池容量。满额时仍停止接纳下一条长请求，
-防止异常 driver 导致无界 backlog；已接纳长请求按 FIFO 交给 worker。
-这里的异步指请求完成与队列分发解耦；文件 I/O 仍使用既有 pread/pwrite。
+设备提供一个 hiprio 和多个普通 request queues；默认普通队列数为宿主
+可用 CPU 数，上限 4，guest 可只初始化其中一部分。每个已初始化队列由
+专有线程直接取请求、执行和发布完成。hiprio 线程只处理 FORGET、
+BATCH_FORGET 和 INTERRUPT，不承担普通 I/O，也不参与 work stealing。
+INTERRUPT 当前不执行实际取消，独立队列不表示阻塞 syscall 可立即取消。
 
-线程间传递已校验的 descriptor 地址与长度，在执行线程内创建借用的
+普通线程通过自己的 epoll/kqueue 直接等待和消费 guest kick，并直接
+执行、发布请求；普通请求没有协调线程到 owner 的唤醒交接。线程优先
+服务自己的队列，空闲时只认领重操作持续至少 2 ms 的 owner ring 中
+尚未执行的请求，轮换 victim。READ/WRITE、同步和可能 copy-up 的修改
+操作属于候选；LOOKUP/GETATTR 等短操作不会仅因 busy 被偷取。
+2 ms 是耗时启发式，不证明宿主线程处于内核阻塞状态。
+
+控制线程只等待 stop，并每 2 ms 检查长操作与真实 ring backlog；有积压
+才唤醒一个已初始化的空闲 thief，不消费或转发普通 kick。队列线程空闲
+时无限期等待，不周期轮询；控制线程有上述周期检查成本。认领时在
+ring 锁内重新检查当前执行时长，拒绝过期救援提示。认领和 used-ring
+发布使用队列短锁，I/O 在锁外执行；已执行请求不迁移，完成回写原队列。
+没有中间工作列表或完成 channel，每个执行线程至多持有一个在途请求。
+所有普通线程都阻塞时没有额外救援线程。
+
+执行线程持有已校验的 descriptor 地址与长度，在执行线程内创建借用的
 Reader/Writer，保留 RAM access lease 直到 used ring 发布完成。禁止通过
 延长 VolatileSlice 的生命周期或新增 unsafe Send 绕过这个契约。
 FUSE header 只解码一次；INIT/DESTROY 独占 session guard。
 
-OverlayFs 的 READ、LOOKUP、GETATTR、目录查询和只读 OPEN 可共享 operation guard。
-带 O_APPEND/O_TRUNC、非只读或需要 kill_priv 的 OPEN，以及改名、copy-up、
-写入、release 与快照恢复仍使用独占 guard。只读 OPEN 的首次观察继续由
-Core 的逐路径 journal 事务同步，快照必须等待所有 operation guard 释放；
-读取通过 backing I/O 持有共享 guard，阻止原生句柄提前释放。文件句柄和
-不可变目录项只在查表时持有 handle map 锁，不把整张表锁带入 I/O。
+descriptor plan 在认领时校验全部输入、输出范围与累计长度；header
+按捕获地址读入固定大小对象，不构造临时 Reader/Writer。执行线程仅为
+body 与 reply 建立一次借用 consumer，不重新读取 opcode。队列主动
+drain 时保持 guest kick 通知关闭，仅在空队列时 enable/recheck 后休眠；
+控制线程独立检查长操作和 backlog，因此仍可救援正在执行的 owner。
+
+OverlayFs 的普通 READ/WRITE/FLUSH/FSYNC 直接在 handle map 和
+I/O admission 短锁内取得原生 Arc lease，不取得 namespace operation guard。
+原生文件锁协调该 handle 的读写与同步。namespace mutation、copy-up、
+writable OPEN 仍串行，但只关闭受影响 handle 的 admission
+并等待其在途 I/O：路径范围覆盖相关文件、目录子树和已知原生对象别名，
+RELEASE/RELEASEDIR 使用 namespace 读锁，允许无关元数据查询继续；RELEASE
+只等待被释放的 handle。FH GETATTR/LSEEK 的原生调用同样持有 admission
+lease，关闭不会撤销它们正在使用的 mapping；目录枚举持有 Arc 快照。
+scope 屏障保持到修改完成，失败也会释放。
+等待时不持有 handle map 或 admission 锁，无关 handle 的新 I/O 仍可进入。
+LOOKUP/GETATTR 和目录元数据查询仍遵循 operation guard 的 namespace
+串行约束。capture/restore/destroy 使用全局 admission 屏障并排空全部
+lease，普通 namespace 修改不使用 mount-wide I/O drain。
+普通 I/O lease 通过 Arc 共享不可变的 open 元数据，WRITE/FLUSH/FSYNC
+不再逐请求分配并复制保存路径。原生 descriptor lease 与 admission 屏障
+继续保护 I/O、release 和 freeze；快照保留原有 File handle 的序列化格式。
+GETATTR 与 backing attributes 的重复查询只在同一请求内复用，不缓存
+可变 backing 的跨请求结果。
+Linux regular-file LOOKUP 和无 FH GETATTR 保留 Core 的 namespace、
+父目录、hardlink 与策略检查，再通过原生父目录的强引用 FD 对最终名称
+执行 no-follow fstatat。每次查询重新读取属性，省去仅用于 metadata 回复
+的叶子 O_PATH FD、native inode 插入与 forget。ROOT_ID 继续绑定初始化时
+的根 FD；目录、符号链接、其他类型、macOS、OPEN 和 FH GETATTR 保留
+原生路径，virtual metadata 的回复处理保持原有规则。
 目录缓存用 `Arc` 持有原生 lookup 引用，借用者在缓存锁外执行 backing I/O；
 淘汰、失效和 clear 仅移除缓存所有权，最后一个借用者离开后才 forget。
 原生 inode 表在同一个 map 锁窗口内固定引用或仲裁插入，防止并发 lookup
 替换已返回的 inode，以及 final forget 与引用固定之间的竞争。
 
-freeze/reset 停止接收新请求，排空已接收请求、回填所有完成结果并 join
-全部 I/O worker 后才能返回。接纳窗口扩大后，冻结可能需等待更多已接纳
-I/O；不以丢弃这些请求缩短冻结。thaw/restore 主动扫描 available ring，不依赖
+freeze/reset 停止所有队列接收新请求，等待已认领请求发布 used ring，join
+hiprio 和普通线程后才能返回。未认领请求保留在 guest ring；不以丢弃在途
+请求缩短冻结。thaw/restore 主动扫描 available ring，不依赖
 guest 再发 kick。正在执行的请求不序列化进入快照；超时由现有 runner
 失败契约处理。公开 `api` 的结构和方法不随平台或 worker 数改变。
 
-宿主诊断变量 `PVISOR_VM_FS_WORKERS=1..8` 可设置每个设备的 worker 上限；
-`1` 禁用线程池分发。生产调用方通常不需要设置。`PVISOR_FS_PROFILE=1`
-会额外记录 `virtio-fs-dispatch` 的 inline/pool 请求数及创建的 worker 数；
+恢复机器在注册 MMIO/eventfd 前，从保存的队列清单恢复普通队列数，
+不重新按宿主 CPU 数推导拓扑。原有单普通队列快照仍按其原拓扑恢复。
+
+宿主诊断变量 `PVISOR_VM_FS_WORKERS=1..8` 现控制普通队列数量；`1`
+仍有独立 hiprio 线程。`PVISOR_FS_PROFILE=1` 记录 `virtio-fs-dispatch`
+的 direct、hiprio 和 stolen 请求数；
 带 profiling 的运行只用于诊断，不作为性能验收。
 
-本次调度变化只覆盖 VM virtio-fs，不改变宿主 FUSE 回调循环或写入/copy-up
-的独占锁约束。新增确定性回归检查长请求突发后的 GETATTR 可先完成、单条
-目录请求不占住 owner，保留满额回压、乱序完成及 RAM lease 检查；没有当前
-制品的真实 guest 性能验收，不能据单测宣称 benchmark 提速。
+staged OverlayFS 的新会话默认不协商 FUSE_WRITEBACK_CACHE；构造前设置
+`PVISOR_VM_FS_WRITEBACK=1` 可显式开启，`0` 可显式关闭。未显式覆盖的
+恢复会话保留快照中已协商的模式、guest 脏页与原生 handle 模式；首次
+或 DESTROY 后再次 INIT 按当前新会话策略协商。显式 `0` 仍拒绝恢复
+已开启 writeback 的快照，backing、handle 与 session 一致性校验不变。
+直接共享宿主目录的 passthrough 保持默认关闭。开启后工作区内容和元数据须由 guest
+独占修改，不能依赖宿主并发修改的即时可见性。O_WRONLY 的原生 FD
+转换为 O_RDWR 以支持部分页回读，O_APPEND 由 guest 计算 offset，原生 FD
+清除 O_APPEND。close/fsync 和 guest 后台回写使脏数据到达宿主；文件写入
+错误可能延后报告。协商状态随 backing 和 FUSE session 保存并校验，完整
+机器快照保留 guest 脏页，不声称排空 virtqueue 已把 guest 脏页刷到 stage。
+恢复仍拒绝 exported descriptors/DAX 等既有不支持状态。
+
+本次只修改 VM virtio-fs 执行路径，不改宿主 FUSE 的 dispatch。
+回归覆盖直接 kick/stop、短操作不偷取、长操作 backlog 原 ring 完成、
+同对象屏障、无关 namespace 修改及等待期间新 I/O admission，并保留
+hiprio、RAM lease、冻结与 writeback 恢复覆盖。性能结果使用独立冻结
+release 制品与正式配对批次，不由并发单测推导收益。
 
 设计参考 [virtiofsd 的线程池和 EVENT_IDX 处理](https://gitlab.com/virtio-fs/virtiofsd/-/blob/main/src/vhost_user.rs)
 及 [passthrough 的资源持有方式](https://gitlab.com/virtio-fs/virtiofsd/-/blob/main/src/passthrough/mod.rs)。
-并发调度使用 pVisor 内部实现，不复制上游代码，也不提供 vhost-user、DAX、
-writeback 或上游的工作目录切换；这些机制需要各自的权限、缓存和冻结契约。
+并发调度使用 pVisor 内部实现，不复制上游代码；不提供 vhost-user 或
+上游的工作目录切换。只读 DAX 使用上文的独立权限、缓存和冻结契约。

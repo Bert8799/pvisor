@@ -10,6 +10,12 @@
 | 选独立 guest kernel | Firecracker、QEMU 与 pVisor 的启动和工具数据 |
 | 设置容量或超时 | 成功率、完整任务等待、相同口径的资源占用 |
 
+<!-- measurement-status:start -->
+
+本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 启动更快并不保证编译更快，可写挂载与暂存审查也提供不同工作流。选型需要同时知道速度、执行边界和改动最终如何进入原目录。
@@ -21,6 +27,10 @@
 B-STARTUP、B-FS-TOOLS、B-AGENT-TASK 使用相同离线工具和固定输入，对照原生、pVisor host/staged/VM、私有 rootless Docker、Firecracker PCI、QEMU q35 和 microvm。镜像、工具与 daemon 预先准备，所有组使用同一两核亲和性，工具 VM 的内存预算相同；每个任务使用新的工作区，按固定种子随机交替执行。完整 Ubuntu、macOS 和不同制品单独成批。
 
 下载、编译 benchmark 制品、镜像导入和输入复制不计入任务等待。计时区分首条有效输出、内部工具与校验、结果返回，以及启动到进程退出。成功样本必须通过输出、执行器和暂存完整性校验；暂存模式还检查宿主原目录未改动。
+
+### JSON 表格与 hyperfine {#json-tables}
+
+表格在 Markdown 渲染前读取已完成的“行名 → 列名 → 标量”JSON；文档构建只读取数据。启动与 replay 的直接命令批次采用 hyperfine 统计值，输入准备和 Python hooks 均在计时外。各条件独立采样，不沿用历史 campaign 的随机配对执行声明。历史分布、正确性计数、容量与物理内存读数保留各自的测量口径。复现方式和其余负载的准备要求见 [JSON benchmark 手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark.new/README.md)。
 
 ### 分布与失败
 

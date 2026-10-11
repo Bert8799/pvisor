@@ -303,6 +303,30 @@ impl VmConfiguration for VmBuilder {
             Err(unsupported("virtio-fs"))
         }
     }
+    fn immutable_filesystem(
+        &mut self,
+        tag: &str,
+        path: &Path,
+        dax_window_size: usize,
+    ) -> io::Result<()> {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        {
+            self.inner.immutable_filesystem(tag, path, dax_window_size)
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        )))]
+        {
+            let _ = (tag, path, dax_window_size);
+            Err(unsupported("immutable virtio-fs DAX"))
+        }
+    }
     fn overlay(&mut self, tag: &str, overlay: OverlayConfig, shm_size: usize) -> io::Result<()> {
         #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
         {

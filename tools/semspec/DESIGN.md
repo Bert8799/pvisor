@@ -253,3 +253,40 @@ AI 不得执行 approve 或编辑真实 REVIEWED.toml、遗留 .approved 文件�
 固定核对 74 条原有产品检查的内容摘要，不代替人工审核。引擎语义升级为 6，已有
 审核须人工重审；迁移不改写真实台账或快照。`@vocab:` 和 JSON 的 `vocab_review`
 保留为审核记录的字段名，其内容现在指向准备文档。
+
+## 15. Benchmark 表格与文档预处理
+
+`semspec bench in.json` 将「行名 → 列名 → 标量」JSON 模板中的 `$ ` 命令单元格
+执行并填回结果，输出 `in.render.json`。同一模板中的相同命令只执行一次。
+直接 hyperfine 命令按 argv 启动；默认提取 `/results/0/median` 并乘 1000，
+`--pointer`、`--scale` 可选择其他字段与单位。每格只测一个命令，样本退出码须全为 0。
+单元格可用 `| json /results/0/summary/time_wall_clock/mean * 1000` 覆盖提取字段和缩放；
+该后缀不是 shell 管道。同一 hyperfine argv 的不同统计列共享一次实验。
+`--cwd` 指定执行目录；每命令日志保留在 `in.bench.logs/`，hooks 通过
+`SEMSPEC_BENCH_LOG` 获取日志路径。原始导出、命令及单元格对应关系保存在 `in.bench.json`。
+其他单元格 Bash 命令须输出单个 JSON 标量；由命令自己明确执行提取或计算。
+行值可直接写 `$ hyperfine ...`：执行一次实验，固定展开 N、Median ms、Mean ms、SD ms、
+Min ms、Max ms，全部来自同一原始导出；kind=hyperfine-row 与行列映射保留在证据中。
+整行单位固定为 ms，不应用 pointer/scale，也不允许标量提取后缀。
+行值也可直接写 `$ python3 native_read.py`：脚本 stdout 输出一个非空 JSON 对象，
+键是列名，值是已完成的标量数据，整个对象替换该行。同一命令只执行一次，可与普通行、
+单元格命令混用；一条脚本命令不能同时作为行与标量单元格。列顺序保留，所有完成行须
+具有相同列。整行结果不做 pointer 提取或 scale 缩放，单位由脚本定义。stderr 保留诊断；
+非零退出、非法/空对象、嵌套数据、未执行命令和列不一致均阻止发布，不递归执行返回值。
+原始对象、日志和 kind=script-row 保留在 commands，rows 记录行到命令及列的关联。
+脚本结果不自动认证为 hyperfine 统计值；完整命令实验保持 benchmark.new 的严格 hyperfine 发布门禁；注册的 pVisor VM Ready / Exit
+脚本在同一次运行中记录两个时刻，另行审核逐次单调时钟、有效输出与正常退出，以 Python 时钟口径独立发布。
+渲染未展开的行命令报错，不执行。
+
+`semspec render xxx.md` 读取独立一行的 `{{ table("in.render.json") }}`，
+按 Markdown 源文件的目录解析 JSON 路径，输出普通 Markdown 表格。
+代码块和行内代码保持字面内容；缺失结果或未执行的命令单元格报错。
+可选第二参数为 JSON 对象：`row_names: false` 隐藏行键列；`markdown: true`
+显式信任仓库内的链接、代码与强调标记；默认仍转义纯文本。`align` 对每个输出列指定
+left/right/center/default；`headers` 可覆盖显示表头，支持重复显示标签。所有选项严格
+校验类型、未知键和列数；管道符及换行保持表格安全。
+默认输出到 stdout，`--output` 可写另一个文件；`--stdin` 供文档预处理扩展传入正文。
+
+这两个子命令独立于 case runner、verdict、digest 与人工审核，不读取或更新台账。
+实验显式运行，文档构建只进行读取与替换。Zensical 的薄 Preprocessor 将替换后的
+Markdown 在内存中交给原有解析器，原始语义规格与源文件保持原样。

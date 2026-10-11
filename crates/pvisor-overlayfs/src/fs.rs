@@ -105,11 +105,42 @@ struct Node {
 }
 
 struct OpenFile {
-    file: File,
+    file: Arc<File>,
     ino: u64,
     path: PathBuf,
     flags: i32,
     backing: PathBuf,
+}
+
+/// Owns the opened descriptor independently of the inode/handle tables.
+/// Dispatch fences namespace publication while the lease performs backing I/O.
+pub(super) struct FileIoLease {
+    file: Arc<File>,
+    core: Arc<FilesystemService>,
+    backing: PathBuf,
+    path: PathBuf,
+    profile: pvisor_overlay_core::profile::Profile,
+}
+
+impl FileIoLease {
+    pub(super) fn read(&self, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+        let _span = self.profile.span("read");
+        let mut bytes = vec![0; size as usize];
+        let count = self.core.read_at(&self.backing, &self.file, &mut bytes, offset)?;
+        bytes.truncate(count);
+        Ok(bytes)
+    }
+
+    pub(super) fn write(&self, offset: u64, data: &[u8], flags: i32) -> io::Result<usize> {
+        let _span = self.profile.span("write");
+        write_request(&self.file, data, offset, flags)
+    }
+
+    pub(super) fn sync(&self, datasync: bool) -> io::Result<()> {
+        let _span = self.profile.span("fsync");
+        self.core.sync_preimages()?;
+        sys::fsync(&self.file, datasync)
+    }
 }
 impl std::ops::Deref for OpenFile {
     type Target = File;
@@ -214,6 +245,83 @@ fn time_value(value: TimeOrNow) -> SystemTime {
 }
 
 impl OverlayFs {
+    pub(super) fn file_io_lease(&self, fh: u64) -> io::Result<FileIoLease> {
+        let file = self.open_files.get(&fh)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        Ok(FileIoLease {
+            file: file.file.clone(),
+            core: self.core.clone(),
+            backing: file.backing.clone(),
+            path: file.path.clone(),
+            profile: self.profile.clone(),
+        })
+    }
+
+    pub(super) fn begin_file_io(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        writing: bool,
+    ) -> io::Result<(FileIoLease, Option<Mutation>)> {
+        let lease = if offset < 0 {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        } else {
+            self.file_io_lease(fh)
+        };
+        let lease = match lease {
+            Ok(lease) => lease,
+            Err(error) => {
+                let path = self.open_files.get(&fh).map(|file| file.path.clone())
+                    .or_else(|| self.node_path(ino).ok());
+                self.observe_result(
+                    path.as_deref(),
+                    if writing { "write" } else { "read" },
+                    &Err::<(), _>(io::Error::from_raw_os_error(errno(&error))),
+                    0,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        let mutation = if writing {
+            self.begin_mutation(&[Some(&lease.path)], &[ino], false)?
+        } else {
+            None
+        };
+        Ok((lease, mutation))
+    }
+
+    pub(super) fn finish_read_io(&self, lease: &FileIoLease, result: &io::Result<Vec<u8>>) {
+        self.observe_result(
+            Some(&lease.path), "read", result,
+            result.as_ref().map_or(0, |bytes| bytes.len() as u64), false,
+        );
+    }
+
+    pub(super) fn finish_write_io(
+        &mut self,
+        lease: &FileIoLease,
+        mutation: Option<Mutation>,
+        result: io::Result<usize>,
+        reply: ReplyWrite,
+    ) {
+        self.observe_result(
+            Some(&lease.path), "write", &result,
+            result.as_ref().copied().unwrap_or(0) as u64, true,
+        );
+        self.mutation_reply(mutation, move |valid| {
+            if !valid {
+                reply.error(libc::EIO);
+            } else {
+                match result {
+                    Ok(count) => reply.written(count as u32),
+                    Err(error) => reply.error(errno(&error)),
+                }
+            }
+        });
+    }
+
     pub(super) fn finish_request(&mut self, bytes: usize, inodes: &[u64]) {
         self.pending_requests -= 1;
         self.pending_bytes -= bytes;
@@ -996,7 +1104,7 @@ impl OverlayFs {
                 .open(&upper)?;
             let offset = sys::seek(file, 0, libc::SEEK_CUR)?;
             sys::seek(&replacement, offset, libc::SEEK_SET)?;
-            file.file = replacement;
+            file.file = Arc::new(replacement);
         }
         Ok(path)
     }
@@ -1671,7 +1779,7 @@ impl OverlayFs {
             self.open_files.insert(
                 handle,
                 OpenFile {
-                    file,
+                    file: Arc::new(file),
                     backing,
                     ino,
                     path: observed_path.unwrap_or_default(),
@@ -1687,129 +1795,6 @@ impl OverlayFs {
             }
             match result {
                 Ok((handle, cache_flags)) => reply.opened(handle, cache_flags),
-                Err(error) => reply.error(errno(&error)),
-            }
-        });
-    }
-
-    pub(super) fn read(
-        &mut self,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        let profile = self.profile.clone();
-        let _span = profile.span("read");
-        let observed_path = self
-            .open_files
-            .get(&fh)
-            .map(|file| file.path.clone())
-            .or_else(|| self.node_path(ino).ok());
-        if offset < 0 {
-            self.observe_result(
-                observed_path.as_deref(),
-                "read",
-                &Err::<(), _>(io::Error::from_raw_os_error(libc::EINVAL)),
-                0,
-                false,
-            );
-            reply.error(libc::EINVAL);
-            return;
-        }
-        let Some(file) = self.open_files.get(&fh) else {
-            self.observe_result(
-                observed_path.as_deref(),
-                "read",
-                &Err::<(), _>(io::Error::from_raw_os_error(libc::EBADF)),
-                0,
-                false,
-            );
-            reply.error(libc::EBADF);
-            return;
-        };
-        let mut data = vec![0; size as usize];
-        let result = self
-            .core
-            .read_at(&file.backing, &file.file, &mut data, offset as u64);
-        self.observe_result(
-            observed_path.as_deref(),
-            "read",
-            &result,
-            result.as_ref().copied().unwrap_or(0) as u64,
-            false,
-        );
-        match result {
-            Ok(read) => {
-                data.truncate(read);
-                reply.data(&data);
-            }
-            Err(error) => reply.error(errno(&error)),
-        }
-    }
-
-    pub(super) fn write(
-        &mut self,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        let profile = self.profile.clone();
-        let _span = profile.span("write");
-        let observed_path = self
-            .open_files
-            .get(&fh)
-            .map(|file| file.path.clone())
-            .or_else(|| self.node_path(ino).ok());
-        if offset < 0 {
-            self.observe_result(
-                observed_path.as_deref(),
-                "write",
-                &Err::<(), _>(io::Error::from_raw_os_error(libc::EINVAL)),
-                0,
-                false,
-            );
-            reply.error(libc::EINVAL);
-            return;
-        }
-        let Some(file) = self.open_files.get(&fh) else {
-            self.observe_result(
-                observed_path.as_deref(),
-                "write",
-                &Err::<(), _>(io::Error::from_raw_os_error(libc::EBADF)),
-                0,
-                false,
-            );
-            reply.error(libc::EBADF);
-            return;
-        };
-        let mutation = mutation_or_reply!(
-            self.begin_mutation(&[observed_path.as_deref()], &[ino], false),
-            reply
-        );
-        let result = write_request(file, data, offset as u64, flags);
-        self.observe_result(
-            observed_path.as_deref(),
-            "write",
-            &result,
-            result.as_ref().copied().unwrap_or(0) as u64,
-            true,
-        );
-        self.mutation_reply(mutation, move |valid| {
-            if !valid {
-                reply.error(libc::EIO);
-                return;
-            }
-            match result {
-                Ok(written) => reply.written(written as u32),
                 Err(error) => reply.error(errno(&error)),
             }
         });
@@ -1841,22 +1826,6 @@ impl OverlayFs {
             reply.ok();
         } else {
             reply.error(libc::EBADF);
-        }
-    }
-
-    pub(super) fn fsync(&mut self, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        let profile = self.profile.clone();
-        let _span = profile.span("fsync");
-        match self.open_files.get(&fh) {
-            Some(file) => match self
-                .core
-                .sync_preimages()
-                .and_then(|()| sys::fsync(file, datasync))
-            {
-                Ok(()) => reply.ok(),
-                Err(error) => reply.error(errno(&error)),
-            },
-            None => reply.error(libc::EBADF),
         }
     }
 
@@ -2108,7 +2077,7 @@ impl OverlayFs {
             let file = self.core.create_file(&path, mode & !umask, flags)?;
             let metadata = self.core.metadata(&path)?;
             let ino = self.allocate_inode(path.clone(), &metadata);
-            let attr = self.attr(ino, &path)?;
+            let attr = self.attr_from_metadata(ino, &metadata);
             Ok((file, attr))
         })();
         self.observe_result(observed_path.as_deref(), "create", &result, 0, true);
@@ -2118,7 +2087,7 @@ impl OverlayFs {
             self.open_files.insert(
                 handle,
                 OpenFile {
-                    file,
+                    file: Arc::new(file),
                     ino: attr.ino,
                     backing: self
                         .core
@@ -2316,6 +2285,26 @@ impl OverlayFs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn file_io_lease_keeps_the_descriptor_alive_after_handle_removal_and_unlink() {
+        let root = tempfile::tempdir().unwrap();
+        let lower = root.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        fs::write(lower.join("file"), b"original").unwrap();
+        let mut overlay = OverlayFs::new(vec![lower.clone()], root.path().join("upper"), None).unwrap();
+        let ino = overlay.inode_for_path_with_metadata("file".into()).unwrap().0;
+        let (file, backing) = overlay.open_inode_with_backing(ino, libc::O_RDONLY).unwrap();
+        overlay.open_files.insert(1, OpenFile {
+            file: Arc::new(file), ino, path: "file".into(), flags: libc::O_RDONLY, backing,
+        });
+        let (lease, mutation) = overlay.begin_file_io(ino, 1, 0, false).unwrap();
+        assert!(mutation.is_none());
+        overlay.open_files.remove(&1);
+        fs::remove_file(lower.join("file")).unwrap();
+        assert_eq!(lease.read(0, 32).unwrap(), b"original");
+        assert_eq!(overlay.file_io_lease(1).err().unwrap().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
     fn queued_requests_pin_only_their_referenced_inodes() {
         let root = tempfile::tempdir().unwrap();
         let lower = root.path().join("lower");
@@ -2360,7 +2349,7 @@ mod tests {
         overlay.open_files.insert(
             1,
             OpenFile {
-                file,
+                file: Arc::new(file),
                 ino,
                 backing,
                 flags: libc::O_RDONLY,
@@ -3311,7 +3300,7 @@ mod tests {
         overlay.open_files.insert(
             1,
             OpenFile {
-                file,
+                file: Arc::new(file),
                 backing,
                 ino,
                 path: path.clone(),

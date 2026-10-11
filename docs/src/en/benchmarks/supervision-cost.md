@@ -12,6 +12,12 @@ Applying prepared changes alone takes pVisor apply P50 of **17 ms, 0.93 s and 14
 | Small workspace or a prepared, reused Git worktree | Git is faster for small workspaces and review of a prepared twenty-file view; long-term reuse is unmeasured |
 | Estimate human supervision cost | Machine timings exclude human reading and decisions |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 An Agent task needs a private workspace, diff review, selective application and disposal as well as tool execution. Individual filesystem timings omit these costs. If you frequently create task workspaces, compare the entire workflow that produces the same result.

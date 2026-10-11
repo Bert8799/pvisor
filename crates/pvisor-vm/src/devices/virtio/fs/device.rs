@@ -47,6 +47,7 @@ pub struct Fs {
     acked_features: u64,
     device_state: DeviceState,
     config: VirtioFsConfig,
+    queue_config: Vec<QueueConfig>,
     allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
@@ -78,7 +79,11 @@ impl Fs {
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
-        config.num_request_queues = 1;
+        config.num_request_queues = super::worker::worker_count() as u32;
+        let queue_config = vec![
+            QueueConfig::new(defs::QUEUE_SIZE);
+            config.num_request_queues as usize + 1
+        ];
 
         let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
             // As uid/gid are context-dependent, attributes can't be cached.
@@ -102,6 +107,7 @@ impl Fs {
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
+            queue_config,
             allow_idmap,
             shm_region: None,
             passthrough_cfg: fs_cfg,
@@ -121,6 +127,15 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    pub(crate) fn configure_request_queues(&mut self, count: usize) -> Result<(), String> {
+        if self.is_activated() || !(1..=8).contains(&count) {
+            return Err("invalid filesystem queue topology or lifecycle".into());
+        }
+        self.config.num_request_queues = count as u32;
+        self.queue_config = vec![QueueConfig::new(defs::QUEUE_SIZE); count + 1];
+        Ok(())
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -245,7 +260,7 @@ impl VirtioDevice for Fs {
     }
 
     fn queue_config(&self) -> &[QueueConfig] {
-        &defs::QUEUE_CONFIG
+        &self.queue_config
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -266,6 +281,9 @@ impl VirtioDevice for Fs {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if queues.len() != self.queue_config.len() {
+            return Err(ActivateError::BadActivate);
+        }
         if self.worker_thread.is_some() {
             panic!("virtio_fs: worker thread already exists");
         }
@@ -337,5 +355,26 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_queue_configuration_preserves_hiprio_and_rejects_invalid_counts() {
+        let mut fs = Fs::new(
+            "queue-test".into(), PermissionSemantics::LinuxComplete, None,
+            Arc::new(AtomicI32::new(0)), false, vec![], None,
+        ).unwrap();
+        fs.configure_request_queues(3).unwrap();
+        let count = fs.config.num_request_queues;
+        assert_eq!(count, 3);
+        assert_eq!(fs.queue_config().len(), 4);
+        assert!(fs.queue_config().iter().all(|queue| queue.size == defs::QUEUE_SIZE));
+        assert!(fs.configure_request_queues(0).is_err());
+        assert!(fs.configure_request_queues(9).is_err());
+        assert_eq!(fs.queue_config().len(), 4);
     }
 }

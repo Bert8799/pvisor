@@ -10,6 +10,12 @@
 | Size local execution or parked states | Use [capacity](density.md) and [VM memory](vm-memory/index.md), not Worker curves |
 | Size the daemon or compare schedulers | Unmeasured; do not transfer old throughput or history figures |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Capacity decisions require evidence for the implementation actually deployed. Retiring Controller/Worker removes the subject of these experiments; renaming its measurements would conceal that boundary. Readiness, validated work and recoverable parked states answer different questions.

@@ -133,6 +133,15 @@ strip = "symbols"
 codegen-units = 8
 panic = "abort"
 
+# File-operation dispatch and checked path walks run on every virtio-fs request.
+# Keep the distribution size policy elsewhere, but optimize these hot crates
+# for execution speed.
+[profile.release.package.pvisor-vm]
+opt-level = 3
+
+[profile.release.package.pvisor-overlay-core]
+opt-level = 3
+
 # Build scripts and proc macros do not need release stripping. Keeping their
 # symbols avoids invoking a host rust-objcopy that may be unavailable when
 # cross-compiling from macOS, while the final application remains stripped.

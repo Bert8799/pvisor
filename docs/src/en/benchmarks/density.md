@@ -10,6 +10,12 @@
 | Many idle environments | Stage reaches higher tested concurrency, using a host-process boundary |
 | A VM boundary per task | Reserve more resources; do not size active tasks from idle counts |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 When multiple Agents execute together, completed work matters more than created environments. Capacity planning must include runtimes, helpers, page cache and VM backing; neither single-process RSS nor configured RAM can establish capacity.

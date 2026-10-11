@@ -218,6 +218,8 @@ workspace checkpoint 只保存文件分支；Agent trajectory 保存模型上下
 
 固定任务、输入、输出检查、版本和总预算，分别记录正确完成量、CPU、内存峰值、memory-time 与恢复延迟。监督成本还需要实际审查、拒绝和返工数据，不能用机器运行时间代替人的注意力。[研究方向](research/index.md)维护这些假设和接入边界；现有数据在[基准测试](../benchmarks/index.md)中保留各自测量范围。
 
+实验能力在[实验特性](experimental/index.md)中按平台、profile 和实施阶段登记。vCPU 空闲观测目前只交付 M0 观测原型，自动卸载仍待验证；guest 文件系统缓存处于 RFC 阶段，拟将元数据和普通只读 open 移到 guest 本地，同时保留宿主 stage 与权限边界。两条路线都需要用完整生命周期和资源预算检验净收益。
+
 ## 11. 回到整个系统 {#results}
 
 现在可以把示例任务完整串起来：准入固定策略；Session 准备 VM、文件与网络；guest 经 virtio-fs 读取 lower，HTTPS 经受控出口建立连接；文件修改 copy-up 到 upper；执行结束后同步 stage、清理资源、保存事实；开发者最后通过 preimage 检查，把选中的候选文件发布到 target。

@@ -4,6 +4,7 @@ site_name = "PolicyVisor"
 site_description = "Scaling autonomous agent execution for Agents, scripts, and automation."
 site_url = "https://deeplink-org.github.io/pvisor/en/"
 docs_dir = "src/en"
+watch = ["src/en/benchmarks", "semspec_tables.py"]
 site_dir = "site/en"
 cache_dir = ".cache/en"
 dev_addr = "127.0.0.1:3001"
@@ -185,6 +186,11 @@ nav = [
       { "Records and version matrix" = "design/records-and-versions.md" },
       { "Failure semantics and retries" = "design/failure-semantics.md" },
     ] },
+    { "Experimental features" = [
+      { "Stages and scope" = "design/experimental/index.md" },
+      { "EXP-001 (observation prototype): vCPU idle observation and automatic RAM offload" = "design/experimental/vcpu-idle-offload/index.md" },
+      { "EXP-002 (design stage): Guest kernel filesystem cache" = "design/experimental/guest-stage-cache/index.md" },
+    ] },
     { "Research directions" = [
       { "Research directions" = "design/research/index.md" },
       { "External orchestration and single-node execution" = "design/research/cluster-execution.md" },
@@ -269,6 +275,8 @@ alternate_style = true
 [project.markdown_extensions."def_list"]
 
 [project.markdown_extensions."tables"]
+
+[project.markdown_extensions."docs.semspec_tables"]
 
 [project.markdown_extensions."toc"]
 permalink = true

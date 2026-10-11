@@ -10,6 +10,12 @@
 | VM 内下载依赖 | 把传输与环境启动分别预算 |
 | 阻止直接 TCP 连接 | host/VM deny-all 的正负对照已测；延迟不是隔离证明 |
 
+<!-- measurement-status:start -->
+
+本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Agent 会请求模型、下载依赖和读取流式响应，三种负载对代理成本的敏感度不同。请求延迟、首字节、完整传输和启动开销需要分开，才能判断等待来自哪里。

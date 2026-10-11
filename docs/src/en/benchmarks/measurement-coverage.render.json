@@ -1,0 +1,58 @@
+{
+  "[agent-tasks](agent-tasks.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[cluster-scalability](cluster-scalability.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[compare-rl-infra](compare-rl-infra.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[density](density.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[filesystem](filesystem.md)": {
+    "Data status": "Fully rerun",
+    "Measured scope": "Eight-backend seven-tool phases and launch through exit; native whole-command probes are separate"
+  },
+  "Overview": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[isolation-tests](isolation-tests.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[lazy-image-startup](lazy-image-startup.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[methodology](methodology.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[network](network.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[replay-fidelity](replay-fidelity.md)": {
+    "Data status": "Partially rerun",
+    "Measured scope": "Whole CLI time for fixed task 0; historical 20-task distributions are separate"
+  },
+  "[startup](startup.md)": {
+    "Data status": "Partially rerun",
+    "Measured scope": "Same-launch Ready / Exit; whole-command time is separate"
+  },
+  "[supervision-cost](supervision-cost.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  },
+  "[vm-memory](vm-memory/index.md)": {
+    "Data status": "Historical data",
+    "Measured scope": "Original metrics and sources retained; no matching new measurements"
+  }
+}

@@ -668,6 +668,25 @@ pub fn build_microvm_for_arch<A: crate::backend::Architecture>(
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    for (index, config) in vm_resources.fs.iter().enumerate() {
+        if config.read_only {
+            if let Some(window) = _shm_manager.fs_region(index) {
+                vm.protect_readonly_window(
+                    &guest_memory,
+                    window.guest_addr.raw_value(),
+                    window.size,
+                )
+                .map_err(Error::Vm)
+                .map_err(StartMicrovmError::Internal)?;
+            }
+        }
+    }
+
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
         let kvm = KvmContext::new()
@@ -1160,6 +1179,10 @@ pub fn build_microvm_for_arch<A: crate::backend::Architecture>(
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
+        vm_resources
+            .machine_restore
+            .as_ref()
+            .map(|restore| restore.state.devices.as_slice()),
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
         export_table,
@@ -2191,6 +2214,7 @@ fn attach_mmio_device(
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
+    restored_devices: Option<&[crate::devices::snapshot::BusMappingSnapshot]>,
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
@@ -2212,6 +2236,31 @@ fn attach_fs_devices(
             )
             .unwrap(),
         ));
+
+        if let Some(devices) = restored_devices {
+            let mut saved_count = None;
+            for mapping in devices {
+                if let crate::devices::snapshot::BusDeviceSnapshot::Virtio(state) = &mapping.device
+                {
+                    if let Some(count) = state
+                        .filesystem_request_queues(config.fs_id.as_bytes())
+                        .map_err(StartMicrovmError::GuestMemoryMmap)?
+                    {
+                        if saved_count.replace(count).is_some() {
+                            return Err(StartMicrovmError::GuestMemoryMmap(
+                                "duplicate filesystem snapshot tag".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(count) = saved_count {
+                fs.lock()
+                    .unwrap()
+                    .configure_request_queues(count)
+                    .map_err(StartMicrovmError::GuestMemoryMmap)?;
+            }
+        }
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
 

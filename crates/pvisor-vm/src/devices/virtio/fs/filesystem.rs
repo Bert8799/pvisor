@@ -1154,6 +1154,12 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
+    /// Flags for a successfully obtained inode's attributes, without another
+    /// lookup. Virtual adapters must not inherit a backing inode's DAX hint.
+    fn attribute_flags(&self, _inode: Self::Inode, _attr: &bindings::stat64) -> u32 {
+        0
+    }
+
     /// Setup a mapping so that guest can access files in DAX style.
     #[allow(
         clippy::too_many_arguments,

@@ -17,7 +17,9 @@
 //! # Filesystems and networking
 //! Disable implicit init before attaching a native-init `/dev/root`. Filesystem
 //! tags and virtual paths are unique. Host paths currently require UTF-8. DAX is
-//! opt-in; pVisor overlays use zero DAX size. Synthetic files own their bytes.
+//! disabled by default; only an explicit [`VmConfiguration::immutable_filesystem`]
+//! attachment allocates a DAX window. Ordinary filesystems and pVisor overlays
+//! use zero DAX size. Synthetic files own their bytes.
 //! Vsock never implicitly enables TSI, even when no network device is configured.
 //!
 //! # Snapshots and transitions
@@ -130,7 +132,38 @@ pub trait VmConfiguration: Sized {
     /// Configure a custom init's command; requires implicit init to be disabled.
     /// Validate atomically before replacing the previous command.
     fn guest_command(&mut self, command: GuestCommand) -> io::Result<()>;
+    /// Attach an ordinary writable passthrough directory. `shm_size` must be
+    /// zero; nonzero windows return Unsupported before changing configuration.
+    /// Use `immutable_filesystem` for the supported read-only DAX contract.
     fn filesystem(&mut self, tag: &str, path: &Path, shm_size: usize) -> io::Result<()>;
+    /// Attach a guest-read-only, physically immutable directory with a DAX window.
+    /// Calling this method explicitly enables DAX capability for this share.
+    /// The caller must keep contents, metadata, namespace, ancestors and hardlink
+    /// aliases unchanged until VM teardown. This promise is not inferred from a
+    /// read-only mount. The guest mounts the tag with `ro,dax=inode` to use DAX,
+    /// or `ro,dax=never` for ordinary reads. Disabling DAX in the guest retains
+    /// the configured window and this attachment's lifecycle restrictions.
+    /// Only regular backing files support DAX; virtual files use ordinary reads.
+    /// OPEN authorizes the file; mappings require a live read-only handle for
+    /// that inode. Linux's `fh=-1` mapping requests reuse such an opened FD.
+    /// Guest writes cannot change the backing. Mapping requests may reserve zero
+    /// padding beyond EOF, but normal file reads retain their original size.
+    ///
+    /// Requires Linux x86_64 without TEE/Nitro, an absolute existing directory,
+    /// and a window of 2 MiB to 1 GiB in 2 MiB increments. Duplicate/empty tags
+    /// and invalid inputs fail before attachment. Other platforms return
+    /// Unsupported. DAX and snapshot profiles/restoration are mutually exclusive;
+    /// freeze/capture also reject DAX. Failure leaves previous attachments usable.
+    /// The window reserves additional guest address space, not ordinary guest RAM;
+    /// resident file pages and guest-induced private COW pages consume host memory.
+    fn immutable_filesystem(
+        &mut self,
+        tag: &str,
+        path: &Path,
+        dax_window_size: usize,
+    ) -> io::Result<()>;
+    /// Attach a writable merged overlay. `shm_size` must be zero; DAX for this
+    /// merged view is Unsupported. Failure preserves previous attachments.
     fn overlay(&mut self, tag: &str, overlay: OverlayConfig, shm_size: usize) -> io::Result<()>;
     fn virtual_file(
         &mut self,

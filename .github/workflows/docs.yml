@@ -3,10 +3,28 @@ name: Documentation
 on:
   push:
     branches: [main, develop, next]
-    paths: ['docs/**', 'scripts/*docs*.py', 'scripts/check-reference.py', 'tests/test_docs.py', 'justfile', '.github/actions/setup-build-env/**', '.github/workflows/docs.yml']
+    paths:
+      - 'docs/**'
+      - 'benchmark.new/**'
+      - 'tools/semspec/**'
+      - 'scripts/*docs*.py'
+      - 'scripts/check-reference.py'
+      - 'tests/test_docs.py'
+      - 'justfile'
+      - '.github/actions/setup-build-env/**'
+      - '.github/workflows/docs.yml'
   pull_request:
     branches: [main, develop, next]
-    paths: ['docs/**', 'scripts/*docs*.py', 'scripts/check-reference.py', 'tests/test_docs.py', 'justfile', '.github/actions/setup-build-env/**', '.github/workflows/docs.yml']
+    paths:
+      - 'docs/**'
+      - 'benchmark.new/**'
+      - 'tools/semspec/**'
+      - 'scripts/*docs*.py'
+      - 'scripts/check-reference.py'
+      - 'tests/test_docs.py'
+      - 'justfile'
+      - '.github/actions/setup-build-env/**'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -24,6 +42,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build-env
+        with:
+          rust: "true"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-semspec
+          workspaces: tools/semspec -> ../../target/semspec
       - name: Test documentation checks
         run: just test-py tests/test_docs.py
       - name: Build and check documentation

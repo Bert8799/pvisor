@@ -10,13 +10,19 @@
 | Small workspace or tool execution alone | Compare native workflows and container costs |
 | VM or concurrent capacity | Require complete tool and resource measurements |
 
+<!-- measurement-status:start -->
+
+The filesystem overview row uses accepted cohort `fo8e2d57ff-f` from 2026-10-11; other topics retain their separate cohorts. Timing boundaries and artifacts are listed by topic; see [measurement coverage](#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Selection requires the total cost of producing the same result, beyond startup or a single command. Review/application, execution boundaries and resource use determine which Agent workflows suit pVisor.
 
 ## Experiment design {#interpretation}
 
-This reuses separately registered [startup](startup.md), [filesystem](filesystem.md), [repair](agent-tasks.md) and [complete review workflow](supervision-cost.md) experiments. The first three use 60 samples and three warmups per backend; review uses thirty samples and three warmups per size/condition/backend. Same host, CPUs 0,1, warm caches, randomized interleaving and complete correctness checks, with no speed-based exclusions. Workloads, resources and timing boundaries differ across topics; distributions are not pooled. Docker uses rootless overlay2; workflow controls are native Git/reflink, not container or VM security rankings.
+This reuses separately registered [startup](startup.md), [filesystem](filesystem.md), [repair](agent-tasks.md) and [complete review workflow](supervision-cost.md) experiments. Startup and repair use 60 samples per backend, filesystem thirty, each with three warmups; review uses thirty samples and three warmups per size/condition/backend. Same host, CPUs 0,1, warm caches, randomized interleaving and complete correctness checks, with no speed-based exclusions. Workloads, resources and timing boundaries differ across topics; distributions are not pooled. Docker uses rootless overlay2; workflow controls are native Git/reflink, not container or VM security rankings.
 
 [Network](network.md) uses thirty independent batches and three warmups per condition; each small-request sample is the median of 256 requests. The origin is outside the payload CPU budget and memory is not identically capped. [Capacity](density.md) uses a shared two-core, 2 GiB, zero-swap budget, five rounds per concurrency and separate idle/useful-tool conditions; every failure, unknown outcome and OOM remains counted.
 
@@ -24,13 +30,13 @@ This reuses separately registered [startup](startup.md), [filesystem](filesystem
 
 ## Data and analysis {#results}
 
-The 2026-10-06 startup/filesystem/repair cohorts have 1,440 valid samples and review has 360; the separate 2026-10-07 stock-kernel startup cohort has 240 valid samples. All have zero measured failures. Cohorts are not pooled; topic pages provide median differences and paired-bootstrap 95% intervals.
+The 2026-10-06 startup/filesystem/repair cohorts have 1,440 valid samples and review has 360; the separate 2026-10-07 stock-kernel startup cohort has 240 valid samples. All have zero measured failures. The selected-source filesystem comparison on 2026-10-11 adds 240 valid samples and zero failures, with task-local caches and a common parent resource budget. Cohorts are not pooled; topic pages provide median differences and paired-bootstrap 95% intervals.
 
 | Question | Measured level (timing is P50) |
 |---|---|
 | [Startup](startup.md) | Stock controls: VM 100.91 ms; Firecracker 285.04 ms; QEMU microvm 321.56 ms; q35 702.98 ms |
 | [Repair completion](agent-tasks.md) | staged 0.64 s; Docker 0.81 s; VM 3.25 s; QEMU microvm 1.40 s |
-| [Seven-tool completion](filesystem.md) | staged 1.09 s; Docker 0.82 s; VM 4.27 s; Firecracker 2.29 s |
+| [Seven-tool completion](filesystem.md) | staged 1.85 s; Docker 1.41 s; VM 5.50 s; Firecracker 2.74 s |
 | [Review workflow](supervision-cost.md) | 10,000 files: stage 141 ms; Git 248 ms; reflink 343 ms |
 | [Network](network.md) | Eight-thread small requests: native 0.69 ms; host proxy 10.09 ms; VM 2.10 ms |
 | [Active capacity](density.md) | 2 GiB: stage/Podman pass all five rounds at 32; VM at 16 |
@@ -44,6 +50,14 @@ Net physical-memory savings and useful-task density from compression, trimmed-ke
 
 [End-to-end tasks](agent-tasks.md) combines tool waiting, workspace lifecycle and CLI compatibility to analyze Agent sandbox, container, VM and cloud tradeoffs. [Reinforcement learning](compare-rl-infra.md) maps tool costs, active capacity and historical-prefix preparation to rollouts; full training throughput and reward are unmeasured.
 
+### Measurement coverage of the new framework {#measurement-coverage}
+
+This table separates new measurements from historical evidence. Data is updated only when metrics, inputs, configurations and correctness gates match. Ready, normal exit, internal tool timings, memory and correctness do not substitute for one another. Unprepared experiments produce no new numbers; historical conclusions apply to their original cohorts.
+
+{{ table("measurement-coverage.render.json", {"markdown":true}) }}
+
+[Coverage CSV](measurement-coverage.csv).
+
 ### Downloads and reproduction {#run}
 
-[Runtime statistics](runtime-summary.csv) · [Confidence intervals](runtime-comparisons.csv) · [Runtime provenance](runtime-provenance.csv) · [Workflow statistics](workflow-summary.csv) · [Workflow intervals](workflow-comparisons.csv) · [Workflow provenance](workflow-provenance.csv) · [Method](methodology.md) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[Current filesystem statistics](filesystem.csv) · [Same-cohort filesystem intervals](filesystem-comparisons.csv) · [Current filesystem provenance](filesystem-provenance.csv) · [Historical runtime statistics](runtime-summary.csv) · [Historical runtime intervals](runtime-comparisons.csv) · [Historical runtime provenance](runtime-provenance.csv) · [Workflow statistics](workflow-summary.csv) · [Workflow intervals](workflow-comparisons.csv) · [Workflow provenance](workflow-provenance.csv) · [Method](methodology.md) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

@@ -1,0 +1,3 @@
+{
+  "QEMU": "$ python3 @REPO@/benchmark.new/startup/qemu_timing.py @BATCH@"
+}

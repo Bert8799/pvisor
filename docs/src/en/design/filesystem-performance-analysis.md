@@ -1,5 +1,421 @@
 # Filesystem performance: technical analysis and experiment records
 
+## Current conclusions and measurement coverage {#filesystem-status}
+
+**Latest independent N30 paired comparison: Selected C3 (new-VM writeback off by default): Launch through normal exit changes by -1.73%, 95% CI [-5.70, -0.22]%; Write 256 files changes by -14.19%, 95% CI [-17.58, -9.82]%. Results apply to the measured combined code/default configuration; complete recovery of historical performance is not established.**
+
+Independent cohorts: [Linux: paired N30 comparison of filesystem optimizations with default-off writeback](#filesystem-optimization-n30). The existing overview retains each historical cohort's conclusions.
+
+Historical engineering conclusions:
+
+**The filesystem regression remains unresolved overall.** The small direct-queue retest supports improvements in some tools, with no detected overall task difference. Disabling writeback reduces write cost but has no detected speedup for the complete seven-tool task. DAX retains explicit opt-in and is disabled by default; first mmap and repeated small-file reads regress clearly.
+
+Each row below uses its own same-condition cohort. Percentages cannot be added, and absolute times cannot be compared across cohorts. Change is candidate relative to that cohort's baseline; negative means less time. Intervals are paired-bootstrap 95% percentage intervals. Direct queues have N=10 per arm; other rows have N=30 per arm. All rows are engineering results.
+
+| Comparison / metric | N per arm | Baseline ms | Candidate ms | Change | 95% CI % | Conclusion |
+| --- | --- | --- | --- | --- | --- | --- |
+| [Staged idle dispatch: completion](#host-idle-dispatch) | 30 | 1826.42 | 1774.15 | -2.86% | [-3.57, -1.22] | faster |
+| [VM worker fix: completion](#vm-completion-dispatch) | 30 | 4741.87 | 4592.36 | -3.15% | [-6.14, -1.23] | faster |
+| [VM concurrency refactor: internal total](#concurrency-retest) | 30 | 3578.18 | 3749.07 | +4.78% | [+2.96, +5.92] | slower |
+| [VM direct queues: internal total](#direct-queue-fast) | 10 | 3707.29 | 3606.71 | -2.71% | [-5.28, +7.25] | no detected difference |
+| [Writeback disabled: write](#writeback-ab) | 30 | 162.10 | 131.61 | -18.81% | [-25.06, -12.87] | faster |
+| [DAX enabled: repeated sequential read](#readonly-dax-ab) | 30 | 5.54 | 4.58 | -17.38% | [-21.40, -10.10] | faster |
+| [DAX enabled: first parallel read](#readonly-dax-ab) | 30 | 54.43 | 38.27 | -29.69% | [-32.16, -28.25] | faster |
+| [DAX enabled: first mmap page traversal](#readonly-dax-ab) | 30 | 23.83 | 104.75 | +339.59% | [+328.77, +352.40] | slower |
+| [DAX enabled: repeated small-file read](#readonly-dax-ab) | 30 | 25.37 | 36.63 | +44.37% | [+36.47, +47.98] | slower |
+
+Ordinary rootfs/workspace attachments allocate no DAX window by default; immutable shares retain explicit DAX configuration. New VM writeback defaults to disabled, with explicit `PVISOR_VM_FS_WRITEBACK=1` / `0` configuration. By default, restoring a negotiated snapshot retains its mode; explicit `PVISOR_VM_FS_WRITEBACK=0` rejects a snapshot with writeback enabled. Stage synchronization defaults to serial. Historical engineering artifacts and conditions remain intact; their percentages are not summed or used to rescale current user results.
+
+The selected frozen source/defaults completed the cross-runtime seven-tool cohort on 2026-10-11: thirty trials for each of eight backends, totaling 240 valid tasks, with DAX disabled and new VM writeback disabled by default; see [tool waiting](../benchmarks/filesystem.md#reference-fs). These user data come from independent cohort `fo8e2d57ff-f`, without pooling history or deriving cross-cohort causal speedups. Earlier accepted and rejected attempts remain in the [acceptance CSV](filesystem-measurement-status.csv).
+
+macOS [responsiveness during copying and journal locks](#host-concurrency) and Linux HOST [immutable-lower caching](#immutable-lower-cache) have separate valid experiments. [Extended kernel caching](#host-cache-evidence) has passing correctness and request-count evidence, with no accepted formal timing. Cold disks, large repositories and concurrent throughput lack matching new measurements. The [engineering evidence CSV](filesystem-evidence-overview.csv) retains each table row's cohort, metric, source and full precision.
+
+## Linux: paired N30 comparison of filesystem optimizations with default-off writeback {#filesystem-optimization-n30}
+
+Independent B-FS-ENG cohort `fof1`, N=30 with three warmups per arm. These tables attribute the measured combined variant/default configuration; screening cohorts, historical switch experiments and cross-runtime user cohorts remain separate.
+
+The control is the frozen SHA939 build; selected C3 is the frozen SHA884 build containing queue hot-path, handle-lease and Linux regular-file metadata changes, plus default-off writeback for new VMs. Neither arm supplies WRITEBACK/WORKERS environment overrides: the baseline uses its enabled default and C3 its disabled default. Attribution therefore applies only to the combined code/default configuration. Frozen source, artifact and firmware identities are in the provenance download. Linux/KVM/FUSE/Btrfs, warm host caches, a new VM, private user/mount/PID namespace, owned pivot_root, workspace and tool caches per trial; whole parent CPUs 0,1, quota two, 16 GiB and zero swap, guest 2 vCPU/16 GiB. Fresh Host-listener startup is included in completion and cannot be subtracted from the warm-listener cross-runtime cohort. Three warmups and thirty seed-20261011 randomized paired rounds per arm; all sixty formal tasks and six warmups pass seven-tool outputs, full 256×64KiB bytes, Run Bundle, host isolation, input/artifact/budget and external interference gates. Environment observation proves visible exec-time variable inheritance, not precise FUSE INIT negotiation; short, inaccessible or unrecognized interference may be missed. Profiling is disabled with no speed-based exclusions. Earlier N5/N10 screens selected C3 and contribute no samples or uncertainty to this cohort.
+
+**Selected C3 (new-VM writeback off by default)**
+
+| Metric | N per arm | Baseline ms | Candidate ms | Change | 95% CI ms | 95% CI % | Conclusion |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| First valid output Ready | 30 | 693.90 | 692.75 | -0.16% | [-5.30, +2.71] | [-0.76, +0.39] | No detected difference |
+| Launch through complete result | 30 | 4333.52 | 4257.06 | -1.76% | [-285.78, -7.65] | [-6.29, -0.18] | Faster |
+| Launch through normal exit | 30 | 4546.35 | 4467.53 | -1.73% | [-269.88, -9.92] | [-5.70, -0.22] | Faster |
+| Internal seven-tool total | 30 | 3641.73 | 3562.54 | -2.17% | [-284.47, -9.52] | [-7.39, -0.27] | Faster |
+| Traverse 2,048 files | 30 | 149.13 | 132.08 | -11.43% | [-36.77, +9.16] | [-23.74, +6.36] | No detected difference |
+| Read and verify 64 MiB | 30 | 114.58 | 115.66 | +0.95% | [-0.43, +5.00] | [-0.37, +4.38] | No detected difference |
+| Write 256 files | 30 | 159.77 | 137.11 | -14.19% | [-28.72, -14.98] | [-17.58, -9.82] | Faster |
+| git status | 30 | 381.61 (n=22); 770.02 (n=8) | 369.18 (n=24); 736.44 (n=6) | — | — | — | Separated clusters; no overall ranking |
+| Ripgrep search | 30 | 422.94 | 424.78 | +0.43% | [-5.80, +9.07] | [-1.36, +2.18] | No detected difference |
+| Offline Cargo build | 30 | 484.65 | 482.34 | -0.48% | [-6.58, +4.43] | [-1.35, +0.92] | No detected difference |
+| Offline npm install | 30 | 937.03 | 920.09 | -1.81% | [-34.38, -0.98] | [-3.63, -0.10] | Faster |
+
+Milliseconds; negative changes indicate lower latency. Intervals use 5,000 same-cohort paired bootstrap resamples. Valid slow samples remain; separated clusters receive no overall P50, percentage or ranking. No P95/P99 is reported.
+
+[Same-cohort full precision CSV](filesystem-optimization-n30-summary.csv) · [Artifact, configuration and provenance](filesystem-optimization-n30-provenance.csv). Raw evidence is local at `benchmark/.data/fof1/report.json`; acceptance is `benchmark/.data/fof1/derived/audit.json`.
+
+## Linux: paired comparison with guest writeback disabled {#writeback-ab}
+
+**Disabling writeback reduces 256 × 64 KiB write time from 162.10 ms to 131.61 ms, a decrease of 18.81%, with 95% CI [-25.06%, -12.87%].** Neither completion nor internal seven-tool time has a detected difference. rg and Cargo increase by 1.82% and 1.08%; Git and disabled-condition npm have separated clusters. The detected benefit is confined to this write workload.
+
+### Control and timing boundaries {#writeback-protocol}
+
+B-FS-ENG uses one frozen GNU release/gateway artifact, SHA256 `ae221676e4bb04231c88f2ce17c2570824f4064f8a3a63d6ef32817b0e2afa98`, including direct queue service, heavy-operation stealing and scoped I/O fences. Conditions only set host-runner `PVISOR_VM_FS_WRITEBACK` to `1` / `0`; a dedicated worker restores and verifies the originating environment. Firmware, seven-tool workload, inputs, workspaces and tool-cache policy are identical. Rootfs/workspace attachments have no DAX window.
+
+Linux/KVM/FUSE/Btrfs, warm host caches, fresh VMs, private user/mount/PID namespaces and owned pivot_root per trial. The whole parent uses CPUs 0,1, a two-core quota, 16 GiB and zero swap; guests have 2 vCPU/16 GiB. Input/namespace preparation is excluded. Fresh Host-listener startup, VM launch and exit enter completion; operations use the original workload's internal timer and include output validation. Profiling is disabled.
+
+Each arm has 3 warmups and 30 seeded shuffled paired rounds, totaling 60 measured tasks. All 66 runs pass output, normal exit, Run Bundle, host isolation and full-byte validation of the 256 upper files. Input/artifact digests match, with no OOM, 0 failures and 0 exclusions. External build/test polling every 0.5 s detects no interference but can miss brief or inaccessible activity. There are 5,000 paired bootstrap resamples; slow valid samples remain, distributions are checked first, and P95/P99 are not reported.
+
+### Seven operations and complete waiting {#writeback-results}
+
+Units are ms, N=30 per arm. Change is disabled relative to enabled; the 95% CI is for the median-time difference. Separated distributions show each cluster's median and count, with no overall P50, percentage or ranking.
+
+| Metric | Writeback on ms | Writeback off ms | Change | 95% CI ms | Conclusion |
+| --- | --- | --- | --- | --- | --- |
+| First valid output (Ready) | 696.95 | 694.99 | -0.28% | &#91;-4.96, +2.39&#93; | no detected difference |
+| Launch to full result | 4409.19 | 4363.77 | -1.03% | &#91;-247.19, +262.05&#93; | no detected difference |
+| Launch to normal exit | 4616.37 | 4564.87 | -1.12% | &#91;-250.56, +271.96&#93; | no detected difference |
+| Internal seven-tool total | 3699.55 | 3660.70 | -1.05% | &#91;-259.00, +263.60&#93; | no detected difference |
+| Traverse 2,048 files | 148.93 | 145.89 | -2.04% | &#91;-26.36, +19.23&#93; | no detected difference |
+| Read and verify 64 MiB | 114.83 | 116.22 | +1.21% | &#91;-1.53, +2.47&#93; | no detected difference |
+| Write 256 × 64 KiB | 162.10 | 131.61 | -18.81% | &#91;-41.05, -20.17&#93; | faster |
+| git status | 391.26 (n=23); 759.78 (n=7) | 375.22 (n=21); 751.37 (n=9) | — | — | Separated clusters; no overall ranking |
+| rg | 420.05 | 427.67 | +1.82% | &#91;+1.09, +14.25&#93; | slower |
+| Offline Cargo compile | 485.05 | 490.29 | +1.08% | &#91;+0.35, +12.54&#93; | slower |
+| Offline npm install | 941.86 | 937.78 (n=22); 1661.33 (n=8) | — | — | Separated clusters; no overall ranking |
+
+The completion median difference is -51.50 ms, with 95% CI [-250.56, +271.96] ms. Internal task time differs by -38.86 ms, interval [-259.00, +263.60] ms. The write improvement does not yield a detected overall benefit; these timings do not establish READ request counts or specific lock costs. Both Git conditions and disabled-condition npm have separated clusters; all samples are retained and displayed separately.
+
+[Complete statistics CSV](writeback-filesystem-summary.csv) · [Artifact, switch, budget and provenance](writeback-provenance.csv). Raw evidence is local under `benchmark/.data/writeback-quick-20261011/`; frozen harness, execution and acceptance records are under `benchmark/pvisor/.data/writeback-ab-20261011/`. This cohort has N=30 per arm despite its directory name and is independent of the N=10 direct-queue retest and read-only DAX experiment. The historical enabled/disabled conditions remain intact; the current new-VM default follows the selected frozen source.
+
+## Linux: paired DAX comparison for an immutable read-only share {#readonly-dax-ab}
+
+**DAX has substantial tradeoffs in this workload and does not justify default enablement.** The first two-thread 64 MiB read is 29.69% faster and repeated sequential reads are 17.38% faster. The first sequential read is 8.72% slower, repeated small-file reads are 44.37% slower, and the first page-stride access to a 64 MiB mmap is 339.59% slower. Metadata has no detected difference. The measured scope is an explicit immutable share; writable CLI workspaces and startup/exit regressions were not retested by this experiment.
+
+### Control and timing boundaries {#readonly-dax-protocol}
+
+B-FS-ENG uses one frozen `performance` artifact (opt-level 3, Thin LTO). Both conditions create a read-only device and a 128 MiB DAX window through the public `immutable_filesystem` API. Only the guest mount option changes, from `dax=never` to `dax=inode`. Every trial verifies the expected statx DAX attribute; the disabled condition retains the same device and window configuration. The host is a Ryzen 7 9700X running Linux 7.2.8; the guest runs Linux 6.12.109. Both use the same Btrfs backing and firmware, warm host content caches, and a fresh VM with private rootfs upper/work directories.
+
+The complete campaign and VMs inherit CPU 0,1 affinity and share a two-core quota, 2 GiB memory.max, zero swap and a 65,536 FD limit; guests have 2 vCPU/512 MiB. The user cgroup lacks a cpuset controller, so actual affinity/quota is verified before and after. Profiling is disabled. Each condition has 3 warmups followed by 30 pairs in a predetermined balanced random order, totaling 60 measured VMs. All 6 warmups and 60 measured runs passed correctness and exited normally. Input/artifact digests match before/after, with no OOM, 0 failures and 0 exclusions. An observer outside the group scanned for external builds/tests every 0.5 seconds, 123 times, and detected none; brief or other host activity may escape detection.
+
+Each guest runs metadata → small files → sequential read → mmap → two-thread read. Data classes use independent files while sharing the window and its reclamation state. Metadata stats 2,048 paths. Small-file reads open/read/close 128×64 KiB files, whose 2 MiB mapping-slot demand exceeds the window. Large files are 64 MiB each: read uses 64 KiB pread calls on an already-open FD; the first mmap phase includes mapping and one byte read per 4 KiB page, while repeats retain the mapping; parallel includes creating and joining two reader threads. Full-byte validation is outside each phase timer. First file-data access does not mean cold storage or an empty DAX window.
+
+Guest `CLOCK_MONOTONIC_RAW` records phases. Repeated read/parallel values are the per-pass average of 4 passes, mmap averages 16 passes, and other phases use one pass. The table reports medians of these 30 samples. CIs use 5,000 paired bootstrap resamples, calculating the difference and percentage between each resample's condition medians; intervals crossing zero are labeled no detected difference. The preregistered adjacent-gap/cluster-size rule detected no separated clusters. All slow valid samples remain; P95/P99 are not reported.
+
+### Same-batch results {#readonly-dax-results}
+
+Units are ms. Change is enabled relative to disabled; positive values mean slower. The 95% CI is for the percentage change.
+
+| Operation | DAX off ms | DAX on ms | Change | 95% CI | Conclusion |
+| --- | --- | --- | --- | --- | --- |
+| 2,048-path stat: first | 129.0957 | 130.0621 | +0.75% | &#91;-8.33%, +11.32%&#93; | no detected difference |
+| 2,048-path stat: repeated | 0.9369 | 0.9690 | +3.43% | &#91;-5.26%, +11.44%&#93; | no detected difference |
+| 128×64 KiB open/read/close: first | 40.2088 | 41.4687 | +3.13% | &#91;-0.68%, +5.74%&#93; | no detected difference |
+| 128×64 KiB open/read/close: repeated | 25.3731 | 36.6306 | +44.37% | &#91;+36.47%, +47.98%&#93; | slower |
+| 64 MiB sequential pread: first | 60.6072 | 65.8917 | +8.72% | &#91;+7.11%, +9.84%&#93; | slower |
+| 64 MiB sequential pread: repeated | 5.5443 | 4.5805 | -17.38% | &#91;-21.40%, -10.10%&#93; | faster |
+| 64 MiB mmap page-stride access: first | 23.8292 | 104.7507 | +339.59% | &#91;+328.77%, +352.40%&#93; | slower |
+| 64 MiB mmap page-stride access: repeated | 0.0964 | 0.1252 | +29.90% | &#91;+27.00%, +33.71%&#93; | slower |
+| 64 MiB two-thread pread: first | 54.4338 | 38.2736 | -29.69% | &#91;-32.16%, -28.25%&#93; | faster |
+| 64 MiB two-thread pread: repeated | 4.7336 | 4.1625 | -12.07% | &#91;-16.90%, +0.74%&#93; | no detected difference |
+
+The first mmap adds about 80.92 ms, while each warm sequential read saves about 0.96 ms. Reducing data READ requests is insufficient to offset the current first-access cost. Repeated small-file open/read/close also regresses consistently. Initial mapping, page faults, window reclamation and host mapping contention require separate diagnosis; these paired phase times do not attribute the difference to one lock or step. DAX is disabled by default with explicit opt-in retained. First mmap and window pressure need investigation before integrating read-only tool/image paths. The disabled experimental condition still reserves a window, so its cost does not exactly represent an ordinary device without one.
+
+[Complete statistics CSV](readonly-dax-summary.csv) · [Provenance and validation summary](readonly-dax-provenance.csv). The entry and reproduction instructions are in repository `benchmark.new/filesystem/README.md`. Raw logs, frozen source and artifacts are local under `benchmark.new/filesystem/.data/dax-20261011-final/`. This engineering batch is independent of the seven-tool, cross-runtime and historical startup datasets.
+
+## Linux: direct queue service and scoped fences, 60-sample quick retest {#direct-queue-fast}
+
+**Scheduling fixes show an improvement trend; the write regression remains.** Against the previous concurrency artifact, VM rg, Cargo and npm are about 7.54%, 4.10% and 4.64% faster in this batch. Internal task time falls about 2.71%, but its interval crosses zero. Write is still about 32.40% slower than the earlier optimized artifact. Each cell has only N=10: this is an exploratory direction check, not formal 30-round performance acceptance.
+
+### Changes and experiment design {#direct-queue-fast-protocol}
+
+Each queue thread directly waits for and consumes its own kick, admits requests, executes and publishes completion. Ordinary requests no longer use a coordinator-to-owner wake handoff. Stealing only considers a heavyweight operation running for at least 2 ms with actual ring backlog; admission rechecks eligibility under the ring lock. Short metadata operations cannot be stolen merely because their owner is busy. The 2 ms threshold is an elapsed-time heuristic, not proof of kernel sleep. The control thread checks rescue every 2 ms; idle queue threads wait indefinitely.
+
+Ordinary I/O obtains a native Arc lease under short handle-map/admission locks without a namespace operation guard. Namespace mutations remain serialized, but close admission and drain I/O only for affected files, directory subtrees and known object aliases. Release waits only for its handle. Scoped fences remain through mutation and reopen on failure; new I/O on unrelated handles can enter while a writer waits. Snapshot/restore/destroy retain a global admission fence and drain all I/O. Writeback and host FUSE dispatch are unchanged.
+
+The frozen GNU release/gateway candidate has SHA256 `ae221676e4bb04231c88f2ce17c2570824f4064f8a3a63d6ef32817b0e2afa98`. Controls in the same cohort are previous concurrency `build2` and earlier `candidate6`; the latter is a recovery reference, not the literal parent of `cf8bfa5`. The original seven-operation workload, firmware, complete tool inputs and timing boundaries are retained. Linux/KVM/FUSE/Btrfs; whole parent CPUs 0,1, two-core quota, 16 GiB, zero swap; VM 2 vCPU/16 GiB. Each trial owns a fresh namespace, pivot_root, workspace and tool caches. Host caches are warm. Fresh Host-listener/VM startup and exit enter completion; input/namespace preparation is excluded. Profiling is off.
+
+At the user's request, the 180-sample attempt was cancelled and retained separately. A new 60-sample batch runs three versions and two backends, each with 3 warmups and 10 shuffled paired rounds, seed 20261010. All 60 timed tasks and 18 warmups passed the original workload, Run Bundle, isolation and full-byte checks for 256 × 64 KiB upper files. Inputs/artifacts match before/after; no external build/test interference was detected. Polling every 0.5 s may miss brief or inaccessible activity. All slow valid samples remain; no P95/P99 is reported. Intervals from 5,000 paired bootstrap resamples are exploratory only.
+
+### Quick results and remaining issues {#direct-queue-fast-results}
+
+Units are ms, N=10 per arm. The previous condition is the same-cohort concurrency artifact; the candidate uses direct queues. The 95% CI is an exploratory median-difference interval. All seven operations, internal total, Ready/Result and normal exit are listed separately.
+
+| Backend | Metric | Previous ms | Candidate ms | Change | 95% CI ms | Conclusion |
+| --- | --- | --- | --- | --- | --- | --- |
+| staged | First valid output (Ready) | 218.77 | 217.92 | -0.39% | &#91;-2.07, +2.81&#93; | no detected difference |
+| staged | Launch to full result | 1432.62 | 1431.14 | -0.10% | &#91;-9.49, +15.92&#93; | no detected difference |
+| staged | Launch to normal exit | 1668.79 | 1667.37 | -0.09% | &#91;-20.76, +28.91&#93; | no detected difference |
+| staged | Internal seven-tool total | 1213.94 | 1213.16 | -0.06% | &#91;-7.08, +16.04&#93; | no detected difference |
+| staged | Traverse 2,048 files | 66.31 | 65.26 | -1.58% | &#91;-1.32, -0.31&#93; | faster |
+| staged | Read and verify 64 MiB | 68.04 | 68.75 | +1.03% | &#91;-1.30, +4.92&#93; | no detected difference |
+| staged | Write 256 × 64 KiB | 27.67 | 27.12 | -1.99% | &#91;-1.64, +0.56&#93; | no detected difference |
+| staged | git status | 143.37 | 141.31 | -1.43% | &#91;-5.07, +1.35&#93; | no detected difference |
+| staged | rg | 106.64 | 106.09 | -0.52% | &#91;-1.78, +0.69&#93; | no detected difference |
+| staged | Offline Cargo compile | 77.50 | 76.54 | -1.24% | &#91;-1.90, +9.94&#93; | no detected difference |
+| staged | Offline npm install | 226.99 | 230.30 | +1.46% | &#91;+0.62, +6.67&#93; | slower |
+| VM | First valid output (Ready) | 691.96 | 693.36 | +0.20% | &#91;-7.61, +5.32&#93; | no detected difference |
+| VM | Launch to full result | 4408.21 | 4303.32 | -2.38% | &#91;-198.58, +264.50&#93; | no detected difference |
+| VM | Launch to normal exit | 4595.45 | 4484.43 | -2.42% | &#91;-222.17, +248.70&#93; | no detected difference |
+| VM | Internal seven-tool total | 3707.29 | 3606.71 | -2.71% | &#91;-200.10, +264.86&#93; | no detected difference |
+| VM | Traverse 2,048 files | 148.97 | 142.88 | -4.09% | &#91;-34.00, +57.34&#93; | no detected difference |
+| VM | Read and verify 64 MiB | 116.58 | 116.24 | -0.29% | &#91;-5.80, +2.48&#93; | no detected difference |
+| VM | Write 256 × 64 KiB | 153.00 | 157.08 | +2.67% | &#91;-21.79, +28.41&#93; | no detected difference |
+| VM | git status | 404.51 | 387.07 | -4.31% | &#91;-43.16, +362.83&#93; | no detected difference |
+| VM | rg | 453.05 | 418.87 | -7.54% | &#91;-52.35, -19.30&#93; | faster |
+| VM | Offline Cargo compile | 508.94 | 488.07 | -4.10% | &#91;-30.01, -11.13&#93; | faster |
+| VM | Offline npm install | 975.21 | 929.92 | -4.64% | &#91;-142.85, -34.51&#93; | faster |
+
+Against previous concurrency, VM internal task P50 is 3707.29 → 3606.71 ms (-2.71%), difference interval [-200.10, 264.86] ms. Completion is 4595.45 → 4484.43 ms (-2.42%), interval [-222.17, 248.70] ms. Both cross zero, so overall recovery is not established.
+
+- rg is 453.05 → 418.87 ms (-7.54%), exploratory difference interval [-52.35, -19.30] ms.
+- Cargo is 508.94 → 488.07 ms (-4.10%), interval [-30.01, -11.13] ms.
+- npm is 975.21 → 929.92 ms (-4.64%), interval [-142.85, -34.51] ms.
+- Write is 153.00 → 157.08 ms (+2.67%), interval [-21.79, 28.41] ms, with no detected improvement. Metadata/read/Git also have no detected difference.
+
+Against same-cohort `candidate6`, VM internal task is 3621.29 → 3606.71 ms (-0.40%), with an interval crossing zero; rg/npm also have no detected difference. Write is 118.64 → 157.08 ms (+32.40%), exploratory difference interval [9.88, 63.74] ms, and remains the main unresolved item. Staged internal work is 1213.94 → 1213.16 ms and completion 1668.79 → 1667.37 ms, both without a detected difference. Its small-sample metadata/npm changes are not attributed to unused VM execution changes. Comparisons use only this cohort, without pooling previous medians or attributing separate contributions to the three fixes.
+
+VM library tests pass 363 with 8 skipped; all-target Clippy and warnings-denied rustdoc pass. Regressions cover direct kick/stop, non-stealing of short requests, long-request backlog completion on its original ring, same-object waits, independent namespace mutation and new unrelated I/O admission during a wait. Snapshot/lifecycle tests are retained. After the measurement build, existing `cfg(test)` device tests were only moved to the end of their file for lint; production implementation matches.
+
+[Quick statistics and exploratory intervals](direct-queue-filesystem-summary.csv) · [Artifacts, cancellation and provenance](direct-queue-provenance.csv). Raw evidence is local under `benchmark/.data/direct-queue-quick-20261011/`; frozen source, build, preflight, cancellation, validation and static checks are under `benchmark/pvisor/.data/direct-queue-retest-20261011/`. This batch is not expanded or substituted into cross-runtime user tables. Write still needs separate diagnosis; cold storage, concurrency throughput and macOS are not covered.
+
+## Linux: concurrency refactor retest, 2026-10-11 {#concurrency-retest}
+
+**This batch does not resolve all filesystem regressions.** Against the pre-refactor artifact, staged completion improves by about 5.00%, while internal task time has no detected difference. VM internal task time increases by about 4.78%, with detected regressions in write, rg and npm. Implementing multiple queues, dedicated workers and handle leases is not performance acceptance.
+
+### Motivation and experiment design {#concurrency-retest-protocol}
+
+This experiment checks dedicated hiprio service, multiple normal queues and queue threads, direct execution and pending-descriptor stealing, staged guest writeback, leased I/O, and startup/exit cleanup changes. The candidate is `build2`, a frozen GNU release/gateway build of the current uncommitted source, SHA256 `87ebb0658f2df6a84f9e4eca29c8d3d8bc01923817f04432780272c8b1b30309`. The other arms are the earlier `candidate6` and a control reversing only `65e65c93` and `09bd1d59`. That control retains other changes and default stage synchronization; it is not the literal parent of `cf8bfa5`. This is a version comparison, not attribution of every difference to one optimization.
+
+Linux/KVM/FUSE/Btrfs, identical firmware and complete tool inputs. The whole parent group uses CPUs 0,1, a two-core quota, 16 GiB and zero swap; the VM has 2 vCPUs and 16 GiB. Each arm/backend has 3 warmups and 30 shuffled paired rounds, seed 20261010, warm host caches, fresh workspaces/tool caches, and a private user/mount/PID namespace with owned pivot_root per trial. Namespace/input preparation is excluded; a fresh Host listener, VM startup and exit are included in completion. The original seven-operation reference workload and timer are used, without profiling; this is not hyperfine.
+
+### Data and analysis {#concurrency-retest-results}
+
+Units are ms, N=30 per arm. The previous condition is the same-cohort optimized artifact before the refactor; the candidate is the concurrency-refactor artifact. The 95% CI is for the median difference; separated distributions retain cluster medians and counts.
+
+| Backend | Metric | Previous ms | Candidate ms | Change | 95% CI ms | Conclusion |
+| --- | --- | --- | --- | --- | --- | --- |
+| staged | First valid output (Ready) | 229.99 | 219.25 | -4.67% | &#91;-11.62, -9.23&#93; | faster |
+| staged | Launch to full result | 1452.13 | 1424.04 | -1.93% | &#91;-38.42, -8.24&#93; | faster |
+| staged | Launch to normal exit | 1755.90 | 1668.16 | -5.00% | &#91;-99.79, -66.71&#93; | faster |
+| staged | Internal seven-tool total | 1221.64 | 1204.69 | -1.39% | &#91;-21.77, +0.03&#93; | no detected difference |
+| staged | Traverse 2,048 files | 66.75 | 66.35 | -0.60% | &#91;-0.71, +0.03&#93; | no detected difference |
+| staged | Read and verify 64 MiB | 67.20 | 67.62 | +0.62% | &#91;-0.82, +1.47&#93; | no detected difference |
+| staged | Write 256 × 64 KiB | 27.76 | 26.67 | -3.92% | &#91;-1.84, -0.68&#93; | faster |
+| staged | git status | 142.65 | 141.87 | -0.54% | &#91;-2.02, +1.26&#93; | no detected difference |
+| staged | rg | 107.21 | 107.58 | +0.34% | &#91;-0.41, +1.26&#93; | no detected difference |
+| staged | Offline Cargo compile | 71.79 | 70.61 | -1.64% | &#91;-2.77, +0.59&#93; | no detected difference |
+| staged | Offline npm install | 230.26 | 230.26 | -0.00% | &#91;-2.28, +2.13&#93; | no detected difference |
+| VM | First valid output (Ready) | 701.29 | 693.92 | -1.05% | &#91;-15.10, +0.22&#93; | no detected difference |
+| VM | Launch to full result | 4278.45 | 4446.60 | +3.93% | &#91;+65.69, +210.06&#93; | slower |
+| VM | Launch to normal exit | 4535.76 | 4635.26 | +2.19% | &#91;-1.90, +148.13&#93; | no detected difference |
+| VM | Internal seven-tool total | 3578.18 | 3749.07 | +4.78% | &#91;+107.48, +210.48&#93; | slower |
+| VM | Traverse 2,048 files | 157.80 | 138.86 | -12.00% | &#91;-35.21, +1.45&#93; | no detected difference |
+| VM | Read and verify 64 MiB | 117.67 | 116.86 | -0.69% | &#91;-3.52, +0.19&#93; | no detected difference |
+| VM | Write 256 × 64 KiB | 131.05 | 163.68 | +24.90% | &#91;+15.38, +42.35&#93; | slower |
+| VM | git status | 375.05 (n=24); 749.92 (n=6) | 399.04 (n=25); 798.60 (n=5) | — | — | Separated clusters; no overall ranking |
+| VM | rg | 426.74 | 450.55 | +5.58% | &#91;+16.56, +36.92&#93; | slower |
+| VM | Offline Cargo compile | 501.38 | 502.77 | +0.28% | &#91;-6.34, +10.58&#93; | no detected difference |
+| VM | Offline npm install | 923.22 | 973.34 | +5.43% | &#91;+31.98, +62.59&#93; | slower |
+
+All 180 formal tasks and 18 warmups passed the original task, Run Bundle, isolation and full byte checks for all 256 × 64 KiB upper files. Complete input inventories match before/after. Intervals use 5,000 paired-round bootstrap resamples; all slow valid samples are retained, with no P99. Against `candidate6`:
+
+- Staged completion P50 is 1755.90 → 1668.16 ms: -87.74 ms, CI95 [-99.79, -66.71]. Internal task time is 1221.64 → 1204.69 ms, with difference interval [-21.77, 0.03] crossing zero. Write improves by about 3.92%; other operations have no detected difference.
+- VM internal task time is 3578.18 → 3749.07 ms: +170.89 ms, CI95 [107.48, 210.48]. Write is 131.05 → 163.68 ms (+24.90%), rg 426.74 → 450.55 ms (+5.58%), and npm 923.22 → 973.34 ms (+5.43%). All three difference intervals exclude zero; metadata, read and cargo have no detected difference.
+- VM completion is 4535.76 → 4635.26 ms, with difference interval [-1.90, 148.13] crossing zero. Better exit handling cannot conceal slower internal work. Git has separated clusters in both arms: baseline cluster medians 375.05/749.92 ms with 24/6 samples, candidate 399.04/798.60 ms with 25/5. No whole-distribution median ranking is made.
+- Against the same-cohort rollback control, VM internal work is still 4.45% slower, write 24.59%, rg 6.17%, and npm 4.86%, with all these difference intervals excluding zero. Staged internal task time has no detected difference.
+
+The first formal attempt was rejected for external Cargo activity; its 27 samples are retained separately. Only the new batch is used above, with no interference detected by 0.5 s external build/test polling, which may miss brief, inaccessible or unrecognized activity. Initial VM preflight also exposed a race between an empty-ring check and guest descriptor publication. The fix was rebuilt from newly frozen source and passed preflight; a new 5,000-publication concurrency regression test passed. Related library tests passed 633 with 19 skipped; after the fix, VM library tests passed 361 with 8 skipped. Full CLI integration testing had Host-listener/namespace environment failures and is not reported as a complete pass.
+
+[Full statistics and paired intervals](concurrency-filesystem-summary.csv) · [Artifacts, control scope and provenance](concurrency-retest-provenance.csv) · [Startup/exit retest](vm-startup-performance-analysis.md#concurrency-retest). Raw report and per-trial evidence are local under `benchmark/.data/concurrency-formal2-20261011/`; builds, rejected attempts and validation scripts are under `benchmark/pvisor/.data/concurrency-retest-20261011/`. These engineering results do not replace historical cross-runtime user tables or establish cold-disk, concurrency-throughput or macOS performance. VM write/tool costs and staged startup variability require separate diagnosis.
+
+## Idle request dispatch in Linux staged execution {#host-idle-dispatch}
+
+**A controlled engineering A/B finds that idle dispatch reduces staged write time by 19.27%, Git by 12.78%, search by 12.88%, and the complete seven-tool task by 2.86%; no difference is detected for reading or startup.** This covers Linux staged only. It does not rescale the cross-runtime user table or establish VM, macOS, cold-disk or concurrent-throughput results.
+
+### Motivation, implementation and experiment design {#host-idle-protocol}
+
+Responsiveness during copying and everyday tool cost must be evaluated together. The previous scheduler hands even idle short requests to a worker, adding thread switches. The fix executes mutations requiring no copy preparation directly when the mutation lane is idle; reads execute directly only when both lanes are idle. READ requests of at least 64 KiB retain worker dispatch for bulk-read pipelining. Accepted requests or active copy preparation keep reads on their independent bounded queue; inode pins, FIFO, capacity limits and shutdown draining remain enforced. Baseline fingerprints, journals, durability and isolation retain their existing semantics.
+
+Measured 2026-10-10 on Linux x86_64 / Fedora 7.2.8-200.fc44.x86_64 / Ryzen 7 9700X / Btrfs. Both release artifacts use one frozen source; the candidate changes only host dispatch, private tests and API/README documentation. The whole parent uses CPUs 0,1, a two-core quota, 16 GiB memory and zero swap. Host caches are warm; every task has a fresh workspace and private tool caches, Python bypasses bytecode and Node caching is enabled. The seven workloads match [B-FS-TOOLS](../benchmarks/filesystem.md#reference-fs), with default serial stage synchronization.
+
+Every sample uses independent user/mount/PID namespaces and an owned pivot_root, binding workspace and stage to the same Btrfs storage. Namespace creation, binary copies and input preparation are untimed; a fresh Host listener is included in complete-task timing. Absolute times therefore are not pooled with the user page's cross-runtime configuration. Each arm has three warmups and 30 seeded randomly paired rounds, seed 20261010, without profiling, using the original reference task timer rather than hyperfine. All 60 formal tasks and six warmups pass output, Run Bundle, host-isolation and full-byte checks of all 256 upper files; input inventories match before and after. An external observer checks same-user builds/tests every 0.5 seconds and rejects the entire cohort on detection. None is detected; short, inaccessible or unrecognized activity can be missed.
+
+### Engineering results and correctness boundaries {#host-idle-results}
+
+Milliseconds, P50, N=30 per arm. Change is candidate relative to baseline; intervals use 5,000 paired-round bootstrap resamples. No distribution triggers the separated-cluster rule, and no P99 is reported.
+
+| Metric | Baseline ms | Fixed ms | Change and 95% CI |
+| --- | ---: | ---: | --- |
+| Tool Ready | 231.34 | 231.15 | -0.08% [-0.87%, +0.41%]; no detected difference |
+| Complete seven-tool task and exit | 1826.42 | 1774.15 | -2.86% [-3.57%, -1.22%] |
+| Traverse 2,048 files | 67.69 | 66.88 | -1.20% [-1.99%, -0.81%] |
+| Read and verify 64 MiB | 72.05 | 70.12 | -2.68% [-6.31%, +4.80%]; no detected difference |
+| Write 256 files | 35.09 | 28.33 | -19.27% [-20.37%, -18.47%] |
+| git status | 162.31 | 141.56 | -12.78% [-13.35%, -12.15%] |
+| Ripgrep search | 122.74 | 106.93 | -12.88% [-13.50%, -12.17%] |
+| Offline Cargo build | 79.37 | 77.06 | -2.92% [-4.21%, -1.63%] |
+| Offline npm install | 231.70 | 229.50 | -0.95% [-1.74%, -0.06%] |
+
+The complete-task median difference is -52.27 ms, 95% CI [-65.35, -22.30] ms. The read interval includes zero, so no read-speed gain is claimed. All 68 ordinary Rust tests, seven real Linux FUSE mount tests, targeted Clippy and warnings-denied rustdoc pass. Coverage retains metadata/readonly access during copying, saturation, FIFO, worker and inline shutdown draining, cache notifications and parallel mount stress. This fix has no macOS performance acceptance yet.
+
+[Idle-dispatch summary CSV](host-idle-dispatch-summary.csv) · [Source, artifact and experiment provenance](host-idle-dispatch-provenance.csv). Raw reports, stdout, budget and namespace receipts remain locally in `benchmark/.data/fr10fixf3/`; frozen sources, build receipts, publication checks and external interference records remain in `benchmark/pvisor/.data/filesystem-regression-20261010/`. Raw and intermediate diagnostic samples are retained and excluded from formal statistics.
+
+## Linux VM worker scheduling and completion wakes {#vm-completion-dispatch}
+
+**In the controlled Linux VM engineering comparison, the fix reduces complete-task latency by 3.15%, 64 MiB read/verify latency by 3.06%, and offline Cargo build latency by 3.14%. Other metrics show no detected difference or separated clusters.** Against the control reverting only the two recent changes, Traverse 2,048 files, Read and verify 64 MiB, Offline Cargo build still show detectable costs; complete recovery of single-request costs is not established. This is B-FS-ENG evidence, kept separate from the staged engineering cohort and cross-runtime user tables. It does not establish macOS, cold-disk or concurrent-throughput results.
+
+### Motivation, implementation and experiment design {#vm-completion-protocol}
+
+Offloading large reads and directory requests leaves metadata/hiprio admission responsive, but worker migration, receiver selectors and completion wakes add tool latency for uncontended requests. The fix reuses the first worker whenever all in-flight requests have cleared, reducing migration for uncontended requests. Requests arriving with work in flight retain the original shared FIFO and parallel receivers for bursts. The dedicated idle inlet has capacity one and counts against the same total bound covering queued, executing and unpublished completions. The owner retains RAM lease management. Before waiting, the owner atomically arms and checks the completion channel; after sending completion, workers atomically disarm and signal only an armed owner. Ready completions use a zero-timeout poll that still checks stop first. Large READ/directory requests remain asynchronous, the owner alone publishes the used ring, and shutdown drains before joining all workers.
+
+Measured on 2026-10-11: Linux x86_64 / Fedora 7.2.8-200.fc44.x86_64 / Ryzen 7 9700X / Btrfs. Three release artifacts share the same frozen October 10 source: the reverted control reverses only `65e65c93` and `09bd1d59`; the current baseline retains those changes and the host idle-dispatch fix; the candidate changes only the VM worker implementation, private tests and crate README relative to that baseline. The reverted control retains all other source and serial stage-sync defaults. It is unrelated to the October 6 historical cohort.
+
+The whole parent has CPUs 0,1, a two-core quota, 16 GiB and no swap; VMs have 2 vCPUs and 16 GiB guest RAM with the same firmware, tools and inputs. Host caches are warm; every trial has a fresh workspace and separate tool caches, Python reads/writes no bytecode, and Node caching is enabled. Each trial owns a private user/mount/PID namespace, pivot_root, fresh VM and Host listener. Namespace/input preparation is outside the timer; launch and exit are included in completion. Workspace/stage remain Btrfs binds. Each artifact has 3 warmups and 30 randomly paired rounds, seed 20261010. Timing uses the original reference task timer, not hyperfine, with profiling disabled.
+
+All 90 formal tasks and 9 warmups passed output, Run Bundle, host isolation, complete bytes in all 256 upper files and before/after input-inventory checks. Same-user build/test polling every 0.5 s detected no interference; short, inaccessible or unrecognized activity may be missed. All valid slow samples remain. This cohort is retained separately and does not fill other cohorts.
+
+### Controlled results and remaining costs {#vm-completion-results}
+
+Units ms, N=30 per artifact. Values are normally P50; separated clusters show their medians and counts without an overall ranking. Intervals use 5,000 paired-round bootstrap resamples. No P99 is reported.
+
+| Metric | Current baseline ms | Fixed ms | Change and 95% CI |
+| --- | ---: | ---: | --- |
+| Tool Ready | 702.39 | 701.45 | -0.13% [-0.39%, +0.41%]; no detected difference |
+| Complete seven-tool task and exit | 4741.87 | 4592.36 | -3.15% [-6.14%, -1.23%] |
+| Traverse 2,048 files | 154.58 | 159.74 | +3.34% [-11.45%, +10.03%]; no detected difference |
+| Read and verify 64 MiB | 120.47 | 116.78 | -3.06% [-3.89%, -0.96%] |
+| Write 256 files | 130.89 | 130.24 | -0.50% [-9.19%, +9.89%]; no detected difference |
+| git status | 436.55 | 371.64 (25/30); 617.08 (5/30) | Separated clusters; no overall ranking |
+| Ripgrep search | 417.92 | 424.90 | +1.67% [-1.01%, +5.40%]; no detected difference |
+| Offline Cargo build | 523.22 | 506.79 | -3.14% [-4.46%, -0.53%] |
+| Offline npm install | 926.99 | 923.10 | -0.42% [-1.88%, +0.63%]; no detected difference |
+
+
+Recovery uses the reverted control from this same cohort, rather than historical page percentages:
+
+| Metric | Reverted control ms | Fixed ms | Change and 95% CI |
+| --- | ---: | ---: | --- |
+| Complete seven-tool task and exit | 4553.30 | 4592.36 | +0.86% [-1.41%, +2.43%]; no detected difference |
+| Traverse 2,048 files | 132.99 | 159.74 | +20.12% [+1.50%, +35.87%] |
+| Read and verify 64 MiB | 114.36 | 116.78 | +2.12% [+0.80%, +3.71%] |
+| Offline Cargo build | 488.23 | 506.79 | +3.80% [+2.84%, +5.71%] |
+
+
+Against the control reverting only the two recent changes, Traverse 2,048 files, Read and verify 64 MiB, Offline Cargo build still show detectable costs; complete recovery of single-request costs is not established. The three artifacts include recent scheduling and journal semantic changes, so remaining gaps cannot all be attributed to one worker handoff. Metrics with separated clusters have no single overall ranking. All 359 VM tests, targeted Clippy, warnings-denied rustdoc and real CLI/guest execution passed. Coverage includes idle-worker reuse, metadata behind long requests, out-of-order completion, retained RAM leases, nonparking ready completions and freeze drain. macOS performance has not been accepted.
+
+[VM scheduling statistics CSV](vm-completion-dispatch-summary.csv) · [Source, artifact and experiment provenance](vm-completion-dispatch-provenance.csv). Raw reports and trial evidence remain locally in `benchmark/.data/fr10vmfixf/`; frozen source, builds and publication checks are in `benchmark/pvisor/.data/filesystem-regression-20261010/`. These absolute times are not joined to the configuration on the cross-runtime user page.
+
+## Optimization candidates after the fixes {#optimization-candidates}
+
+**Prioritize repeated physical checks during path resolution, then the cache contract for immutable rootfs inputs, directory requests and completion notifications.** Three instrumented diagnostics support this investigation order; speedups for these candidates remain unmeasured.
+
+### Motivation and experiment design {#optimization-candidates-protocol}
+
+On 2026-10-11, B-FS-DIAG runs three independent VM seven-tool tasks using the final frozen `candidate5` release above (SHA-256 `a4cfdbc6e2657f9ff6a43a4c640cd472c1c94c965c9d388924e58727dc55556d`). Inputs, firmware, private namespaces/owned pivot_root, whole-parent CPUs 0,1 / two-core quota / 16 GiB / zero swap and tool-cache policy match the earlier experiment. Filesystem profiling and startup timing are enabled; stderr goes to regular files. There are no warmups, version controls or external build/test interference monitoring. These diagnostics do not enter user tables or performance acceptance.
+
+All three tasks pass tool output, Run Bundle, host isolation and full-byte checks of 256 upper files; input inventories match before and after. Each has 13/13 final profile instances, retaining the last cumulative record by PID/component/instance and separating equal-numbered supervisor and VMM instances. The table aggregates the two active VM instances. Cumulative spans for a label can overlap across workers; they cannot establish task-time fractions, predicted speedups or attribution to individual tools.
+
+### Request costs and candidate priorities {#optimization-candidates-results}
+
+| Observation | Range across three tasks | Implication |
+| --- | ---: | --- |
+| Core path `resolve`, cumulative inclusive span | 368.6–378.8 ms | Investigate repeated path validation first |
+| Core physical parent stat count | 186,401–187,722 | Deep paths still repeat many checks per entry |
+| Core parent identity statx count | 109,564–110,238 | Preserve identity validation; evaluate reuse within one request |
+| Worker queue and completion wait, sum of cumulative spans | 84.0–93.5 ms | Dispatch costs remain; preserve responsiveness during long I/O |
+| Used interrupt count across both VM instances | 37,572–37,660 | Investigate batching and notification opportunities |
+
+| Priority | Candidate | Required contract checks and experiment |
+| --- | --- | --- |
+| 1 | Reuse validated parent/leaf information between Core and VM backing | Core resolves metadata before VM native lookup performs openat/statx again. Evaluate passing validated identities and owned backing handles within one request; preserve host replacements, mount identity, hard-link denials and reference release after errors. Measure deep-path metadata, READDIRPLUS and Cargo separately. |
+| 2 | Metadata/data caches for explicitly immutable rootfs inputs | A guest read-only mount can still be modified by its host; input lifetime or invalidation must establish immutability. Reduce Core physical queries before evaluating guest request counts; retain external-change visibility for live workspaces. Measure first access, warm caches and TTL expiry separately. |
+| 3 | Separate ordinary READDIR and READDIRPLUS service paths | Ordinary READDIR usually consumes OPENDIR name/type snapshots; PLUS resolves fresh attributes per entry. Evaluate bounded snapshot handling and parent reuse in batches; preserve old-handle fallbacks, lock waits, large directories, deletion, permissions and cookies/restoration. Moving every directory request inline is not justified. |
+| 4 | Worker dispatch and completion/interrupt batching | Preserve shared load balancing, long-read offload, owner-only virtqueue publication, RAM leases and freeze draining. Three earlier timing attempts for a per-worker queue candidate were rejected for external build/test interference; it remains unmerged. Add mixed long/short request and saturation correctness coverage before an independent 30-round A/B. |
+| 5 | Repeated fingerprint and persistence work | Each workspace performs 2,157 content fingerprints, with 46.3–51.9 ms cumulative spans. Investigate repeated observations/batching while retaining preimages before first mutation, journal order, durability and recovery; delaying records is not an equivalent low-cost substitute. |
+
+Linux local reads in this frozen artifact use `preadv` directly into guest descriptor buffers; the diagnostic does not establish a benefit from eliminating another intermediate copy. Independent DAX and writeback switch results are now available in the [read-only share comparison](#readonly-dax-ab) and [writeback comparison](#writeback-ab); guest-local/block rootfs lacks corresponding acceptance. These three diagnostic trials have no per-tool checkpoints, so overlapping spans cannot establish the timing share of metadata, read or Cargo.
+
+Raw evidence: `benchmark/.data/fr11explore/report.json`, frozen `runner.py`/`child.py`/`harness/`, artifact/source receipts, per-task stderr/stdout, `diagnostic-summary.json` and `counter-summary.csv`. Formal candidates continue through B-FS-ENG acceptance: same-source randomized pairing, three warmups/30 rounds, correctness and interference gates. A passing candidate can then justify repeating the cross-runtime user matrix.
+
+## Concurrent host access during copying and fingerprinting {#host-concurrency}
+
+**Independent engineering A/B on Apple M4 / APFS / macFUSE FSKit shows that host scheduling and journal-lock changes allow unrelated short file requests to overlap a 1 GiB copy or hash.** The gain is responsiveness during blocking work; complete seven-tool tasks, Linux FUSE, VM and cold disks have no corresponding new performance conclusions. These three independent B-FS-ENG cohorts are not pooled or used to rescale the [cross-runtime tool baseline](../benchmarks/filesystem.md).
+
+### Motivation and experiment design {#host-concurrency-protocol}
+
+A first write to a large file triggers copy-up, and a first read observation triggers content fingerprinting. Evaluate unrelated access waiting, idle request overhead and long-operation completion together to judge the scheduling benefits and costs.
+
+Measured 2026-10-10 on Apple M4, 24 GiB RAM, Darwin 27.0.0 / arm64, APFS, macFUSE 5.4.0 / FSKit, Rust 1.98.0 release, without fixed CPU affinity or whole-host resource limits. Each A/B freezes the same source and dependencies, restoring/retaining only its selected changes. Copy-up scheduling baseline files come from `392c9d99`; read-dispatch/journal-lock baseline files come from `f109dd25`, with candidate source `09bd1d59`. Other changes remain identical within each comparison; the two comparisons do not share one candidate artifact.
+
+Each cell has three warmups and 30 formal paired rounds, with seed 4207 shuffling conditions and A/B order. Inputs are warm-cache allocated deterministic 1 GiB files, fresh upper/work and independent paths. Copy experiments use real host mounts; journal experiments use one shared native Core without FUSE. Probes require an actually incomplete temporary copy, or evidence that the first content read occurred while hashing remains active, without artificial delay. Read probes release OPEN, READ and enumeration simultaneously and independently check that copying is still active, preventing an earlier blocking probe from turning later probes into idle measurements.
+
+Untimed checks cover complete lower/upper bytes, identity, hardlinks, held descriptors, rename, temporary-copy cleanup, journal fingerprints and normal unmount; native journal trials verify all 129 observations. Visible build/test interference is checked before, every 250 ms during and after each trial. Errors, missed windows or detected interference fail the whole cohort. Reports retain zero formal failures and zero slow-sample exclusions; every valid slow sample remains. Visible-process sampling cannot exclude short or inaccessible activity.
+
+Tables use milliseconds, N=30 per baseline/candidate cell, normally P50. Separated distributions list cluster medians and counts without a whole-distribution ranking. Intervals use 5,000 paired-round bootstrap resamples; P95 is descriptive only, with no P99. Formal timing has no profiling instrumentation.
+
+### Copy-up scheduling: metadata responsiveness {#host-copy-up}
+
+| Journal condition | Operation | Baseline ms | Candidate ms | Median change and 95% CI |
+| --- | --- | ---: | ---: | --- |
+| nojournal | First stat during copying | 802.858 | 0.681 | -99.915% [-99.919%, -99.911%] |
+| nojournal | 64-path stat during copying | 836.938 | 20.999 | -97.491% [-97.545%, -97.422%] |
+| nojournal | 1 GiB writable-open | 803.733 | 819.464 | +1.957% [-0.896%, +4.095%]; no detected difference |
+| nojournal | Idle 64-path stat | 34.558 | 34.596 | +0.108% [-8.278%, +7.639%]; no detected difference |
+| compact | First stat during copying | 790.321 | 1.655 | -99.791% [-99.816%, -99.782%] |
+| compact | 64-path stat during copying | 827.025 | 34.640 | -95.811% [-95.854%, -95.739%] |
+| compact | 1 GiB writable-open | 1232.667 | 1231.293 | -0.111% [-1.280%, +1.470%]; no detected difference |
+| compact | Idle 64-path stat | 32.165 | 34.069 | +5.921% [+2.299%, +10.745%] |
+
+Candidate 64-path stat completes before copying in 30/30 samples in both conditions; baseline first stat waits for copying to finish. The trigger occurs after byte copying begins, excluding earlier baseline-fingerprint waiting. Writable-open includes fingerprinting, copying, publication and protocol return; neither condition detects a median difference. Compact idle batches increase by 1.90 ms, absolute 95% CI [+0.76, +3.36] ms, precluding a general claim of faster everyday metadata operations.
+
+### Independent read dispatch and journal fingerprint locks {#host-read-journal}
+
+The mounted-read cohort is independent of the metadata cohort above. Every candidate read probe in every condition finishes before copying in 30/30 samples, versus 0/30 for baseline.
+
+| Journal condition | Operation | Baseline ms | Candidate ms | Median change and 95% CI |
+| --- | --- | ---: | ---: | --- |
+| nojournal | Read-only OPEN during copying | 784.602 | 1.577 | -99.799% [-99.817%, -99.782%] |
+| nojournal | Held-fd READ during copying, 64 KiB | 784.597 | 0.521 | -99.934% [-99.936%, -99.927%] |
+| nojournal | OPENDIR and 64-entry enumeration during copying | 791.558 | 6.919 | -99.126% [-99.190%, -99.074%] |
+| legacy | Read-only OPEN during copying | 797.214 | 3.172 | -99.602% [-99.612%, -99.579%] |
+| legacy | Held-fd READ during copying, 64 KiB | 797.424 | 0.960 | -99.880% [-99.909%, -99.860%] |
+| legacy | OPENDIR and 64-entry enumeration during copying | 804.033 | 10.292 | -98.720% [-98.758%, -98.695%] |
+| compact | Read-only OPEN during copying | 800.275 (25/30); 2340.599 (5/30) | 2.219 | Separated; no single ranking |
+| compact | Held-fd READ during copying, 64 KiB | 800.486 (25/30); 2340.717 (5/30) | 0.760 | Separated; no single ranking |
+| compact | OPENDIR and 64-entry enumeration during copying | 807.137 (25/30); 2347.782 (5/30) | 9.737 | Separated; no single ranking |
+
+Compact baseline reads separate into 25/30 ordinary and 5/30 slow samples; both clusters remain without a single speedup percentage. OPEN measures opening only; complete open/read/close is separate in the CSV and includes FSKit parent xattr queries and read-only close callbacks.
+
+The native journal cohort measures `observe_read` for 64 unrelated paths, also recording hash completion. Read observations retain their non-durable-per-read policy, with final `sync_preimages` outside timing.
+
+| Journal condition | Operation | Baseline ms | Candidate ms | Median change and 95% CI |
+| --- | --- | ---: | ---: | --- |
+| legacy | First unrelated read observation | 462.276 | 0.184 | -99.960% [-99.964%, -99.956%] |
+| legacy | 64-path read observations | 473.262 | 12.011 | -97.462% [-97.521%, -97.384%] |
+| legacy | Complete 1 GiB fingerprint | 462.230 | 469.558 | +1.585% [+0.621%, +1.964%] |
+| compact | First unrelated read observation | 450.714 | 0.045 (25/30); 0.071 (5/30) | Separated; no single ranking |
+| compact | 64-path read observations | 453.158 | 2.385 | -99.474% [-99.477%, -99.464%] |
+| compact | Complete 1 GiB fingerprint | 450.739 | 452.237 | +0.332% [-0.398%, +0.783%]; no detected difference |
+
+Legacy's 64-path observation waiting falls substantially, while its full hash increases by 7.329 ms, absolute 95% CI [+2.894, +9.066] ms. Compact hashing detects no difference. All idle probes in the read cohort and idle observations in the journal cohort detect no difference, which does not prove equal overhead. Compact writable-open median falls by 1.89%, 95% CI [−3.13%, −0.45%]; other conditions detect no difference. This measures open completion under concurrent probes, not independent storage bandwidth.
+
+Long-operation tails remain uncertain: the read cohort's no-journal writable-open reference P95 moves from 952.6 to 3166.9 ms, with maxima 1469.6/4636.8 ms; all slow samples remain. Normal read/write I/O, directory snapshots and publication can still occupy the shared state lock. Independent queues do not guarantee arrival order for overlapping reads and mutations, and concurrent first observations can duplicate fingerprint work. Short-request improvements do not establish that complete Agent tasks or long operations never regress.
+
+### Parallel stage synchronization: measurement status {#parallel-stage-sync}
+
+`PVISOR_STAGE_SYNC_WORKERS=2|4|8` opts into a bounded regular-file synchronization pool during stage sealing; unset or `1` retains serial execution. Journal validation and persistence finish first. Every file synchronization must succeed and every worker join before bottom-up directory synchronization, parent persistence and atomic seal publication; failure publishes no new seal. Explicit workload fsync and journal synchronization do not use this pool.
+
+**No independent serial/parallel timing data is available.** The A/B above does not change worker counts and cannot quantify this option's gains. Evaluation requires one frozen binary, fresh stages and otherwise identical configurations, timing through complete persistence and verifying unchanged lowers, complete upper bytes and completion markers. Implementation availability does not establish a speedup magnitude.
+
+### Derived data, sources and reproduction {#host-concurrency-evidence}
+
+[Copy-up statistics CSV](host-copy-up-summary.csv) · [Read-dispatch statistics CSV](host-read-summary.csv) · [Journal-lock statistics CSV](journal-lock-summary.csv). These directly copy committed derived results, retaining cohorts, sample counts, distributions, relative/absolute intervals and raw-report digests; artifact digests and source receipts are in the source reports. Complete idle controls, reference tails and extrema remain in the CSVs.
+
+Sources: [copy-up engineering report](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/HOST_COPY_UP_REPORT.md), [read-dispatch and journal-lock engineering report](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/HOST_READ_JOURNAL_REPORT.md). Raw logs, sources and artifacts remain in the measurement workspace's `benchmark/pvisor/.data/host-copy-up-*`, `.data/read-*` and `.data/journal-*`, without site downloads. Reproduce using the [host copy-up manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md#host-copy-up-scheduling-ab-on-macos) and [read-dispatch/journal-lock manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md#read-dispatch-and-journal-fingerprint-locks-on-macos). macOS/macFUSE is required; Linux harness tests cannot replace mounted measurements.
+
 ## Current Linux HOST kernel caching and evidence {#host-kernel-cache}
 
 **Under an explicit ownership contract, the Linux HOST API supports writable `Metadata` and read-only `MetadataAndData`; current-source correctness tests and independent request counters are valid, while formal performance acceptance remains blocked.** Kernel caching and the service-side immutable-lower physical metadata cache below are separate mechanisms. Neither automatically changes product executor defaults.

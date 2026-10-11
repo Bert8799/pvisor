@@ -10,6 +10,12 @@
 | Dependency downloads inside a VM | Budget transmission separately from environment startup |
 | Blocking direct TCP connections | Host/VM deny-all positive and negative controls are tested; latency is not isolation evidence |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Agents request models, download dependencies and consume streams. These workloads respond differently to proxy overhead. Separate request latency, first byte, full transmission and startup to understand the waiting involved.

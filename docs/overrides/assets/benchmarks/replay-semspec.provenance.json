@@ -1,0 +1,37 @@
+{
+  "batch": "replay-20261010T194213Z-9zpco2sv",
+  "benchmark_id": "B-REPLAY",
+  "role": "user-facing",
+  "entry": "replay/replay.json",
+  "recorded_at": "2026-10-10T19:42:13.896344+00:00",
+  "runs": 60,
+  "warmup": 0,
+  "metric_scope": "direct subject command; hyperfine hooks and semspec excluded",
+  "platform": "Linux-7.2.8-200.fc44.x86_64-x86_64-with-glibc2.43",
+  "kernel": "7.2.8-200.fc44.x86_64",
+  "cpu_affinity": [
+    0,
+    1
+  ],
+  "source_commit": "b3e2f03509396b8ebe840a9ccdefa63424bc1afe",
+  "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+  "fixture_scope": "one fixed synthetic task 0 per adapter; distinct from historical twenty-task cohort",
+  "hyperfine_version": "hyperfine 2.0.0",
+  "exports": {
+    "in.bench.json": "34f0c4a59ad1612860c382951158167a4fb3a2f45e47dbf635d0dca793105eca",
+    "in.render.json": "22244571709617b5be20c3d769fc2f6e4c6d9482917ad69ab34ded49ca21b12c"
+  },
+  "manifest_sha256": "202c53d97959bbdf76bb10fd5fb071d22eb2c435f194f48e3372800b02dd1c8e",
+  "artifacts": {
+    "pvisor-replay": "675ce7d3ce53bacbf10d6ed7e7df2fbac6d592507435200babb0782822e55275",
+    "fixtures/claude-code/trajectory.json": "639c918bffe7a61a695b44dc313fd677233333faae5fafe3638a5bcca92f50de",
+    "fixtures/codex/trajectory.json": "f81e8d7f42b477cbe55a63b89415bc23455a12ad3b000ef69ae564ec6de535ef",
+    "fixtures/opencode/trajectory.json": "e9e29d0129f973c5073f7964799df27cdc3049a29d42181d309214190227b8b5",
+    "fixtures/mini-swe-agent/trajectory.json": "29b0b9cb3897efb7e2cc0feec69d11c2a8ffb82ab1c0583cec7f9213ef5dd7a9",
+    "fixtures/openhands/trajectory.json": "d6daee3a05aaf026786a804a4f07c4aa232a469d7a1339b02cd5b00d8ec5d119",
+    "fixtures/pi-agent/trajectory.json": "beebfaa9e7264e9e0c576c6040986831fe98f4ee8774a54db41988fdd43c679e",
+    "fixtures/swe-agent/trajectory.json": "bab27618703c9d3b9718ef9eddcd46faf55e9dfc25ea98c3e69ca9b92b6ac96d",
+    "protocol.json": "2bd5b02729a6861e57e79b560a4169b2aecbf403d9991632d77da78138e29a2f"
+  },
+  "publisher_sha256": "0aa41588227e9bf2a86f1a358cc7c91056d8b2d605a1bcf3ad9ad3782dbdfa7a"
+}

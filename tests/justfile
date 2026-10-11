@@ -11,6 +11,7 @@ test-task-routing:
     trap 'echo "FAIL: $BASH_COMMAND" >&2; cat "$work/stdout" "$work/stderr" >&2 2>/dev/null || true' ERR
     trap 'rm -rf "$work"' EXIT
     export JUST_TEST_LOG="$work/commands" CARGO_TARGET_DIR="$work/target with spaces" CARGO_INSTALL_ROOT="$work/install"
+    export JUST_TEST_PYTHON="$(python3 -c 'import sys; print(sys.executable)')"
     mkdir "$work/bin" "$work/tests"
     cp "{{ repo }}/justfile" "$work/justfile"
     cp "{{ repo }}/tests/justfile" "$work/tests/justfile"
@@ -21,6 +22,10 @@ test-task-routing:
     printf '%q\t' "$name" "$@" >> "$JUST_TEST_LOG"
     printf '\n' >> "$JUST_TEST_LOG"
     args=("$@")
+    if [[ "$name" == python3 && "${2:-}" == --check ]]; then
+      exec "$JUST_TEST_PYTHON" "$@"
+    fi
+    if [[ "$name" == python3 && "$1" == scripts/check-docs.py && "${JUST_TEST_BAD_DOCS_PREFLIGHT:-0}" == 1 ]]; then exit 1; fi
     if [[ "$name" == python3 && "$1" == scripts/packaging/stage_wheel_binaries.py ]]; then
       profile=debug
       for ((i=0; i<$#; i++)); do
@@ -55,6 +60,8 @@ test-task-routing:
       fi
     fi
     if [[ "$name" == uv || "$name" == uvx ]]; then
+      if [[ " $* " == *" zensical serve "* ]]; then test "${PVISOR_DOCS_LIVE:-0}" == 1; fi
+      if [[ " $* " == *" zensical build "* ]]; then test "${PVISOR_DOCS_LIVE:-0}" == 0; fi
       for ((i=0; i<$#; i++)); do
         if [[ "${args[$i]}" == --out-dir || "${args[$i]}" == --output-dir ]]; then
           staging=${args[$((i+1))]}
@@ -117,6 +124,7 @@ test-task-routing:
     run test-py
     check_line uv run --no-project --with 'setuptools>=77' python -m unittest discover -s tests
     check_line uv run --no-project --with 'setuptools>=77' python -m unittest discover -s benchmark/pvisor
+    check_line uv run --no-project --with 'setuptools>=77' python -m unittest discover -s benchmark.new/tests
     for flags in selected leading filter; do
       case "$flags" in
         selected) run test-py tests/test_docs.py -k reference -v; check_line uv run --no-project --with 'setuptools>=77' python -m unittest tests/test_docs.py -k reference -v ;;
@@ -187,14 +195,49 @@ test-task-routing:
     expect_failure ci "check;touch $work/injected" build
     test ! -e "$work/injected"
     test ! -s "$JUST_TEST_LOG"
+    ln -s "{{ repo }}/benchmark.new" "$work/benchmark.new"
     for recipe in fw cases benchmark doctor; do
       case "$recipe" in
         cases) expect_failure cases --suite unknown ;;
         benchmark) expect_failure benchmark smoke unknown ;;
         *) expect_failure "$recipe" unknown ;;
       esac
-      test ! -s "$JUST_TEST_LOG"
+      if [[ "$recipe" == benchmark ]]; then
+        command_line python3 "$work/benchmark.new/run.py" --check smoke unknown > "$work/expected"
+        diff -u "$work/expected" "$JUST_TEST_LOG"
+      else
+        test ! -s "$JUST_TEST_LOG"
+      fi
     done
+    run benchmark startup/timing 'pvisor vm'
+    check_line python3 "$work/benchmark.new/run.py" --check startup/timing 'pvisor vm'
+    check_line python3 "$work/benchmark.new/run.py" startup/timing 'pvisor vm'
+    run benchmark filesystem/tools native-read
+    check_line python3 "$work/benchmark.new/run.py" filesystem/tools native-read
+    expect_failure benchmark filesystem/tools 'pvisor vm'
+    command_line python3 "$work/benchmark.new/run.py" --check filesystem/tools 'pvisor vm' > "$work/expected"
+    diff -u "$work/expected" "$JUST_TEST_LOG"
+    grep -Fq 'available: native-metadata, native-read' "$work/stderr"
+    run benchmark smoke --binary /already-built/pvisor
+    {
+      command_line python3 "$work/benchmark.new/run.py" --check smoke --binary /already-built/pvisor
+      command_line cargo build --quiet --locked --manifest-path "$work/tools/semspec/Cargo.toml" --target-dir "$CARGO_TARGET_DIR/semspec"
+      command_line python3 "$work/benchmark.new/run.py" smoke --binary /already-built/pvisor
+    } > "$work/expected"
+    diff -u "$work/expected" "$JUST_TEST_LOG"
+    run benchmark smoke
+    check_line python3 "$work/benchmark.new/run.py" --binary "$CARGO_TARGET_DIR/pvisor-benchmark-build/release/pvisor" smoke
+    check_line python3 scripts/packaging/stage_wheel_binaries.py --profile release --target-dir "$CARGO_TARGET_DIR/pvisor-benchmark-build"
+    JUST_TEST_BAD_DOCS_PREFLIGHT=1 JUST_TEST_BAD_BUILD=1 run docs-serve en -a 127.0.0.1:3002
+    check_line uv run --no-project --with zensical==0.0.67 zensical serve -f docs/zensical.en.toml -a 127.0.0.1:3002
+    grep -Fq 'continuing live preview' "$work/stderr"
+    JUST_TEST_BAD_DOCS_PREFLIGHT=1 expect_failure docs-build
+    {
+      command_line python3 benchmark.new/docs.py check
+      command_line python3 scripts/check-reference.py
+      command_line python3 scripts/check-docs.py --preflight-build
+    } > "$work/expected"
+    diff -u "$work/expected" "$JUST_TEST_LOG"
     selection="S-DOC-001,\$(touch $work/injected)"
     run cases --case "$selection" --keep --require-reviewed
     check_line cargo run --quiet --manifest-path tools/semspec/Cargo.toml --locked -- run docs/src/zh/reference --domain DOC --subject-bin "$CARGO_TARGET_DIR/release/pvisor" --format json --output "$CARGO_TARGET_DIR/pvisor-case-report.json" --case "$selection" --keep --require-reviewed

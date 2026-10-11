@@ -2,20 +2,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::btree_map;
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, MaybeUninit};
+use std::mem::{self, MaybeUninit, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use caps::{has_cap, CapSet, Capability};
+use caps::{CapSet, Capability, has_cap};
 use nix::request_code_read;
 
 use vm_memory::ByteValued;
@@ -58,6 +58,9 @@ struct HandleData {
     file: RwLock<File>,
     exported: AtomicBool,
 }
+
+/// Pins the actual native descriptor, rather than just its reusable handle ID.
+pub(in crate::devices::virtio::fs) struct HandleLease(Arc<HandleData>);
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -450,6 +453,169 @@ enum FileOrLink {
 }
 
 impl PassthroughFs {
+    /// Read one regular-file child's attributes from its retained native parent.
+    /// This reply-only path does not allocate an inode or a leaf descriptor.
+    /// Non-regular children retain the ordinary lookup/submount path.
+    pub(in crate::devices::virtio::fs) fn regular_lookup_attributes(
+        &self,
+        parent: Inode,
+        name: &CStr,
+    ) -> io::Result<Option<(libc::stat64, Duration, Duration)>> {
+        // Only a single validated name is allowed: fstatat must not follow an
+        // intermediate symlink which the ordinary component walk would reject.
+        if name.to_bytes().is_empty()
+            || name.to_bytes().contains(&b'/')
+            || matches!(name.to_bytes(), b"." | b"..")
+        {
+            return Err(einval());
+        }
+        let parent = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&parent)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let mut attr = MaybeUninit::<libc::stat64>::zeroed();
+        // SAFETY: the Arc owns the directory FD throughout the syscall, and
+        // both the NUL-terminated single name and output remain valid. The
+        // no-follow query preserves the inode bound by ROOT_ID/parent lookup.
+        let result = unsafe {
+            libc::fstatat64(
+                parent.file.as_raw_fd(),
+                name.as_ptr(),
+                attr.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatat initialized the complete output.
+        let attr = unsafe { attr.assume_init() };
+        Ok((attr.st_mode & libc::S_IFMT == libc::S_IFREG).then_some((
+            attr,
+            self.cfg.attr_timeout,
+            self.cfg.entry_timeout,
+        )))
+    }
+
+    pub(in crate::devices::virtio::fs) fn with_dax_file(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        map: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        // Linux SETUPMAPPING supplies fh = -1: DAX ranges belong to an inode,
+        // rather than a particular open description. Borrow an already opened
+        // descriptor, so mapping never reopens a path or grants new authority.
+        // The Arc pins it if RELEASE races with this request.
+        let lease = if handle == u64::MAX {
+            self.handles
+                .read()
+                .unwrap()
+                .values()
+                .find(|data| data.inode == inode)
+                .cloned()
+                .map(HandleLease)
+                .ok_or_else(ebadf)?
+        } else {
+            self.lease_handle(inode, handle)?
+        };
+        let file = lease.0.file.read().unwrap();
+        map(&file)
+    }
+    pub(in crate::devices::virtio::fs) fn lease_handle(
+        &self,
+        inode: Inode,
+        handle: Handle,
+    ) -> io::Result<HandleLease> {
+        self.handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|data| data.inode == inode)
+            .cloned()
+            .map(HandleLease)
+            .ok_or_else(ebadf)
+    }
+
+    pub(in crate::devices::virtio::fs) fn read_leased<W: io::Write + ZeroCopyWriter>(
+        &self,
+        lease: &HandleLease,
+        mut writer: W,
+        size: u32,
+        offset: u64,
+    ) -> io::Result<usize> {
+        let file = lease.0.file.read().unwrap();
+        writer.write_from(&file, size as usize, offset)
+    }
+
+    pub(in crate::devices::virtio::fs) fn flush_leased(
+        &self,
+        lease: &HandleLease,
+    ) -> io::Result<()> {
+        // Serialize descriptor effects against writes and sync; File's
+        // shared-reference methods do not imply shared operation semantics.
+        #[allow(clippy::readonly_write_lock)]
+        let file = lease.0.file.write().unwrap();
+        // Match FUSE FLUSH's existing dup/close behavior while keeping this
+        // descriptor's lock and ownership through both syscalls.
+        let duplicate = unsafe { libc::dup(file.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::close(duplicate) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(in crate::devices::virtio::fs) fn sync_leased(
+        &self,
+        lease: &HandleLease,
+        datasync: bool,
+    ) -> io::Result<()> {
+        // Serialize descriptor effects against writes and sync; File's
+        // shared-reference methods do not imply shared operation semantics.
+        #[allow(clippy::readonly_write_lock)]
+        let file = lease.0.file.write().unwrap();
+        let result = unsafe {
+            if datasync {
+                libc::fdatasync(file.as_raw_fd())
+            } else {
+                libc::fsync(file.as_raw_fd())
+            }
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(in crate::devices::virtio::fs) fn write_leased<R: io::Read + ZeroCopyReader>(
+        &self,
+        _ctx: Context,
+        lease: &HandleLease,
+        mut reader: R,
+        size: u32,
+        offset: u64,
+        kill_priv: bool,
+    ) -> io::Result<usize> {
+        let _killpriv_guard = if kill_priv {
+            drop_effective_cap(Capability::CAP_FSETID)?
+        } else {
+            None
+        };
+        // Serialize writes and synchronization on this opened descriptor only.
+        // Serialize descriptor effects against writes and sync; File's
+        // shared-reference methods do not imply shared operation semantics.
+        #[allow(clippy::readonly_write_lock)]
+        let file = lease.0.file.write().unwrap();
+        reader.read_to(&file, size as usize, offset)
+    }
+
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let fd = if let Some(fd) = cfg.proc_sfd_rawfd {
             fd
@@ -955,9 +1121,10 @@ impl FileSystem for PassthroughFs {
         );
 
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
-        if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+        let writeback = self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE);
+        self.writeback.store(writeback, Ordering::Relaxed);
+        if writeback {
             opts |= FsOptions::WRITEBACK_CACHE;
-            self.writeback.store(true, Ordering::Relaxed);
         }
 
         if capable.contains(FsOptions::SUBMOUNTS) {
@@ -1279,26 +1446,15 @@ impl FileSystem for PassthroughFs {
         _ctx: Context,
         inode: Inode,
         handle: Handle,
-        mut w: W,
+        w: W,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // This is safe because write_from uses preadv64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
-        w.write_from(&f, size as usize, offset)
+        let lease = self.lease_handle(inode, handle)?;
+        self.read_leased(&lease, w, size, offset)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
@@ -1306,7 +1462,7 @@ impl FileSystem for PassthroughFs {
         _ctx: Context,
         inode: Inode,
         handle: Handle,
-        mut r: R,
+        r: R,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -1314,28 +1470,8 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        let _killpriv_guard = if kill_priv {
-            // We need to drop FSETID during a write so that the kernel will remove setuid
-            // or setgid bits from the file if it was written to by someone other than the
-            // owner.
-            drop_effective_cap(Capability::CAP_FSETID)?
-        } else {
-            None
-        };
-
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // This is safe because read_to uses pwritev64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
-        r.read_to(&f, size as usize, offset)
+        let lease = self.lease_handle(inode, handle)?;
+        self.write_leased(_ctx, &lease, r, size, offset, kill_priv)
     }
 
     fn getattr(
@@ -1685,58 +1821,13 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // Since this method is called whenever an fd is closed in the client, we can emulate that
-        // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
-        // because this doesn't modify any memory and we check the return values.
-        unsafe {
-            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
-            if newfd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            if libc::close(newfd) < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
+        let lease = self.lease_handle(inode, handle)?;
+        self.flush_leased(&lease)
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let fd = data.file.write().unwrap().as_raw_fd();
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            if datasync {
-                libc::fdatasync(fd)
-            } else {
-                libc::fsync(fd)
-            }
-        };
-
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        let lease = self.lease_handle(inode, handle)?;
+        self.sync_leased(&lease, datasync)
     }
 
     fn fsyncdir(
@@ -2092,89 +2183,6 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn setupmapping(
-        &self,
-        _ctx: Context,
-        inode: Inode,
-        _handle: Handle,
-        foffset: u64,
-        len: u64,
-        flags: u64,
-        moffset: u64,
-        host_shm_base: u64,
-        shm_size: u64,
-    ) -> io::Result<()> {
-        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::O_RDWR
-        } else {
-            libc::O_RDONLY
-        };
-
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::PROT_READ | libc::PROT_WRITE
-        } else {
-            libc::PROT_READ
-        };
-
-        if (moffset + len) > shm_size {
-            return Err(einval());
-        }
-
-        let addr = host_shm_base + moffset;
-
-        debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
-
-        let file = self.open_inode(inode, open_flags)?;
-        let fd = file.as_raw_fd();
-
-        let ret = unsafe {
-            libc::mmap(
-                addr as *mut libc::c_void,
-                len as usize,
-                prot_flags,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                fd,
-                foffset as libc::off_t,
-            )
-        };
-        if std::ptr::eq(ret, libc::MAP_FAILED) {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
-    }
-
-    fn removemapping(
-        &self,
-        _ctx: Context,
-        requests: Vec<fuse::RemovemappingOne>,
-        host_shm_base: u64,
-        shm_size: u64,
-    ) -> io::Result<()> {
-        for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
-                return Err(einval());
-            }
-            debug!("removemapping: addr={:x} len={:?}", addr, req.len);
-            let ret = unsafe {
-                libc::mmap(
-                    addr as *mut libc::c_void,
-                    req.len as usize,
-                    libc::PROT_NONE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
-                    -1,
-                    0_i64,
-                )
-            };
-            if std::ptr::eq(ret, libc::MAP_FAILED) {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        Ok(())
-    }
-
     fn ioctl(
         &self,
         _ctx: Context,
@@ -2246,6 +2254,153 @@ impl PassthroughFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regular_attributes_match_native_lookup_without_reading_file_contents() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"attributes only").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+        let time = std::time::UNIX_EPOCH + Duration::from_secs(1000);
+        File::open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(time)
+                    .set_modified(time),
+            )
+            .unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.path().to_string_lossy().into_owned(),
+                attr_timeout: Duration::from_secs(3),
+                entry_timeout: Duration::from_secs(7),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        let (attr, attr_timeout, entry_timeout) = fs
+            .regular_lookup_attributes(fuse::ROOT_ID, c"file")
+            .unwrap()
+            .unwrap();
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        macro_rules! same_fields {
+            ($($field:ident),+ $(,)?) => { $(assert_eq!(attr.$field, entry.attr.$field, stringify!($field));)+ };
+        }
+        same_fields!(
+            st_dev,
+            st_ino,
+            st_mode,
+            st_nlink,
+            st_uid,
+            st_gid,
+            st_rdev,
+            st_size,
+            st_blksize,
+            st_blocks,
+            st_atime,
+            st_atime_nsec,
+            st_mtime,
+            st_mtime_nsec,
+            st_ctime,
+            st_ctime_nsec
+        );
+        assert_eq!(attr.st_nlink, 2);
+        assert_eq!(attr_timeout, entry.attr_timeout);
+        assert_eq!(entry_timeout, entry.entry_timeout);
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (after.atime(), after.atime_nsec()),
+            (before.atime(), before.atime_nsec())
+        );
+        fs.forget(ctx, entry.inode, 1);
+        std::fs::write(&path, b"fresh host size").unwrap();
+        assert_eq!(
+            fs.regular_lookup_attributes(fuse::ROOT_ID, c"file")
+                .unwrap()
+                .unwrap()
+                .0
+                .st_size,
+            15
+        );
+        assert_eq!(
+            fs.regular_lookup_attributes(fuse::ROOT_ID, c"missing")
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
+
+    #[test]
+    fn regular_attributes_keep_single_name_nofollow_and_directory_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("directory")).unwrap();
+        std::fs::write(root.path().join("file"), b"data").unwrap();
+        std::os::unix::fs::symlink("file", root.path().join("symlink")).unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::SUBMOUNTS).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for name in [c"directory", c"symlink"] {
+            assert!(
+                fs.regular_lookup_attributes(fuse::ROOT_ID, name)
+                    .unwrap()
+                    .is_none()
+            );
+            let entry = fs.lookup(ctx, fuse::ROOT_ID, name).unwrap();
+            assert_ne!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+            fs.forget(ctx, entry.inode, 1);
+        }
+        for name in [c"", c".", c"..", c"directory/../file"] {
+            assert_eq!(
+                fs.regular_lookup_attributes(fuse::ROOT_ID, name)
+                    .err()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+        }
+        // /proc is already a distinct Linux mount: this read-only check needs
+        // no test mount and exercises the original directory SUBMOUNTS reply.
+        let host = PassthroughFs::new(
+            Config {
+                root_dir: "/".into(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        host.init(FsOptions::SUBMOUNTS).unwrap();
+        assert!(
+            host.regular_lookup_attributes(fuse::ROOT_ID, c"proc")
+                .unwrap()
+                .is_none()
+        );
+        let proc = host.lookup(ctx, fuse::ROOT_ID, c"proc").unwrap();
+        assert_ne!(proc.attr_flags & fuse::ATTR_SUBMOUNT, 0);
+        host.forget(ctx, proc.inode, 1);
+    }
 
     // A non-zero uid the server can be made to run as, plus a guest
     // uid distinct from it and from root. Both must be mappable when

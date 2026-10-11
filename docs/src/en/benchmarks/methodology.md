@@ -10,6 +10,12 @@
 | Choose an independent guest kernel | Firecracker, QEMU and pVisor startup plus tool data |
 | Set capacity or timeouts | Success rates, complete-task waiting and matching resource accounting |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Faster startup does not guarantee faster compilation. Writable mounts and staged review also provide different workflows. Adoption decisions require speed, execution boundaries and how changes reach the original directory.
@@ -21,6 +27,10 @@ Faster startup does not guarantee faster compilation. Writable mounts and staged
 B-STARTUP, B-FS-TOOLS and B-AGENT-TASK use one offline tool environment and fixed inputs across native, pVisor host/staged/VM, private rootless Docker, Firecracker PCI and QEMU q35/microvm. Images, tools and daemon are prepared beforehand. Every execution uses the same two-core affinity; tool VMs have matching configured memory. Each job gets a fresh workspace, with seeded randomized runtime order. Complete Ubuntu, macOS and distinct binaries remain separate cohorts.
 
 Downloads, benchmark compilation, image import and input copying are excluded. Timing separates first valid output, internal tools plus validation, returned results and launch-to-process-exit. Successful samples require validated outputs, observed executor and complete staging. Staged modes also verify that original host files remain unchanged.
+
+### JSON tables and hyperfine {#json-tables}
+
+Tables load resolved named-row JSON before Markdown rendering. Rendering reads data and executes no benchmark. Direct-command startup and replay cohorts use hyperfine statistics; their input preparation and Python hooks are outside timing. Conditions run independently, without the randomized paired-order claim used by historical campaigns. Historical distributions, correctness counts, capacity and physical-memory readings keep their original measurement scope. Reproduction and remaining workload prerequisites are listed in the [JSON benchmark manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark.new/README.md).
 
 ### Distributions and failures
 

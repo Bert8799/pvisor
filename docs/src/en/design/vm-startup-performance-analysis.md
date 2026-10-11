@@ -1,5 +1,27 @@
 # VM startup: technical analysis and experiment records
 
+## Linux: startup and exit fixes retest, 2026-10-11 {#concurrency-retest}
+
+**Exit cleanup has a measured benefit, but startup regressions are not fully resolved.** Against the `cf8bfa5` GNU artifact, host Ready improves by about 9.11 ms and Exit by 75.00 ms. VM Exit improves by about 48.26 ms, with no detected Ready improvement. New staged Ready has two separated clusters and cannot be declared restored.
+
+### Motivation and experiment design {#concurrency-retest-protocol}
+
+This experiment checks fixes for repeated binary reads/hashes, repeated process-tree cleanup and fixed waits, together with the new filesystem execution model. The three arms are the historical `cfe36981` GNU release/gateway artifact, the `cf8bfa5fe8ad3438a096a2293bcc411176d388c8` GNU release/gateway artifact, and current frozen `build2`. All VMs use the same dynamic firmware, without mixing GNU and musl. Candidate SHA256 is `87ebb0658f2df6a84f9e4eca29c8d3d8bc01923817f04432780272c8b1b30309`. Other source changes intervene between historical and current versions, so differences cannot be attributed solely to hashing or cleanup.
+
+B-STARTUP-REVISION-ENG, Linux/KVM/FUSE: 3 warmups and 60 shuffled paired rounds per backend/version, seed 20261011. Host, staged and VM run sequentially, without overlapping filesystem sampling. The whole parent uses CPUs 0,1, a two-core quota, 16 GiB and zero swap; VMs have 2 vCPUs and 128 MiB. Each arm owns a private user/mount/PID namespace, pivot_root and warmed Host listener. Input/namespace preparation and initial service startup are outside timing. The original startup workload measures Popen to exact Ready and normal zero exit, checking output, Run Bundle, isolation and complete before/after input inventories. Formal timing uses the original Python perf_counter_ns observer without profiling, not hyperfine.
+
+### Data and analysis {#concurrency-retest-results}
+
+All 540 formal runs and 27 warmups passed, with unchanged artifact hashes and no external build/test interference detected. Intervals use 5,000 paired-round bootstrap resamples. All slow valid samples are retained; separated clusters have no whole-distribution median ranking, and no P99 is reported. Against `cf8bfa5`:
+
+- Host Ready is 29.14 → 20.03 ms: -9.11 ms, CI95 [-9.51, -8.72]. Exit is 99.16 → 24.16 ms: -75.00 ms, CI [-75.24, -74.59]. Against historical `cfe36981`, Ready still adds 6.82 ms, CI [6.16, 7.27], and Exit 0.25 ms, CI [0.02, 0.63]. The major exit regression is removed, but not every metric is restored.
+- Staged baseline Ready is 41.23 ms. Candidate Ready has 19/41 samples in two clusters, with medians 32.17/121.95 ms; no overall improvement percentage is assigned. Exit is 118.41 → 118.67 ms, with difference interval [-31.54, 16.60] crossing zero. Historical-control Exit also has separated clusters: 53/7 samples at 34.12/74.43 ms.
+- VM Ready is 119.41 → 115.25 ms: -4.16 ms, CI [-7.08, 0.77] crossing zero. Exit is 218.71 → 170.45 ms: -48.26 ms, CI [-67.43, -33.36]. Historical `cfe36981` Ready/Exit in this cohort are 174.06/211.83 ms, slower than current. The versions differ in several ways, so this does not isolate a single optimization.
+
+**Overall performance acceptance still fails:** staged startup is variable, and the [same-artifact filesystem retest](filesystem-performance-analysis.md#concurrency-retest) shows remaining VM write/tool regressions. These require separate diagnosis; host exit gains cannot stand in for other backends or internal task performance.
+
+[Full statistics, distributions and paired intervals](concurrency-startup-summary.csv) · [Artifact and experiment provenance](concurrency-retest-provenance.csv). Raw samples, per-trial stdout/timing, Run Bundles, inputs and build receipts are local under `benchmark.new/startup/.data/concurrency-retest2-20261011/`. These engineering version comparisons do not overwrite historical cross-runtime user tables or cover cold caches, concurrent workloads, macOS or initial service startup. Polling every 0.5 s may miss brief, inaccessible or unrecognized interference.
+
 ## Capability checks for current generic and trimmed kernels {#kernel-capabilities}
 
 **The trimmed configuration passes these staged-workspace, development-tool, IPv4 HTTP and execution-snapshot restoration checks.** Tests use the current CLI and two firmware variants rebuilt from identical Linux 6.12.109 sources, patches and compact packaging implementation. Complete digests verify all 79 frozen source inputs and both actual build input trees before and after; the CLI's 1,063 product source/dependency files match the current worktree. Measured on 2026-10-06, Linux/KVM, host CPUs 0,1 and 2 configured vCPUs. Tool preflights sample resources; these capability checks do not provide formal timings.

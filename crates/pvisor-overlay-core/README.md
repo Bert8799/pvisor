@@ -51,10 +51,23 @@ mixed precedence, upper mutations, hardlink denials, capacity and disabled contr
 
 ## Copy-up and truncation
 
+For a repeated live read, a compact-log owner may skip the pre-publication
+path query only after refreshing and verifying the already published observation
+under the log lock. It still resolves the current merged path and checks policy,
+hardlink aliases and symlinks. Local cached membership is a hint, never authority;
+external consumption recaptures the observation. First reads, legacy journals,
+read-only stages and verification errors retain the original checked capture path.
+
 Both legacy file journals and compact logs perform missing-entry checks under
 their journal lock, release it while computing full-file fingerprints, then
-recheck and publish under the lock. Concurrent observations may compute duplicate
-fingerprints; the first published observation wins, and durable promotion syncs
+recheck and publish under the lock. Compact-log first observations of the same
+path in one Core share a temporary capture admission; unrelated paths and
+already published entries proceed. Waiting observers refresh verified journal
+membership before reusing the actual publication, and external consumption still
+recaptures. Pending paths are removed after success or failure; fingerprints are
+never cached. Absence observations need no content capture admission.
+Legacy journals and different Core owners may still compute duplicate
+fingerprints. The first published observation wins, and durable promotion syncs
 that actual winner. Capture failures publish nothing and do not poison the compact
 log; append/sync failures retain its existing reopen requirement. Unrelated
 observations and sync of already published entries can proceed during capture.
@@ -139,6 +152,10 @@ Host FUSE uses the service's names/type directory candidates and loads
 attributes on demand for READDIRPLUS. Protected directory views validate
 children at snapshot creation to hide denied hardlink aliases. See the host
 adapter README for cookie and inode lifetime details.
+
+Existing upper parents are checked with one no-follow metadata query during
+create/copy-up preparation;
+non-directories and I/O errors are not treated as absence.
 
 ## Experimental parallel stage sealing
 

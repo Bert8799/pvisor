@@ -211,6 +211,11 @@ pub trait OverlayMounting {
     /// with its own 128-request bound; a full mutation queue does not consume read admission.
     /// Directory release and read-only-handle flush/release/lseek share that
     /// queue. Fsync/fsyncdir and writable-handle lifecycle requests retain mutation ordering.
+    /// A mutation needing no copy preparation may run inline when its lane is
+    /// idle. A read may run inline only when both lanes are idle; READ requests
+    /// of at least 64 KiB always use the worker. An accepted
+    /// copy keeps reads on the worker so the receiver can serve metadata.
+    /// Inline callbacks retain admission/pins and are drained by shutdown too.
     /// The two workers serialize inode/handle access through the state lock;
     /// ordinary read/open/directory I/O can still hold that lock. There is no
     /// cross-queue arrival ordering for overlapping reads and mutations.

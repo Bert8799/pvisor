@@ -54,18 +54,45 @@ fn read_only_open_flags(flags: u32) -> io::Result<u32> {
 
 pub struct PassthroughFsRo {
     inner: PassthroughFs,
+    #[cfg(target_os = "linux")]
+    dax: Option<super::dax::ReadOnlyDax>,
 }
 
 impl PassthroughFsRo {
     pub fn new(cfg: passthrough::Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
         Ok(Self {
             inner: PassthroughFs::new(cfg, inode_alloc)?,
+            #[cfg(target_os = "linux")]
+            dax: None,
         })
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn enable_dax(
+        &mut self,
+        region: crate::devices::virtio::VirtioShmRegion,
+    ) -> io::Result<()> {
+        self.dax = Some(super::dax::ReadOnlyDax::new(region)?);
+        Ok(())
+    }
+    fn dax_attr_flags(&self, attr: &bindings::stat64) -> u32 {
+        #[cfg(target_os = "linux")]
+        if self.dax.is_some() && attr.st_mode & libc::S_IFMT == libc::S_IFREG {
+            return 2;
+        } // FUSE_ATTR_DAX
+        let _ = attr;
+        0
     }
 }
 
 impl FileSystem for PassthroughFsRo {
     fn capture_state(&self) -> io::Result<super::snapshot::FsSnapshot> {
+        #[cfg(target_os = "linux")]
+        if self.dax.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DAX mappings cannot be captured",
+            ));
+        }
         Ok(super::snapshot::FsSnapshot::ReadOnly(Box::new(
             self.inner.capture_state()?,
         )))
@@ -85,17 +112,33 @@ impl FileSystem for PassthroughFsRo {
     // --- Delegated read-only operations ---
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let opts = self.inner.init(capable)?;
+        let mut opts = self.inner.init(capable)?;
+        #[cfg(target_os = "linux")]
+        if self.dax.is_some() {
+            opts |= capable & (FsOptions::HAS_INODE_DAX | FsOptions::MAP_ALIGNMENT);
+        }
         // Strip WRITEBACK_CACHE to prevent the guest kernel from buffering writes.
         Ok(opts & !FsOptions::WRITEBACK_CACHE)
     }
 
     fn destroy(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(dax) = &self.dax {
+            if let Err(error) = dax.clear() {
+                log::error!("clear DAX window: {error}");
+            }
+        }
         self.inner.destroy()
     }
 
     fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        self.inner.lookup(ctx, parent, name)
+        let mut entry = self.inner.lookup(ctx, parent, name)?;
+        entry.attr_flags |= self.dax_attr_flags(&entry.attr);
+        Ok(entry)
+    }
+
+    fn attribute_flags(&self, _inode: Inode, attr: &bindings::stat64) -> u32 {
+        self.dax_attr_flags(attr)
     }
 
     fn forget(&self, ctx: Context, inode: Inode, count: u64) {
@@ -226,13 +269,16 @@ impl FileSystem for PassthroughFsRo {
         handle: Handle,
         size: u32,
         offset: u64,
-        add_entry: F,
+        mut add_entry: F,
     ) -> io::Result<()>
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.inner
-            .readdirplus(ctx, inode, handle, size, offset, add_entry)
+            .readdirplus(ctx, inode, handle, size, offset, |dir, mut entry| {
+                entry.attr_flags |= self.dax_attr_flags(&entry.attr);
+                add_entry(dir, entry)
+            })
     }
 
     fn fsyncdir(
@@ -284,19 +330,36 @@ impl FileSystem for PassthroughFsRo {
         if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
             return Err(erofs());
         }
-        self.inner.setupmapping(
-            ctx,
-            inode,
-            handle,
-            foffset,
-            len,
-            flags,
-            moffset,
-            host_shm_base,
-            shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
-        )
+        #[cfg(target_os = "linux")]
+        {
+            let _ = ctx;
+            let dax = self
+                .dax
+                .as_ref()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
+            self.inner.with_dax_file(inode, handle, |file| {
+                dax.setup(file, foffset, len, flags, moffset, host_shm_base, shm_size)
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (
+                ctx,
+                inode,
+                handle,
+                foffset,
+                len,
+                flags,
+                moffset,
+                host_shm_base,
+                shm_size,
+                map_sender,
+            );
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "read-only DAX is supported only on Linux",
+            ))
+        }
     }
 
     fn removemapping(
@@ -307,14 +370,22 @@ impl FileSystem for PassthroughFsRo {
         shm_size: u64,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
-        self.inner.removemapping(
-            ctx,
-            requests,
-            host_shm_base,
-            shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
-        )
+        #[cfg(target_os = "linux")]
+        {
+            let _ = ctx;
+            self.dax
+                .as_ref()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?
+                .remove(&requests, host_shm_base, shm_size)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (ctx, requests, host_shm_base, shm_size, map_sender);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "read-only DAX is supported only on Linux",
+            ))
+        }
     }
 
     fn ioctl(
@@ -511,5 +582,156 @@ mod tests {
         let err = read_only_open_flags((libc::O_RDONLY | libc::O_TRUNC) as u32).unwrap_err();
 
         assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_requires_opened_regular_file_and_preserves_readonly_lifecycle() {
+        use super::*;
+        use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("payload"), vec![0x5a; 4096]).unwrap();
+        std::fs::create_dir(directory.path().join("dir")).unwrap();
+        let memory = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let region = crate::devices::virtio::VirtioShmRegion {
+            host_addr: memory.get_host_address(GuestAddress(0)).unwrap() as u64,
+            guest_addr: 0,
+            size: 4096,
+        };
+        let mut fs = PassthroughFsRo::new(
+            passthrough::Config {
+                root_dir: directory.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.enable_dax(region.clone()).unwrap();
+        let options = fs
+            .init(FsOptions::HAS_INODE_DAX | FsOptions::MAP_ALIGNMENT | FsOptions::WRITEBACK_CACHE)
+            .unwrap();
+        assert!(options.contains(FsOptions::HAS_INODE_DAX | FsOptions::MAP_ALIGNMENT));
+        assert!(!options.contains(FsOptions::WRITEBACK_CACHE));
+        let ctx = Context {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            pid: 0,
+        };
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"payload").unwrap();
+        assert_eq!(entry.attr_flags, 2);
+        assert_eq!(fs.attribute_flags(entry.inode, &entry.attr), 2);
+        assert_eq!(fs.lookup(ctx, fuse::ROOT_ID, c"dir").unwrap().attr_flags, 0);
+        assert_eq!(
+            fs.setupmapping(ctx, entry.inode, 999, 0, 4096, 2, 0, region.host_addr, 4096)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            fs.setupmapping(
+                ctx,
+                entry.inode,
+                u64::MAX,
+                0,
+                4096,
+                2,
+                0,
+                region.host_addr,
+                4096
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let handle = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(
+            fs.setupmapping(
+                ctx,
+                entry.inode + 100,
+                handle,
+                0,
+                4096,
+                2,
+                0,
+                region.host_addr,
+                4096
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            fs.setupmapping(
+                ctx,
+                entry.inode,
+                handle,
+                0,
+                4096,
+                3,
+                0,
+                region.host_addr,
+                4096
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        fs.setupmapping(
+            ctx,
+            entry.inode,
+            u64::MAX,
+            0,
+            4096,
+            2,
+            0,
+            region.host_addr,
+            4096,
+        )
+        .unwrap();
+        fs.release(ctx, entry.inode, 0, handle, false, false, None)
+            .unwrap();
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x5a);
+        assert_eq!(
+            fs.setupmapping(
+                ctx,
+                entry.inode,
+                handle,
+                0,
+                4096,
+                2,
+                0,
+                region.host_addr,
+                4096
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            fs.setupmapping(
+                ctx,
+                entry.inode,
+                u64::MAX,
+                0,
+                4096,
+                2,
+                0,
+                region.host_addr,
+                4096
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            fs.capture_state().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        fs.destroy();
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0);
     }
 }

@@ -173,6 +173,9 @@ struct HandleData {
     dirstream: Mutex<DirStream>,
 }
 
+/// Pins the actual native descriptor, rather than just its reusable handle ID.
+pub(in crate::devices::virtio::fs) struct HandleLease(Arc<HandleData>);
+
 fn descriptor_path(file: &File) -> io::Result<CString> {
     let mut path = [0u8; libc::PATH_MAX as usize];
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
@@ -666,6 +669,100 @@ struct NodeCreation {
 }
 
 impl PassthroughFs {
+    pub(in crate::devices::virtio::fs) fn lease_handle(
+        &self,
+        inode: Inode,
+        handle: Handle,
+    ) -> io::Result<HandleLease> {
+        self.handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|data| data.inode == inode)
+            .cloned()
+            .map(HandleLease)
+            .ok_or_else(ebadf)
+    }
+
+    pub(in crate::devices::virtio::fs) fn read_leased<W: io::Write + ZeroCopyWriter>(
+        &self,
+        lease: &HandleLease,
+        mut writer: W,
+        size: u32,
+        offset: u64,
+    ) -> io::Result<usize> {
+        let file = lease.0.file.read().unwrap();
+        writer.write_from(&file, size as usize, offset)
+    }
+
+    pub(in crate::devices::virtio::fs) fn flush_leased(&self, lease: &HandleLease) -> io::Result<()> {
+        // Serialize descriptor effects against writes and sync; File's
+        // shared-reference methods do not imply shared operation semantics.
+        #[allow(clippy::readonly_write_lock)]
+        let file = lease.0.file.write().unwrap();
+        let duplicate = unsafe { libc::dup(file.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        if unsafe { libc::close(duplicate) } < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    pub(in crate::devices::virtio::fs) fn sync_leased(
+        &self,
+        lease: &HandleLease,
+        _datasync: bool,
+    ) -> io::Result<()> {
+        // Serialize descriptor effects against writes and sync; File's
+        // shared-reference methods do not imply shared operation semantics.
+        #[allow(clippy::readonly_write_lock)]
+        let file = lease.0.file.write().unwrap();
+        if unsafe { libc::fsync(file.as_raw_fd()) } < 0 {
+            Err(linux_error(io::Error::last_os_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(in crate::devices::virtio::fs) fn write_leased<R: io::Read + ZeroCopyReader>(
+        &self,
+        ctx: Context,
+        lease: &HandleLease,
+        mut reader: R,
+        size: u32,
+        offset: u64,
+        kill_priv: bool,
+    ) -> io::Result<usize> {
+        // Serialize descriptor effects against writes and sync; File's
+        // shared-reference methods do not imply shared operation semantics.
+        #[allow(clippy::readonly_write_lock)]
+        let file = lease.0.file.write().unwrap();
+        let result = reader.read_to(&file, size as usize, offset);
+        if result.is_ok() && kill_priv {
+            let fd = file.as_raw_fd();
+            let inode_handle = InodeHandle::Fd(fd);
+            remove_security_capability(&inode_handle);
+            if let Ok(stat) = fstat(&ctx, self.cfg.semantics, fd, false) {
+                let mode = clear_suid_sgid(stat.st_mode as u32);
+                if mode != stat.st_mode as u32 {
+                    if let Err(error) = set_stat(
+                        &ctx,
+                        self.cfg.semantics,
+                        &inode_handle,
+                        Some(stat),
+                        None,
+                        Some(mode),
+                    ) {
+                        error!("Couldn't clear suid/sgid for inode {}: {error}", lease.0.inode);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
@@ -1292,13 +1389,12 @@ fn forget_one(
 
 impl FileSystem for PassthroughFs {
     fn capture_state(&self) -> io::Result<FsSnapshot> {
-        if self.writeback.load(Ordering::Relaxed)
-            || !self.map_windows.lock().unwrap().is_empty()
+        if !self.map_windows.lock().unwrap().is_empty()
             || self.cfg.export_table.is_some()
             || self.cfg.proc_sfd_rawfd.is_some()
         {
             return Err(snapshot::unsupported(
-                "filesystem writeback, DAX or exported descriptors",
+                "filesystem DAX or exported descriptors",
             ));
         }
         let root = Path::new(&self.cfg.root_dir).canonicalize()?;
@@ -1390,6 +1486,7 @@ impl FileSystem for PassthroughFs {
             handles: saved_handles,
             next_handle: self.next_handle.load(Ordering::Relaxed),
             submounts: self.announce_submounts.load(Ordering::Relaxed),
+            writeback: self.writeback.load(Ordering::Relaxed),
         }))
     }
 
@@ -1397,13 +1494,12 @@ impl FileSystem for PassthroughFs {
         let FsSnapshot::Passthrough(state) = state else {
             return Err(snapshot::invalid("filesystem type mismatch"));
         };
-        if self.writeback.load(Ordering::Relaxed)
-            || !self.map_windows.lock().unwrap().is_empty()
+        if !self.map_windows.lock().unwrap().is_empty()
             || self.cfg.export_table.is_some()
             || self.cfg.proc_sfd_rawfd.is_some()
         {
             return Err(snapshot::unsupported(
-                "filesystem writeback, DAX or exported descriptors",
+                "filesystem DAX or exported descriptors",
             ));
         }
         let root = Path::new(&self.cfg.root_dir).canonicalize()?;
@@ -1413,6 +1509,7 @@ impl FileSystem for PassthroughFs {
             || self.cfg.attr_timeout != state.attr_timeout
             || self.cfg.cache_policy != state.cache_policy
             || self.cfg.xattr != state.xattr
+            || (state.writeback && !self.cfg.writeback)
         {
             return Err(snapshot::invalid(
                 "filesystem root or permission semantics mismatch",
@@ -1499,6 +1596,8 @@ impl FileSystem for PassthroughFs {
                 || handles.contains_key(&saved.handle)
                 || saved.flags & !allowed != 0
                 || saved.flags & libc::O_ACCMODE == libc::O_ACCMODE
+                || (state.writeback && (saved.flags & libc::O_APPEND != 0
+                    || saved.flags & libc::O_ACCMODE == libc::O_WRONLY))
                 || saved.offset > i64::MAX as u64
             {
                 return Err(snapshot::invalid(&format!(
@@ -1566,6 +1665,7 @@ impl FileSystem for PassthroughFs {
         self.next_handle.store(state.next_handle, Ordering::Relaxed);
         self.announce_submounts
             .store(state.submounts, Ordering::Relaxed);
+        self.writeback.store(state.writeback, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1630,9 +1730,10 @@ impl FileSystem for PassthroughFs {
         );
 
         let mut opts = FsOptions::empty();
-        if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+        let writeback = self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE);
+        self.writeback.store(writeback, Ordering::Relaxed);
+        if writeback {
             opts |= FsOptions::WRITEBACK_CACHE;
-            self.writeback.store(true, Ordering::Relaxed);
         }
 
         if capable.contains(FsOptions::SUBMOUNTS) {
@@ -2007,26 +2108,15 @@ impl FileSystem for PassthroughFs {
         _ctx: Context,
         inode: Inode,
         handle: Handle,
-        mut w: W,
+        w: W,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // This is safe because write_from uses preadv64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
-        w.write_from(&f, size as usize, offset)
+        let lease = self.lease_handle(inode, handle)?;
+        self.read_leased(&lease, w, size, offset)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
@@ -2034,7 +2124,7 @@ impl FileSystem for PassthroughFs {
         ctx: Context,
         inode: Inode,
         handle: Handle,
-        mut r: R,
+        r: R,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -2042,46 +2132,8 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // This is safe because read_to uses pwritev64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
-        let result = r.read_to(&f, size as usize, offset);
-
-        // If write succeeded and kill_priv is set, clear security.capability and suid/sgid
-        if result.is_ok() && kill_priv {
-            let fd = f.as_raw_fd();
-            let ihandle = InodeHandle::Fd(fd);
-
-            remove_security_capability(&ihandle);
-
-            if let Ok(st) = fstat(&ctx, self.cfg.semantics, fd, false) {
-                let new_mode = clear_suid_sgid(st.st_mode as u32);
-                if new_mode != st.st_mode as u32 {
-                    // Update mode in xattr
-                    if let Err(err) = set_stat(
-                        &ctx,
-                        self.cfg.semantics,
-                        &ihandle,
-                        Some(st),
-                        None,
-                        Some(new_mode),
-                    ) {
-                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
-                    }
-                }
-            }
-        }
-
-        result
+        let lease = self.lease_handle(inode, handle)?;
+        self.write_leased(ctx, &lease, r, size, offset, kill_priv)
     }
 
     fn getattr(
@@ -2511,30 +2563,8 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // Since this method is called whenever an fd is closed in the client, we can emulate that
-        // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
-        // because this doesn't modify any memory and we check the return values.
-        unsafe {
-            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
-            if newfd < 0 {
-                return Err(linux_error(io::Error::last_os_error()));
-            }
-
-            if libc::close(newfd) < 0 {
-                Err(linux_error(io::Error::last_os_error()))
-            } else {
-                Ok(())
-            }
-        }
+        let lease = self.lease_handle(inode, handle)?;
+        self.flush_leased(&lease)
     }
 
     fn fsync(
@@ -2544,25 +2574,8 @@ impl FileSystem for PassthroughFs {
         _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let fd = data.file.write().unwrap().as_raw_fd();
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::fsync(fd) };
-
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(linux_error(io::Error::last_os_error()))
-        }
+        let lease = self.lease_handle(inode, handle)?;
+        self.sync_leased(&lease, _datasync)
     }
 
     fn fsyncdir(

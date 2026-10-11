@@ -1,0 +1,66 @@
+{
+  "Native": {
+    "N": 60,
+    "Ready 中位数 ms": "0.48",
+    "Ready 均值 ms": "0.48",
+    "Ready 标准差 ms": "0.02",
+    "Ready 最小 ms": "0.45",
+    "Ready 最大 ms": "0.55"
+  },
+  "pVisor host": {
+    "N": 60,
+    "Ready 中位数 ms": "33.52",
+    "Ready 均值 ms": "50.48",
+    "Ready 标准差 ms": "29.70",
+    "Ready 最小 ms": "30.58",
+    "Ready 最大 ms": "128.65"
+  },
+  "pVisor staged": {
+    "N": 60,
+    "Ready 中位数 ms": "50.59",
+    "Ready 均值 ms": "52.77",
+    "Ready 标准差 ms": "17.87",
+    "Ready 最小 ms": "46.18",
+    "Ready 最大 ms": "188.29"
+  },
+  "pVisor VM": {
+    "N": 60,
+    "Ready 中位数 ms": "130.71",
+    "Ready 均值 ms": "130.10",
+    "Ready 标准差 ms": "6.16",
+    "Ready 最小 ms": "119.00",
+    "Ready 最大 ms": "149.99"
+  },
+  "Docker": {
+    "N": 60,
+    "Ready 中位数 ms": "105.03",
+    "Ready 均值 ms": "105.57",
+    "Ready 标准差 ms": "7.22",
+    "Ready 最小 ms": "90.52",
+    "Ready 最大 ms": "126.04"
+  },
+  "Firecracker": {
+    "N": 60,
+    "Ready 中位数 ms": "287.13",
+    "Ready 均值 ms": "287.07",
+    "Ready 标准差 ms": "5.89",
+    "Ready 最小 ms": "269.08",
+    "Ready 最大 ms": "301.73"
+  },
+  "QEMU": {
+    "N": 60,
+    "Ready 中位数 ms": "663.25",
+    "Ready 均值 ms": "667.53",
+    "Ready 标准差 ms": "28.73",
+    "Ready 最小 ms": "631.38",
+    "Ready 最大 ms": "742.13"
+  },
+  "QEMU microvm": {
+    "N": 60,
+    "Ready 中位数 ms": "260.10",
+    "Ready 均值 ms": "259.53",
+    "Ready 标准差 ms": "9.57",
+    "Ready 最小 ms": "243.28",
+    "Ready 最大 ms": "288.39"
+  }
+}

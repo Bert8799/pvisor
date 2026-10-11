@@ -56,6 +56,29 @@ Help, version and feature queries emit no startup logs. For execution commands,
 `process.entry` and `cli.parsed` are emitted only after command parsing; these
 markers do not measure the complete process-entry or argument-parsing overhead.
 
+Host execution verifies the loaded executable once per process and pins that
+inode. Request validation and the check immediately before worker spawn reuse
+its digest only when the opened file's device, inode, size, nanosecond mtime and
+ctime, mode and ownership match the verified image. Changes trigger a full hash;
+metadata must remain stable across verification. Ancestor permissions, path
+identity, peer credentials and listener compatibility remain checked. A warm
+listener therefore normally needs no new content hash, while each new frontend
+and worker still independently hash their loaded images; no caller-supplied hash
+or persistent cross-process cache substitutes for that attestation.
+The frontend's signal-only Tokio runtime uses one worker thread; execution
+retains its separate worker runtime.
+
+Successful final process-tree cleanup is idempotent; failed cleanup remains
+retryable and descendant-only cleanup does not finalize ownership. Linux
+observes the stop state of every discovered live process and thread before
+rescanning descendants, instead of assuming a fixed delay quiesces forkers.
+Pidfds wake descendant/root exit waits, and worker response events wake the
+service immediately. The frontend still owns Child reaping and adopted orphan
+cleanup; the service's Finish handshake and bounded escalation remain in place.
+macOS retains birth-identity checks and polling during tree quiescence. These
+changes remove redundant work in the source path; runtime latency improvements
+require a new paired measurement.
+
 ## Source layout
 
 - `src/cli/`: Job commands, typed internal Host requests/listener/workers,

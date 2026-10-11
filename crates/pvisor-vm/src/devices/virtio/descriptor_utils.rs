@@ -6,7 +6,7 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
-use std::mem::{size_of, MaybeUninit};
+use std::mem::{MaybeUninit, size_of};
 use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::result;
@@ -201,13 +201,24 @@ impl OwnedDescriptorChain {
             writable: Vec::new(),
         };
         let mut writing = false;
+        let mut readable_len = 0usize;
+        let mut writable_len = 0usize;
         loop {
+            // Validate the complete captured plan before decoding a request.
+            // Header admission does not need to allocate Reader/Writer buffers.
+            descriptor_slice(chain.mem, chain.addr, chain.len)?;
             if chain.is_write_only() {
                 writing = true;
+                writable_len = writable_len
+                    .checked_add(chain.len as usize)
+                    .ok_or(Error::DescriptorChainOverflow)?;
                 plan.writable.push((chain.addr, chain.len));
             } else if writing {
                 return Err(Error::InvalidChain);
             } else {
+                readable_len = readable_len
+                    .checked_add(chain.len as usize)
+                    .ok_or(Error::DescriptorChainOverflow)?;
                 plan.readable.push((chain.addr, chain.len));
             }
             // has_next() masks the NEXT flag at the TTL limit. Reject cycles
@@ -220,28 +231,64 @@ impl OwnedDescriptorChain {
         Ok(plan)
     }
 
+    /// Decode a fixed-size prefix without constructing descriptor consumers.
+    /// The captured plan and its RAM lease have already validated every range,
+    /// including writable buffers that this prefix itself does not touch.
+    pub(crate) fn read_prefix<T: ByteValued>(&self, mem: &GuestMemoryMmap) -> Result<T> {
+        let mut object = T::zeroed();
+        let mut remaining = object.as_mut_slice();
+        for &(address, length) in &self.readable {
+            if remaining.is_empty() {
+                break;
+            }
+            let count = remaining.len().min(length as usize);
+            mem.read_slice(&mut remaining[..count], address)
+                .map_err(Error::GuestMemoryError)?;
+            remaining = &mut remaining[count..];
+        }
+        if !remaining.is_empty() {
+            return Err(Error::IoError(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "descriptor chain is shorter than the request prefix",
+            )));
+        }
+        Ok(object)
+    }
+
+    #[cfg(test)]
     pub(crate) fn reader_writer<'a>(
         &self,
         mem: &'a GuestMemoryMmap,
     ) -> Result<(Reader<'a>, Writer<'a>)> {
-        let consumer = |ranges: &[(GuestAddress, u32)]| {
+        self.reader_writer_after(mem, 0)
+    }
+
+    /// Construct consumers after a previously captured readable prefix. This
+    /// avoids constructing and splitting a second Reader for the same header.
+    pub(crate) fn reader_writer_after<'a>(
+        &self,
+        mem: &'a GuestMemoryMmap,
+        prefix: usize,
+    ) -> Result<(Reader<'a>, Writer<'a>)> {
+        let consumer = |ranges: &[(GuestAddress, u32)], mut skip: usize| {
+            let requested_skip = skip;
             let mut total_len = 0usize;
-            let buffers = ranges
-                .iter()
-                .map(|&(addr, len)| {
-                    total_len = total_len
-                        .checked_add(len as usize)
-                        .ok_or(Error::DescriptorChainOverflow)?;
-                    let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
-                    let offset = addr
-                        .checked_sub(region.start_addr().raw_value())
-                        .ok_or(Error::InvalidChain)?;
-                    region
-                        .deref()
-                        .get_slice(offset.raw_value() as usize, len as usize)
-                        .map_err(Error::VolatileMemoryError)
-                })
-                .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            let mut buffers = VecDeque::with_capacity(ranges.len());
+            for &(address, length) in ranges {
+                total_len = total_len
+                    .checked_add(length as usize)
+                    .ok_or(Error::DescriptorChainOverflow)?;
+                let slice = descriptor_slice(mem, address, length)?;
+                if skip >= length as usize {
+                    skip -= length as usize;
+                    continue;
+                }
+                buffers.push_back(slice.offset(skip).map_err(Error::VolatileMemoryError)?);
+                skip = 0;
+            }
+            if skip != 0 {
+                return Err(Error::SplitOutOfBounds(requested_skip));
+            }
             Ok(DescriptorChainConsumer {
                 memory_access: self.memory_access.clone(),
                 buffers,
@@ -250,13 +297,28 @@ impl OwnedDescriptorChain {
         };
         Ok((
             Reader {
-                buffer: consumer(&self.readable)?,
+                buffer: consumer(&self.readable, prefix)?,
             },
             Writer {
-                buffer: consumer(&self.writable)?,
+                buffer: consumer(&self.writable, 0)?,
             },
         ))
     }
+}
+
+fn descriptor_slice(
+    mem: &GuestMemoryMmap,
+    address: GuestAddress,
+    length: u32,
+) -> Result<VolatileSlice<'_>> {
+    let region = mem.find_region(address).ok_or(Error::FindMemoryRegion)?;
+    let offset = address
+        .checked_sub(region.start_addr().raw_value())
+        .ok_or(Error::InvalidChain)?;
+    region
+        .deref()
+        .get_slice(offset.raw_value() as usize, length as usize)
+        .map_err(Error::VolatileMemoryError)
 }
 
 /// Provides high-level interface over the sequence of memory regions
@@ -362,7 +424,7 @@ impl<'a> Reader<'a> {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "failed to fill whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => count -= n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -511,7 +573,7 @@ impl<'a> Writer<'a> {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "failed to write whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => count -= n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -627,6 +689,89 @@ pub fn create_descriptor_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_prefix_spans_fragments_and_body_keeps_captured_addresses_and_ram_lease() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let gate = super::super::memory_gate::register(&mem);
+        let chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x100),
+            vec![
+                (DescriptorType::Readable, 3),
+                (DescriptorType::Readable, 0),
+                (DescriptorType::Readable, 5),
+                (DescriptorType::Readable, 4),
+                (DescriptorType::Writable, 8),
+            ],
+            8,
+        )
+        .unwrap();
+        let plan = OwnedDescriptorChain::new(chain).unwrap();
+        let header = 0x0807060504030201u64;
+        mem.write_slice(&header.as_slice()[..3], plan.readable[0].0)
+            .unwrap();
+        mem.write_slice(&header.as_slice()[3..], plan.readable[2].0)
+            .unwrap();
+        mem.write_slice(b"body", plan.readable[3].0).unwrap();
+        assert_eq!(plan.read_prefix::<u64>(&mem).unwrap(), header);
+
+        // The decoded header is captured separately. Changing its bytes and
+        // the descriptor table cannot redirect or reread the body consumers.
+        mem.write_slice(&[0; 3], plan.readable[0].0).unwrap();
+        mem.write_obj(0x800u64, GuestAddress(3 * 16)).unwrap();
+        mem.write_slice(b"fake", GuestAddress(0x800)).unwrap();
+        let (mut reader, mut writer) = plan.reader_writer_after(&mem, 8).unwrap();
+        assert_eq!(reader.bytes_read(), 0);
+        assert_eq!(reader.available_bytes(), 4);
+        let mut body = [0u8; 4];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"body");
+        writer.write_all(&body).unwrap();
+        let mut output = [0u8; 4];
+        mem.read_slice(&mut output, plan.writable[0].0).unwrap();
+        assert_eq!(output, body);
+        assert!(matches!(
+            plan.reader_writer_after(&mem, 13),
+            Err(Error::SplitOutOfBounds(13))
+        ));
+        drop((reader, writer));
+        assert!(!gate.try_close().unwrap());
+        drop(plan);
+        assert!(gate.try_close().unwrap());
+    }
+
+    #[test]
+    fn owned_prefix_rejects_short_input_and_validates_unread_output_ranges() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x100),
+            vec![
+                (DescriptorType::Readable, 4),
+                (DescriptorType::Writable, 16),
+            ],
+            0,
+        )
+        .unwrap();
+        let plan = OwnedDescriptorChain::new(chain).unwrap();
+        assert!(matches!(
+            plan.read_prefix::<u64>(&mem),
+            Err(Error::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        drop(plan);
+
+        // The prefix is readable, but executing it would have an invalid
+        // output buffer. Admission must reject the whole captured plan.
+        mem.write_obj(0xfff8u64, GuestAddress(16)).unwrap();
+        let chain = DescriptorChain::checked_new(&mem, GuestAddress(0), 0x100, 0).unwrap();
+        assert!(matches!(
+            OwnedDescriptorChain::new(chain),
+            Err(Error::VolatileMemoryError(_))
+        ));
+    }
 
     #[test]
     fn owned_plan_captures_addresses_and_keeps_ram_pinned_across_threads() {

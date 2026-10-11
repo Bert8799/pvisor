@@ -10,6 +10,8 @@ on:
       - 'crates/**'
       - 'vendor/**'
       - 'benchmark/**'
+      - 'benchmark.new/**'
+      - 'tools/semspec/**'
       - 'justfile'
       - '.github/actions/setup-build-env/**'
       - '.github/workflows/pvisor-benchmark.yml'
@@ -22,6 +24,8 @@ on:
       - 'crates/**'
       - 'vendor/**'
       - 'benchmark/**'
+      - 'benchmark.new/**'
+      - 'tools/semspec/**'
       - 'justfile'
       - '.github/actions/setup-build-env/**'
       - '.github/workflows/pvisor-benchmark.yml'
@@ -55,6 +59,9 @@ jobs:
         with:
           shared-key: pvisor-benchmark
 
+      - name: Install hyperfine
+        run: cargo install hyperfine --version 2.0.0 --locked
+
       - name: Resolve main baseline
         id: baseline
         env:
@@ -74,7 +81,7 @@ jobs:
           git worktree add --detach "$baseline_repo" "$baseline_sha"
           echo "repo=$baseline_repo" >> "$GITHUB_OUTPUT"
           echo "sha=$baseline_sha" >> "$GITHUB_OUTPUT"
-          if [[ -f "$baseline_repo/benchmark/pvisor/bench.py" ]]; then
+          if [[ -f "$baseline_repo/justfile" ]]; then
             echo "supported=true" >> "$GITHUB_OUTPUT"
           else
             echo "supported=false" >> "$GITHUB_OUTPUT"
@@ -110,8 +117,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          candidate="${RUNNER_TEMP}/.data/pvisor-benchmark/candidate/smoke/raw-report.json"
-          baseline="${RUNNER_TEMP}/.data/pvisor-benchmark/main/smoke/raw-report.json"
+          candidate="${RUNNER_TEMP}/.data/pvisor-benchmark/candidate/smoke/in.bench.json"
+          baseline="${RUNNER_TEMP}/.data/pvisor-benchmark/main/smoke/in.bench.json"
           output="${RUNNER_TEMP}/.data/pvisor-benchmark/comparison"
           if [[ -f "$baseline" ]]; then
             just benchmark-compare "$candidate" "$baseline" "$output"

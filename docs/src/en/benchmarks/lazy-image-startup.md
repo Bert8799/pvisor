@@ -10,6 +10,12 @@
 | Complete image already cached locally | Docker produces checked output sooner; lazy VM still incurs VM/Job startup and teardown |
 | First deployment of the image service | Budget upstream download, unpack and indexing separately; cached preparation does not measure these costs |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Downloading and unpacking a complete image can cost more than a short task in a disposable environment. Choosing on-demand reads requires distinguishing service preparation from client startup and checking whether the advantage persists after caching.

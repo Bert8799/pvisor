@@ -12,6 +12,12 @@
 | 小工作区或已准备并复用的 Git worktree | 小工作区及 20 文件预备视图的审查流程 Git 较快；长期复用未测 |
 | 估算人工监督成本 | 机器流程不包含人的阅读和判断时间 |
 
+<!-- measurement-status:start -->
+
+本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 一次 Agent 任务除了执行工具，还需要独立工作区、查看 diff、保留指定改动和清理剩余结果。只比较单项文件操作，会漏掉这些成本。需要频繁创建任务工作区时，应比较完成同样结果的整个流程。

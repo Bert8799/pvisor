@@ -45,6 +45,9 @@ pub struct PassthroughSnapshot {
     pub(crate) handles: Vec<HandleSnapshot>,
     pub(crate) next_handle: u64,
     pub(crate) submounts: bool,
+    /// Negotiated mode; dirty guest pages are preserved by the RAM snapshot.
+    #[serde(default)]
+    pub(crate) writeback: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -326,6 +329,16 @@ impl ServerSnapshot {
 }
 
 impl FsSnapshot {
+    pub(super) fn validate_writeback(&self, enabled: bool) -> io::Result<()> {
+        match self {
+            Self::ReadOnly(inner) | Self::Augment { inner, .. } => inner.validate_writeback(enabled),
+            Self::Overlay(state) => state.validate_writeback(enabled),
+            Self::Passthrough(state) if state.writeback == enabled => Ok(()),
+            Self::Null if !enabled => Ok(()),
+            _ => Err(invalid("FUSE and backing writeback modes disagree")),
+        }
+    }
+
     pub(super) fn verify_frozen_backing(&self) -> io::Result<()> {
         match self {
             Self::ReadOnly(inner) | Self::Augment { inner, .. } => inner.verify_frozen_backing(),
@@ -613,6 +626,7 @@ mod owned_copy_tests {
             handles: Vec::new(),
             next_handle: 1,
             submounts: false,
+            writeback: false,
         });
         (state, source, destination)
     }

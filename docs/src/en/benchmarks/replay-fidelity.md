@@ -2,13 +2,19 @@
 
 ## Main conclusions {#conclusions}
 
-**Seven pinned trajectory formats each pass 60/60 prefix checks. Prepare-only executes no tools and leaves the workspace unchanged. Most formats show separated timing clusters: lower-cluster medians are about 6–7 ms and higher-cluster medians about 11–16 ms. This supports binding tasks to historical tool observations; fidelity of subsequent model execution remains unmeasured.**
+**In the new framework, each of seven adapters passes 60/60 checks for fixed task 0, with whole prepare-only CLI medians of 5.56–5.74 ms. No tools execute and workspaces remain unchanged. Historical clusters across twenty trajectories use a different input cohort and retain their original scope; consistency of real model continuation remains unmeasured.**
 
 | Need | Selection implication |
 |---|---|
 | Prepare historical tool context across Agents | Use the validated pinned-format adapters |
 | Restore actual file state | Restore the task environment separately; prefix preparation does not replay file changes |
 | Compare native resume or RL pipeline speed | No matched-trajectory timing control is available for a ranking |
+
+<!-- measurement-status:start -->
+
+New experiments and historical data are published separately. Each table retains its timing scope and inputs from the design and provenance; distinct cohorts are not pooled.
+
+<!-- measurement-status:end -->
 
 ## Motivation {#motivation}
 
@@ -39,6 +45,14 @@ Measured on 2026-10-06. N=60 per adapter, all passing; units are ms. Separated c
 | swe-agent | swe-agent/1.1.0/replay-then-live-v1 | 60/60 (0) | 51/60 (85.0%); 6.55 | 9/60 (15.0%); 14.97 | 15.20 |
 
 Mini-SWE-Agent does not trigger the split rule, so its row reports the full-sample P50. Splitting is descriptive: each cluster contains at least 10% of samples; the largest adjacent gap is at least 20% of the overall median and exceeds three times the median adjacent gap; cluster medians differ by at least 1.5×. This does not establish the cause of slower samples. All valid slow samples remain, so preparation should not be budgeted as a fixed few milliseconds.
+
+### Hyperfine: direct prepare-only command {#hyperfine}
+
+This independent cohort measures one fixed synthetic trajectory (task 0) per adapter, 60 runs without warmups. Hyperfine directly launches `pvisor-replay` with `--shell=none`; Python reset and fidelity checks run outside timing for every execution. All runs must preserve exact arguments, source digests and historical observations, execute zero tools and leave the workspace unchanged. Results cover full command completion, not the twenty-fixture historical distribution above. The binary digest identifies the artifact; its correspondence to current source is unverified. Host caches are retained, CPU affinity and artifact identities are recorded in the provenance download. No paired speedup or tail claim is made.
+
+{{ table("replay-semspec.render.json") }}
+
+[Hyperfine data CSV](replay-semspec.csv) · [Batch provenance](../assets/benchmarks/replay-semspec.provenance.json) · [JSON benchmark manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark.new/README.md#replay)
 
 ### Scope {#acceptance}
 

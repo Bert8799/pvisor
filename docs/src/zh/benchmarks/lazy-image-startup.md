@@ -10,6 +10,12 @@
 | 已有完整本地镜像 | Docker 更早输出正确标记；lazy VM 仍需 VM/Job 启动和收尾 |
 | 首次部署镜像服务 | 另计上游下载、解包和索引成本；缓存准备不衡量这些工作 |
 
+<!-- measurement-status:start -->
+
+本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 一次性环境运行短命令时，完整镜像下载、解包可能比任务本身更贵。选择按需读取前，需要区分服务端准备和客户端启动成本，也要判断镜像已缓存后是否仍有优势。

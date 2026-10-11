@@ -11,6 +11,12 @@
 | Historical context or uncached images | Evaluate prefix preparation or lazy reads within their measured scope |
 | Existing RL stack | Keep task, model and training layers; dedicated integrations remain unvalidated |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 A rollout creates an environment, alternates model inference with tool calls, runs verification, assigns a reward and retains or rejects the sample. Failed attempts may need context preparation, environment restoration and another execution. Choosing an executor requires budgeting these stages separately and preserving the task's required boundary.

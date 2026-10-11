@@ -1,0 +1,269 @@
+{
+  "Native": {
+    "batch": "native_timing-20261011T004342Z-8wjyuy21",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "355c05aa8af734b85978052114fc98485d339ec681f1e1cebc5bd5b317ac4948",
+    "manifest_sha256": "571e859d1e439e764b42696e5280aa02bdeb4a3cb49797164d54116286d797e0",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "protocol.json": "3ef56beced1a1cfe490a97bee7abaa4acaec30b92015bdc8d82ece4b8bd7fefb"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "pVisor host": {
+    "batch": "pvisor_host_timing-20261011T004343Z-gdenfkzx",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "b5ec9fd9f67ad90cfa3b5aaa77041a2aad2a3426f82a7afd2c63efeccd954adb",
+    "manifest_sha256": "768f808263dc663e926b58944b46d1e966d0b700f42a4cdacf91a7e0bd7c27fa",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "pvisor": "d3f09687cca60b617629c215fa1359c441ab6ac19f8c63b68f1dcdf7614e6b30",
+        "protocol.json": "1fac9b4a3f827244454f5d8e44d269339d4de49efc235fd60abb590607553cf7"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "pVisor staged": {
+    "batch": "pvisor_staged_timing-20261011T004437Z-0_8_myox",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "ecad00dd273bd159cd74112059f1a1a09a0bf0a58cf999f596d5a5d7a2027049",
+    "manifest_sha256": "8a4d6d031779febc3b156bfe29163e68ba7ccaa3f3294ff810cdd913b094e22f",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "pvisor": "d3f09687cca60b617629c215fa1359c441ab6ac19f8c63b68f1dcdf7614e6b30",
+        "protocol.json": "283300340310a364630a2cb623c27e646b49b1400aa44b1b9808c5bdcedfb191"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "pVisor VM": {
+    "batch": "pvisor_vm-20261011T004527Z-4o2qaxr9",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "6f1b2e5eb12b8012bb1f221d94944017c3792625ae27038e489d29808ae43de3",
+    "manifest_sha256": "a63cb47729c4b6cf1f37e259241a0b5ee1105157e58a1eb5b79f5e8da82db252",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "guest_cpus": 2,
+      "guest_memory_mib": 128,
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "pvisor": "d3f09687cca60b617629c215fa1359c441ab6ac19f8c63b68f1dcdf7614e6b30",
+        "protocol.json": "4ad73228a7567a5099d6ec8712e4c2e9e8fe17be21017f03dda6b7122b0943cd"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "Docker": {
+    "batch": "docker_timing-20261011T004624Z-8aq0yusi",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "9df027d8154142787594d86cd7572465957be3513333dd83c734debd50558c10",
+    "manifest_sha256": "aea46ba225d18a1fd202e2460933d809a691636e33b0346319fcd4cc01eeb8d5",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "docker-import.json": "f79716a9a03dca9c30854458052c6652b6d98c42f219125a22f50677d769802f",
+        "docker": "1e4ba89993b43d6ad35c0c7fad3192a1ec6eb268037768023c570ae6fadc8d38",
+        "protocol.json": "1ebc89f9512f3783fbf1ee2b13d53c3173a8286017efdf10e1c9e80977c792ba"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "QEMU": {
+    "batch": "qemu_timing-20261011T004840Z-vh5l4h7y",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "7d8b028d8df05ff7b3cc881e9d30b998fb55de23b51c29329969ed1b86ce1ae0",
+    "manifest_sha256": "1431f57af3f73fac2331982e186a0d61ba8de88d7f07e1213af23751a1c1fad9",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "guest_cpus": 2,
+      "guest_memory_mib": 128,
+      "kernel": {
+        "receipt_sha256": "b9f102941262a6671f52e5cb0f361df5b8a45192b8e54e71ad00d6fd559ed350",
+        "variant": "fc-system",
+        "provenance": {
+          "distribution": "Fedora Linux 44",
+          "package": "kernel-core",
+          "package_version": "7.2.8-200.fc44.x86_64",
+          "source_url": "https://src.fedoraproject.org/rpms/kernel",
+          "origin": "official-distro-stock",
+          "pvisor_firmware": false,
+          "initrd": "minimal stock-module loader; not host systemd initramfs"
+        },
+        "artifacts": {
+          "config": "de2947fbecd9addbf0612ba44a963e082bb34a35a552184b10a00e62690756f8",
+          "extractor": "f81eb1706b6be6fe452d6dfa019b8b3b06030e27316a64c5e16c267a40584126",
+          "initrd": "9da85569fdccde17f235407a1cd87a6fcaae25c89f90c47de30239c4f78c9069",
+          "kernel": "50a85e7c4c13307eb8a9ef79873e550ee21ef53a91c45f9b69cabc5c91ad2703",
+          "provenance": "0dd26dab29b058294df69a271a5737ce48f2a17a69e7cf6472be969a1a7d039a",
+          "vmlinuz": "2e8f2993295da228471a6e6849469b40be4513303f413029f62e565d44d4fc47"
+        }
+      },
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "kernel-receipt.json": "b9f102941262a6671f52e5cb0f361df5b8a45192b8e54e71ad00d6fd559ed350",
+        "config": "de2947fbecd9addbf0612ba44a963e082bb34a35a552184b10a00e62690756f8",
+        "extractor": "f81eb1706b6be6fe452d6dfa019b8b3b06030e27316a64c5e16c267a40584126",
+        "initrd": "9da85569fdccde17f235407a1cd87a6fcaae25c89f90c47de30239c4f78c9069",
+        "kernel": "50a85e7c4c13307eb8a9ef79873e550ee21ef53a91c45f9b69cabc5c91ad2703",
+        "provenance": "0dd26dab29b058294df69a271a5737ce48f2a17a69e7cf6472be969a1a7d039a",
+        "vmlinuz": "2e8f2993295da228471a6e6849469b40be4513303f413029f62e565d44d4fc47",
+        "qemu-system-x86_64": "27cd395848940fc6482256d85096fc64bc4fe3f3e909824d51c202f8314cd9e9",
+        "protocol.json": "ca51aabc0036cc5451493541d26def13cea178132d599429d855a9223ae8b163"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "QEMU microvm": {
+    "batch": "qemu_microvm_timing-20261011T005005Z-hra4_tyy",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "eb2c5c6f18620ac4f0f30e1d67aa47aa1fcaa223f6b050ad70ec9982f6a3b457",
+    "manifest_sha256": "d5c74b3517c2b8ee545c4a274a8cea36e93d9f3c6b4b9153d0ea7ab4ce1d974a",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "guest_cpus": 2,
+      "guest_memory_mib": 128,
+      "kernel": {
+        "receipt_sha256": "b9f102941262a6671f52e5cb0f361df5b8a45192b8e54e71ad00d6fd559ed350",
+        "variant": "fc-system",
+        "provenance": {
+          "distribution": "Fedora Linux 44",
+          "package": "kernel-core",
+          "package_version": "7.2.8-200.fc44.x86_64",
+          "source_url": "https://src.fedoraproject.org/rpms/kernel",
+          "origin": "official-distro-stock",
+          "pvisor_firmware": false,
+          "initrd": "minimal stock-module loader; not host systemd initramfs"
+        },
+        "artifacts": {
+          "config": "de2947fbecd9addbf0612ba44a963e082bb34a35a552184b10a00e62690756f8",
+          "extractor": "f81eb1706b6be6fe452d6dfa019b8b3b06030e27316a64c5e16c267a40584126",
+          "initrd": "9da85569fdccde17f235407a1cd87a6fcaae25c89f90c47de30239c4f78c9069",
+          "kernel": "50a85e7c4c13307eb8a9ef79873e550ee21ef53a91c45f9b69cabc5c91ad2703",
+          "provenance": "0dd26dab29b058294df69a271a5737ce48f2a17a69e7cf6472be969a1a7d039a",
+          "vmlinuz": "2e8f2993295da228471a6e6849469b40be4513303f413029f62e565d44d4fc47"
+        }
+      },
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "kernel-receipt.json": "b9f102941262a6671f52e5cb0f361df5b8a45192b8e54e71ad00d6fd559ed350",
+        "config": "de2947fbecd9addbf0612ba44a963e082bb34a35a552184b10a00e62690756f8",
+        "extractor": "f81eb1706b6be6fe452d6dfa019b8b3b06030e27316a64c5e16c267a40584126",
+        "initrd": "9da85569fdccde17f235407a1cd87a6fcaae25c89f90c47de30239c4f78c9069",
+        "kernel": "50a85e7c4c13307eb8a9ef79873e550ee21ef53a91c45f9b69cabc5c91ad2703",
+        "provenance": "0dd26dab29b058294df69a271a5737ce48f2a17a69e7cf6472be969a1a7d039a",
+        "vmlinuz": "2e8f2993295da228471a6e6849469b40be4513303f413029f62e565d44d4fc47",
+        "qemu-system-x86_64": "27cd395848940fc6482256d85096fc64bc4fe3f3e909824d51c202f8314cd9e9",
+        "protocol.json": "ddc637ed77e0f68a2a993fe629d8d14ff18649546b0ade1ac61095054eb3b7e7"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  },
+  "Firecracker": {
+    "batch": "fc_system_timing-20261011T004712Z-97n8gne7",
+    "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded",
+    "measurement_engine": "python-perf_counter_ns",
+    "evidence_sha256": "b0343f5973991391c32b67b4a8431a5e992c80cb6c403338d3dc4965e7ce2251",
+    "manifest_sha256": "107c830711205462c88ae27f0de0e1088ffee1176a5f9842d483dacc1e8413f3",
+    "configuration": {
+      "cpu_affinity": [
+        0,
+        1
+      ],
+      "guest_cpus": 2,
+      "guest_memory_mib": 128,
+      "device_transport": "virtio-mmio",
+      "kernel": {
+        "receipt_sha256": "b9f102941262a6671f52e5cb0f361df5b8a45192b8e54e71ad00d6fd559ed350",
+        "variant": "fc-system",
+        "provenance": {
+          "distribution": "Fedora Linux 44",
+          "package": "kernel-core",
+          "package_version": "7.2.8-200.fc44.x86_64",
+          "source_url": "https://src.fedoraproject.org/rpms/kernel",
+          "origin": "official-distro-stock",
+          "pvisor_firmware": false,
+          "initrd": "minimal stock-module loader; not host systemd initramfs"
+        },
+        "artifacts": {
+          "config": "de2947fbecd9addbf0612ba44a963e082bb34a35a552184b10a00e62690756f8",
+          "extractor": "f81eb1706b6be6fe452d6dfa019b8b3b06030e27316a64c5e16c267a40584126",
+          "initrd": "9da85569fdccde17f235407a1cd87a6fcaae25c89f90c47de30239c4f78c9069",
+          "kernel": "50a85e7c4c13307eb8a9ef79873e550ee21ef53a91c45f9b69cabc5c91ad2703",
+          "provenance": "0dd26dab29b058294df69a271a5737ce48f2a17a69e7cf6472be969a1a7d039a",
+          "vmlinuz": "2e8f2993295da228471a6e6849469b40be4513303f413029f62e565d44d4fc47"
+        }
+      },
+      "cache": "warm; no host cache eviction",
+      "source_commit_scope": "harness worktree; binary digest does not prove source-build correspondence",
+      "artifacts": {
+        "assets.json": "c678eaba542f4e30feb9d033ee8a4af84e955cc6a67bc08e234c0ec22512198d",
+        "input-manifest.json": "358ca833b32ed7ef60b6333cc873a77a531a9f8076e5419cb57b4e629185013f",
+        "kernel-receipt.json": "b9f102941262a6671f52e5cb0f361df5b8a45192b8e54e71ad00d6fd559ed350",
+        "config": "de2947fbecd9addbf0612ba44a963e082bb34a35a552184b10a00e62690756f8",
+        "extractor": "f81eb1706b6be6fe452d6dfa019b8b3b06030e27316a64c5e16c267a40584126",
+        "initrd": "9da85569fdccde17f235407a1cd87a6fcaae25c89f90c47de30239c4f78c9069",
+        "kernel": "50a85e7c4c13307eb8a9ef79873e550ee21ef53a91c45f9b69cabc5c91ad2703",
+        "provenance": "0dd26dab29b058294df69a271a5737ce48f2a17a69e7cf6472be969a1a7d039a",
+        "vmlinuz": "2e8f2993295da228471a6e6849469b40be4513303f413029f62e565d44d4fc47",
+        "firecracker": "c41309a2452e05149c5183e867c4d34b9b8d07e2885673d465714e238ad57d98",
+        "protocol.json": "0a0b44b39041776d5b1bc198f964b8f24a23a1c4c0487996588c68508087c85e"
+      },
+      "publisher_sha256": "46d249fe87c2879229867500d93f9d568e5aabf861d6ec0d44039893a61c220d"
+    }
+  }
+}

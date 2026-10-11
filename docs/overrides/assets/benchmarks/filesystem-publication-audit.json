@@ -1,0 +1,39 @@
+{
+  "format": 1,
+  "state": "passed",
+  "benchmark_id": "B-FS-TOOLS",
+  "role": "user-facing",
+  "batch": "fo8e2d57ff-f",
+  "date": "2026-10-11",
+  "formal_rows": 240,
+  "samples_per_backend": 30,
+  "warmups_per_backend": 3,
+  "failed": 0,
+  "summary_records": 80,
+  "raw_sha256": "d37b961370f9d8ba3487fd1a6a7a85cf5e85e5de6b32ae91285eb69b9dbfdb92",
+  "acceptance_sha256": "ec38a6bc0311c07e45a756ed6ac0099270c680e432a3aa02252e78ea07f66528",
+  "csv_sha256": {
+    "filesystem.csv": "04d21df98b303017b7611c398084b31f4a25f3a744611c715afa74da8db201b4",
+    "filesystem-comparisons.csv": "7b4676043a7967fc93eeff898790aa37963c4be4f064775e5b661f15e01ff1de",
+    "filesystem-provenance.csv": "ddb47aec6e6b656bd45a94eef9e490241484509ad9dafce5410270aabffbc569"
+  },
+  "defaults": {
+    "reviewed_from_frozen_source": true,
+    "new_vm_writeback": false,
+    "ordinary_dax": false,
+    "stage_sync_workers": 1
+  },
+  "timing_scope": "one full reference cohort; complete tasks and seven tool phases; no whole-command probe replacement",
+  "confidence_method": "5000 paired-round bootstrap resamples, seed 20261006; percentile 95% CI",
+  "separated_clusters": "retain medians/counts; no overall P50/ranking",
+  "documentation_checks": "accepted input distributions/exports rechecked during preparation; Markdown/HTML consistency requires the separate audit command",
+  "engineering_cohorts": [
+    {
+      "batch": "fof1",
+      "summary": "filesystem-optimization-n30-summary.csv",
+      "summary_sha256": "65b0287892724c266ebc39db20adcc138ac180aedb6b455cc0f713517d6b25dd",
+      "acceptance_sha256": "3a599448f7a7737f38e52b7d2943555d0a8cc4d74e030ebabbea5461d25fca29",
+      "role": "independent formal engineering A/B; no pooled samples"
+    }
+  ]
+}

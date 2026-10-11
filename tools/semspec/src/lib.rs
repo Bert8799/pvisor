@@ -7,3 +7,4 @@ pub mod parse;
 pub mod project;
 pub mod runner;
 pub mod seal;
+pub mod table;

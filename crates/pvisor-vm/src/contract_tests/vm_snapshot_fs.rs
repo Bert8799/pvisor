@@ -53,6 +53,8 @@ impl GuestFs {
         Self::from_device(fs, restore)
     }
     fn from_device(mut fs: Fs, restore: Option<(GuestMemoryMmap, DeviceSnapshot, u16)>) -> Self {
+        // This protocol fixture models a one-vCPU guest with one request ring.
+        fs.configure_request_queues(1).unwrap();
         let chip = interrupt_chip();
         let interrupt = InterruptTransport::new(chip, "fs-check".into()).unwrap();
         let events: Vec<_> = (0..2)

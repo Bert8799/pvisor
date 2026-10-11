@@ -27,6 +27,32 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Execute command cells or rows in a JSON table; write INPUT.render.json and INPUT.bench.json.
+    Bench {
+        input: PathBuf,
+        /// Working directory for commands; defaults to the template directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// RFC 6901 pointer into each hyperfine export (default: first command's median).
+        #[arg(long, default_value = "/results/0/median")]
+        pointer: String,
+        /// Multiply the selected hyperfine value (seconds to milliseconds by default).
+        #[arg(long, default_value = "1000")]
+        scale: f64,
+    },
+    /// Replace standalone {{ table("file.render.json") }} placeholders; print Markdown.
+    Render {
+        input: PathBuf,
+        /// Optional output file; otherwise write to stdout. The source cannot be overwritten.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Read Markdown from stdin, using INPUT only as the source path for relative tables.
+        #[arg(long)]
+        stdin: bool,
+        /// Continue past table errors with visible warnings; intended for live previews.
+        #[arg(long)]
+        best_effort: bool,
+    },
     Init {
         directory: PathBuf,
     },
@@ -121,6 +147,45 @@ fn main() {
 }
 fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
+        Commands::Bench {
+            input,
+            cwd,
+            pointer,
+            scale,
+        } => {
+            ensure!(cli.spec_dir.is_empty(), "bench does not accept --spec-dir");
+            let output = semspec::table::bench_at(&input, &pointer, scale, cwd.as_deref())?;
+            println!("{}", output.display());
+            return Ok(0);
+        }
+        Commands::Render {
+            input,
+            output,
+            stdin,
+            best_effort,
+        } => {
+            ensure!(cli.spec_dir.is_empty(), "render does not accept --spec-dir");
+            let source = if stdin {
+                std::io::read_to_string(io::stdin())?
+            } else {
+                fs::read_to_string(&input)?
+            };
+            let text = semspec::table::render(&source, &input, best_effort)?;
+            if let Some(output) = output {
+                let output = absolute(&output)?;
+                ensure!(
+                    output != absolute(&input)?
+                        && (!output.exists()
+                            || !input.exists()
+                            || output.canonicalize()? != input.canonicalize()?),
+                    "render output must not overwrite its Markdown source"
+                );
+                atomic_write(&output, text.as_bytes())?;
+            } else {
+                print!("{text}");
+            }
+            return Ok(0);
+        }
         Commands::Helper { command } => {
             return match command {
                 Helper::TreeState { directory } => {
@@ -319,7 +384,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Commands::Helper { .. } | Commands::Init { .. } => unreachable!(),
+        Commands::Helper { .. }
+        | Commands::Init { .. }
+        | Commands::Bench { .. }
+        | Commands::Render { .. } => unreachable!(),
     }
 }
 fn absolute(path: &Path) -> Result<PathBuf> {
