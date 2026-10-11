@@ -12,7 +12,7 @@
 
 <!-- measurement-status:start -->
 
-总览的文件系统一行来自 2026-10-11 已验收批次 `fo8e2d57ff-f`，其他主题继续使用各自批次。各专题的计时边界和制品分别列出，见[复测覆盖](#measurement-coverage)。
+总览的文件系统一行来自 2026-10-12 已验收批次 `fo5a4e7d2b-f`，其他主题继续使用各自批次。各专题的计时边界和制品分别列出，见[复测覆盖](#measurement-coverage)。
 
 <!-- measurement-status:end -->
 
@@ -30,13 +30,13 @@
 
 ## 实验数据和分析 {#results}
 
-2026-10-06 的启动、文件系统和修复共 1,440 个有效样本，完整审查流程 360 个；2026-10-07 的独立 stock 内核启动对照为 240 个有效样本，失败均为 0。2026-10-11 所选冻结源码文件系统对照另有 240 个有效样本、失败 0，使用每任务独立缓存与统一父组资源约束。各批次不合并，中位数差异和 95% 配对 bootstrap 区间见各专题。
+2026-10-06 的启动、文件系统和修复共 1,440 个有效样本，完整审查流程 360 个；2026-10-07 的独立 stock 内核启动对照为 240 个有效样本，失败均为 0。2026-10-12 所选冻结源码文件系统对照另有 240 个有效样本、失败 0，使用每任务独立缓存与统一父组资源约束。各批次不合并，中位数差异和 95% 配对 bootstrap 区间见各专题。
 
 | 问题 | 实测水位（耗时为 P50） |
 |---|---|
 | [Startup](startup.md) | stock 对照：VM 100.91 ms；Firecracker 285.04 ms；QEMU microvm 321.56 ms；q35 702.98 ms |
 | [Repair completion](agent-tasks.md) | staged 0.64 s; Docker 0.81 s; VM 3.25 s; QEMU microvm 1.40 s |
-| [Seven-tool completion](filesystem.md) | staged 1.85 s; Docker 1.41 s; VM 5.50 s; Firecracker 2.74 s |
+| [Seven-tool completion](filesystem.md) | staged 1.80 s; Docker 1.27 s; VM 5.46 s; Firecracker 2.67 s |
 | [Review workflow](supervision-cost.md) | 10,000 files: stage 141 ms; Git 248 ms; reflink 343 ms |
 | [网络](network.md) | 八线程小请求：原生 0.69 ms；host proxy 10.09 ms；VM 2.10 ms |
 | [活跃容量](density.md) | 2 GiB：stage/Podman 32 路、VM 16 路通过全部五轮 |

@@ -141,8 +141,8 @@ provenance 摘要统一保存在 `docs/overrides/assets/benchmarks/`，中英文
 清单、宿主路径和软件包收据留在批次 `.data/`。启动仅发布文档引用的 Ready / Exit
 两张 JSON 表，单行复测保留其他条件的来源配置。
 发布器验证 `metric_scope` 与绑定声明的负载配置；中位数与标准差同一行，批次名称放在来源记录，不挤入数值表。
-没有 live binding 的条件会拒绝发布；工程 A/B 不写入用户表。filesystem 的历史 hyperfine 表
-已移回 Markdown，其发布绑定已删除；新 Python 时钟数据需单独登记文档表与 CSV。改变历史表数据时需同步
+没有 live binding 的条件会拒绝发布；工程 A/B 不写入用户表。filesystem 的历史 hyperfine 结果
+保留在本地归档，其用户表、下载和发布绑定已删除；新 Python 时钟数据需单独登记文档表与 CSV。改变历史表数据时需同步
 登记新来源与摘要，不能让旧 CSV 或旧结论自动冒充新实验。原文章归档留在
 `.data/docs-tables-20261011/`；原 CSV 未覆盖。
 整理前的完整文档 provenance 归档于 `.data/docs-provenance-20261011/`。

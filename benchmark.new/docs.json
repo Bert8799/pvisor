@@ -83,8 +83,7 @@
         "filesystem-provenance.csv",
         "filesystem.csv",
         "runtime-provenance.csv",
-        "runtime-summary.csv",
-        "filesystem-semspec.csv"
+        "runtime-summary.csv"
       ]
     },
     {
@@ -495,8 +494,7 @@
         "filesystem-provenance.csv",
         "filesystem.csv",
         "runtime-provenance.csv",
-        "runtime-summary.csv",
-        "filesystem-semspec.csv"
+        "runtime-summary.csv"
       ]
     },
     {

@@ -26,7 +26,7 @@
 
 普通 rootfs/workspace 默认不创建 DAX 窗口；不可变 share 保留显式 DAX 配置。新建 VM 写合并默认关闭，`PVISOR_VM_FS_WRITEBACK=1` / `0` 可显式配置；默认恢复已协商快照时保留原模式，显式 `PVISOR_VM_FS_WRITEBACK=0` 会拒绝已开启写合并的快照；stage 同步默认串行。历史工程表的制品与条件保留，不将其百分比累加或折算成当前用户批次的收益。
 
-2026-10-11 所选冻结源码/默认配置已完成跨运行时七工具复测：八个后端各 30 次，共 240 个有效任务，DAX 关闭、新 VM 写合并默认关闭，见[工具等待](../benchmarks/filesystem.md#reference-fs)。新用户数据来自独立 `fo8e2d57ff-f` 批次，不与历史合并，也不计算跨批次因果加速。旧有效与拒绝批次继续分别保留，见[验收范围 CSV](filesystem-measurement-status.csv)。
+2026-10-12 所选冻结源码/默认配置已完成跨运行时七工具复测：八个后端各 30 次，共 240 个有效任务，DAX 关闭、新 VM 写合并默认关闭，见[工具等待](../benchmarks/filesystem.md#reference-fs)。新用户数据来自独立 `fo5a4e7d2b-f` 批次，不与历史合并，也不计算跨批次因果加速。旧有效与拒绝批次继续分别保留，见[验收范围 CSV](filesystem-measurement-status.csv)。
 
 macOS 的[复制期间响应性与 journal 锁](#host-concurrency)、Linux HOST 的[不可变 lower 缓存](#immutable-lower-cache)各有独立有效实验；[扩展内核缓存](#host-cache-evidence)只有正确性和请求计数通过，正式时间未验收。冷磁盘、大型仓库和并发吞吐没有匹配的新测量。[工程结论索引 CSV](filesystem-evidence-overview.csv)保留表格的批次、指标、来源和完整精度。
 

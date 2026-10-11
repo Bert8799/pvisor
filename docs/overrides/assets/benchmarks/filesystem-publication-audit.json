@@ -3,19 +3,20 @@
   "state": "passed",
   "benchmark_id": "B-FS-TOOLS",
   "role": "user-facing",
-  "batch": "fo8e2d57ff-f",
-  "date": "2026-10-11",
+  "batch": "fo5a4e7d2b-f",
+  "date": "2026-10-12",
+  "date_timezone": "Asia/Shanghai",
   "formal_rows": 240,
   "samples_per_backend": 30,
   "warmups_per_backend": 3,
   "failed": 0,
   "summary_records": 80,
-  "raw_sha256": "d37b961370f9d8ba3487fd1a6a7a85cf5e85e5de6b32ae91285eb69b9dbfdb92",
-  "acceptance_sha256": "ec38a6bc0311c07e45a756ed6ac0099270c680e432a3aa02252e78ea07f66528",
+  "raw_sha256": "0127dbdd8a04317be06a0235e5b1cec75dc298b3c6e312f22f1382b8d19f7262",
+  "acceptance_sha256": "45f479ab7709723e781bfd6b78d8ace3dfa2a8914a687173babfd9ee23daf24e",
   "csv_sha256": {
-    "filesystem.csv": "04d21df98b303017b7611c398084b31f4a25f3a744611c715afa74da8db201b4",
-    "filesystem-comparisons.csv": "7b4676043a7967fc93eeff898790aa37963c4be4f064775e5b661f15e01ff1de",
-    "filesystem-provenance.csv": "ddb47aec6e6b656bd45a94eef9e490241484509ad9dafce5410270aabffbc569"
+    "filesystem.csv": "27dc60670d758f4d0f0852e7c3535b08a8ec290e6892a72295901e590b6389aa",
+    "filesystem-comparisons.csv": "d7063001b2c0c2121f603e5111db50b240e91285209cc10742fd642c5e47670b",
+    "filesystem-provenance.csv": "e88d4292d73e52a4d243d6a3b7a07404ff1594d027abdbdcca4bac43155925cd"
   },
   "defaults": {
     "reviewed_from_frozen_source": true,
@@ -27,13 +28,5 @@
   "confidence_method": "5000 paired-round bootstrap resamples, seed 20261006; percentile 95% CI",
   "separated_clusters": "retain medians/counts; no overall P50/ranking",
   "documentation_checks": "accepted input distributions/exports rechecked during preparation; Markdown/HTML consistency requires the separate audit command",
-  "engineering_cohorts": [
-    {
-      "batch": "fof1",
-      "summary": "filesystem-optimization-n30-summary.csv",
-      "summary_sha256": "65b0287892724c266ebc39db20adcc138ac180aedb6b455cc0f713517d6b25dd",
-      "acceptance_sha256": "3a599448f7a7737f38e52b7d2943555d0a8cc4d74e030ebabbea5461d25fca29",
-      "role": "independent formal engineering A/B; no pooled samples"
-    }
-  ]
+  "engineering_cohorts": []
 }

@@ -12,7 +12,7 @@
 
 <!-- measurement-status:start -->
 
-The filesystem overview row uses accepted cohort `fo8e2d57ff-f` from 2026-10-11; other topics retain their separate cohorts. Timing boundaries and artifacts are listed by topic; see [measurement coverage](#measurement-coverage).
+The filesystem overview row uses accepted cohort `fo5a4e7d2b-f` from 2026-10-12; other topics retain their separate cohorts. Timing boundaries and artifacts are listed by topic; see [measurement coverage](#measurement-coverage).
 
 <!-- measurement-status:end -->
 
@@ -30,13 +30,13 @@ This reuses separately registered [startup](startup.md), [filesystem](filesystem
 
 ## Data and analysis {#results}
 
-The 2026-10-06 startup/filesystem/repair cohorts have 1,440 valid samples and review has 360; the separate 2026-10-07 stock-kernel startup cohort has 240 valid samples. All have zero measured failures. The selected-source filesystem comparison on 2026-10-11 adds 240 valid samples and zero failures, with task-local caches and a common parent resource budget. Cohorts are not pooled; topic pages provide median differences and paired-bootstrap 95% intervals.
+The 2026-10-06 startup/filesystem/repair cohorts have 1,440 valid samples and review has 360; the separate 2026-10-07 stock-kernel startup cohort has 240 valid samples. All have zero measured failures. The selected-source filesystem comparison on 2026-10-12 adds 240 valid samples and zero failures, with task-local caches and a common parent resource budget. Cohorts are not pooled; topic pages provide median differences and paired-bootstrap 95% intervals.
 
 | Question | Measured level (timing is P50) |
 |---|---|
 | [Startup](startup.md) | Stock controls: VM 100.91 ms; Firecracker 285.04 ms; QEMU microvm 321.56 ms; q35 702.98 ms |
 | [Repair completion](agent-tasks.md) | staged 0.64 s; Docker 0.81 s; VM 3.25 s; QEMU microvm 1.40 s |
-| [Seven-tool completion](filesystem.md) | staged 1.85 s; Docker 1.41 s; VM 5.50 s; Firecracker 2.74 s |
+| [Seven-tool completion](filesystem.md) | staged 1.80 s; Docker 1.27 s; VM 5.46 s; Firecracker 2.67 s |
 | [Review workflow](supervision-cost.md) | 10,000 files: stage 141 ms; Git 248 ms; reflink 343 ms |
 | [Network](network.md) | Eight-thread small requests: native 0.69 ms; host proxy 10.09 ms; VM 2.10 ms |
 | [Active capacity](density.md) | 2 GiB: stage/Podman pass all five rounds at 32; VM at 16 |

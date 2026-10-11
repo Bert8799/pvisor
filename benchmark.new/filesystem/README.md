@@ -48,8 +48,8 @@ read 读取完整数据并校验 SHA256。输入大小、目录结构及所有�
 本地 CSV / Markdown 可通过 `update.py` 显式发布到 `.data/results/`。
 旧 results 已归档到 `.data/history/`；旧 workload CLI 与 hyperfine 模板不再参与执行。
 
-Python 时钟数据与旧 hyperfine 数据的来源不同。文档里的 `filesystem-semspec.csv` 和
-展示表继续使用历史口径，当前批次不写入这些文件；`docs.py publish` 会拒绝时钟范围不匹配的发布。
+Python 时钟数据与旧 hyperfine 数据的来源不同。旧数据和撤下的公开文件保留在本地
+历史归档，用户文件系统页只展示七工具对照；`docs.py publish` 会拒绝时钟范围不匹配的发布。
 需要发布新口径时应登记独立文档表与 CSV，不覆盖或拼接旧样本。
 
 ## 不可变 share 的 DAX 工程 A/B
