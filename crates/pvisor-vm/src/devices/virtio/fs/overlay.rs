@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use pvisor_overlay_core::{BackingIdentity, BackingResolution, OverlayCore};
 use pvisor_overlay_core::{
     backend,
     service::{FilesystemService, OpenBacking},
 };
+use pvisor_overlay_core::{BackingIdentity, BackingResolution, OverlayCore};
 
 use super::super::linux_errno::linux_error;
 use super::bindings;
@@ -109,23 +109,30 @@ struct IoFence {
 
 impl IoActivity {
     fn fence(self: &Arc<Self>, handles: Vec<u64>, global: bool) -> IoFence {
+        let fence = IoFence {
+            activity: self.clone(),
+            handles,
+            global,
+        };
+        if !global && fence.handles.is_empty() {
+            return fence;
+        }
         let mut state = self.state.lock().unwrap();
         if global {
             state.global += 1;
         }
-        for id in &handles {
+        for id in &fence.handles {
             *state.blocked.entry(*id).or_default() += 1;
         }
-        IoFence {
-            activity: self.clone(),
-            handles,
-            global,
-        }
+        fence
     }
 }
 
 impl IoFence {
     fn drain(&self) {
+        if !self.global && self.handles.is_empty() {
+            return;
+        }
         let mut state = self.activity.state.lock().unwrap();
         while if self.global {
             !state.active.is_empty()
@@ -139,6 +146,9 @@ impl IoFence {
 
 impl Drop for IoFence {
     fn drop(&mut self) {
+        if !self.global && self.handles.is_empty() {
+            return;
+        }
         let mut state = self.activity.state.lock().unwrap();
         if self.global {
             state.global -= 1;
@@ -172,7 +182,12 @@ impl Drop for FileIoLease {
         *count -= 1;
         if *count == 0 {
             state.active.remove(&self.id);
-            self.activity.ready.notify_all();
+            // Only a global drain or a fence on this handle can be waiting
+            // for its count to reach zero. Ordinary uncontended I/O neither
+            // opens admission nor needs to wake unrelated fenced handles.
+            if state.global != 0 || state.blocked.contains_key(&self.id) {
+                self.activity.ready.notify_all();
+            }
         }
     }
 }
@@ -1467,7 +1482,7 @@ impl FileSystem for OverlayFs {
         )))
     }
     fn restore_state(&self, state: &super::snapshot::FsSnapshot) -> io::Result<()> {
-        use super::snapshot::{FsSnapshot, invalid};
+        use super::snapshot::{invalid, FsSnapshot};
         let FsSnapshot::Overlay(state) = state else {
             return Err(invalid("overlay filesystem type mismatch"));
         };
@@ -2486,7 +2501,7 @@ mod tests {
         body: &[u8],
     ) -> (vm_memory::GuestMemoryMmap, vm_memory::GuestAddress, usize) {
         use super::super::descriptor_utils::{
-            DescriptorType, OwnedDescriptorChain, create_descriptor_chain,
+            create_descriptor_chain, DescriptorType, OwnedDescriptorChain,
         };
         use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
@@ -2798,11 +2813,10 @@ mod tests {
             ..Default::default()
         };
         let fs = PassthroughFs::new(config.clone(), Arc::new(InodeAllocator::new())).unwrap();
-        assert!(
-            fs.init(FsOptions::WRITEBACK_CACHE)
-                .unwrap()
-                .contains(FsOptions::WRITEBACK_CACHE)
-        );
+        assert!(fs
+            .init(FsOptions::WRITEBACK_CACHE)
+            .unwrap()
+            .contains(FsOptions::WRITEBACK_CACHE));
         let ctx = Context {
             uid: 0,
             gid: 0,
@@ -3027,6 +3041,55 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_global_drain_is_woken_by_the_last_file_io_lease() {
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/a"), b"first").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"a").unwrap().inode;
+        let handle = fs
+            .open(ctx, inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let lease = fs.file_io_lease(handle).unwrap();
+        let (sent, received) = channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                sent.send(fs.capture_state()).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let installed = loop {
+                if fs.io_activity.state.lock().unwrap().global != 0 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            let premature = received.try_recv();
+            drop(lease);
+            let completed = received.recv_timeout(Duration::from_secs(2));
+            assert!(installed, "snapshot did not install its global drain");
+            assert!(premature.is_err(), "snapshot captured admitted I/O");
+            completed
+                .expect("last lease did not wake the global drain")
+                .unwrap();
+        });
+        fs.release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
     fn native_descriptor_lease_survives_native_handle_removal() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("lower")).unwrap();
@@ -3057,11 +3120,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(
-            native
-                .lease_handle(lease.handle.inode, lease.handle.handle)
-                .is_err()
-        );
+        assert!(native
+            .lease_handle(lease.handle.inode, lease.handle.handle)
+            .is_err());
         let mut writer = ReadWriter {
             gate: None,
             bytes: Vec::new(),
@@ -3234,7 +3295,10 @@ mod tests {
             let (queried, query_done) = channel();
             scope.spawn(move || {
                 queried
-                    .send(fs.lookup(ctx, fuse::ROOT_ID, c"b").map(|entry| entry.attr.st_size))
+                    .send(
+                        fs.lookup(ctx, fuse::ROOT_ID, c"b")
+                            .map(|entry| entry.attr.st_size),
+                    )
                     .unwrap();
             });
             // A blocked close must not exclude metadata on another object.
@@ -3244,7 +3308,9 @@ mod tests {
             assert_eq!(bytes, b"second");
             assert!(premature.is_err(), "release raced retained backing handle");
             assert_eq!(
-                unrelated_metadata.expect("RELEASE blocked unrelated LOOKUP").unwrap(),
+                unrelated_metadata
+                    .expect("RELEASE blocked unrelated LOOKUP")
+                    .unwrap(),
                 6
             );
             done.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
@@ -4143,10 +4209,9 @@ mod tests {
         };
         let entry = fs.lookup(ctx, fuse::ROOT_ID, c"dir").unwrap();
         for _ in 0..16 {
-            assert!(
-                fs.open(ctx, entry.inode, false, libc::O_WRONLY as u32)
-                    .is_err()
-            );
+            assert!(fs
+                .open(ctx, entry.inode, false, libc::O_WRONLY as u32)
+                .is_err());
         }
         assert!(fs.handles.lock().unwrap().is_empty());
         let super::super::snapshot::FsSnapshot::Overlay(snapshot) = fs.capture_state().unwrap()
@@ -4158,12 +4223,10 @@ mod tests {
                 panic!("expected a native layer");
             };
             assert!(native.handles.is_empty());
-            assert!(
-                native
-                    .inodes
-                    .iter()
-                    .all(|inode| inode.inode == fuse::ROOT_ID)
-            );
+            assert!(native
+                .inodes
+                .iter()
+                .all(|inode| inode.inode == fuse::ROOT_ID));
         }
     }
 
@@ -4268,24 +4331,21 @@ mod tests {
             gid: 0,
             pid: 1,
         };
-        assert!(
-            fs.lookup(ctx, fuse::ROOT_ID, &CString::new("private.key").unwrap())
-                .is_err()
-        );
+        assert!(fs
+            .lookup(ctx, fuse::ROOT_ID, &CString::new("private.key").unwrap())
+            .is_err());
         let alias = fs
             .lookup(ctx, fuse::ROOT_ID, &CString::new("alias").unwrap())
             .unwrap();
-        assert!(
-            fs.open(ctx, alias.inode, false, libc::O_RDONLY as u32)
-                .is_err()
-        );
+        assert!(fs
+            .open(ctx, alias.inode, false, libc::O_RDONLY as u32)
+            .is_err());
         let env = fs
             .lookup(ctx, fuse::ROOT_ID, &CString::new(".env").unwrap())
             .unwrap();
-        assert!(
-            fs.open(ctx, env.inode, false, libc::O_RDONLY as u32)
-                .is_ok()
-        );
+        assert!(fs
+            .open(ctx, env.inode, false, libc::O_RDONLY as u32)
+            .is_ok());
     }
 
     #[test]
@@ -4625,8 +4685,8 @@ mod tests {
         assert_eq!(entry.attr.st_gid, 2345);
         assert_eq!(entry.attr.st_mode as u32 & 0o7777, 0o755);
         fs.access(ctx, entry.inode, libc::X_OK as u32).unwrap();
-        assert!(
-            fs.access(
+        assert!(fs
+            .access(
                 Context {
                     uid: 3456,
                     gid: 3456,
@@ -4635,8 +4695,7 @@ mod tests {
                 entry.inode,
                 libc::W_OK as u32
             )
-            .is_err()
-        );
+            .is_err());
         let handle = fs
             .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
             .unwrap()

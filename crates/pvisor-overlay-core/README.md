@@ -66,6 +66,8 @@ already published entries proceed. Waiting observers refresh verified journal
 membership before reusing the actual publication, and external consumption still
 recaptures. Pending paths are removed after success or failure; fingerprints are
 never cached. Absence observations need no content capture admission.
+The diagnostic `coalesced_fingerprints` counter reports captures skipped after
+verified same-Core publication, not requests or bytes cached.
 Legacy journals and different Core owners may still compute duplicate
 fingerprints. The first published observation wins, and durable promotion syncs
 that actual winner. Capture failures publish nothing and do not poison the compact

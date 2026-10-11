@@ -339,6 +339,9 @@ RELEASE/RELEASEDIR 使用 namespace 读锁，允许无关元数据查询继续�
 只等待被释放的 handle。FH GETATTR/LSEEK 的原生调用同样持有 admission
 lease，关闭不会撤销它们正在使用的 mapping；目录枚举持有 Arc 快照。
 scope 屏障保持到修改完成，失败也会释放。
+没有受影响 handle 的路径屏障不取得 admission 锁，也不通知等待者。
+普通 I/O 完成只在全局排空或本 handle 的屏障已登记时通知；屏障关闭和
+排空检查仍在同一 admission 锁内，避免 close/freeze 丢失唤醒。
 等待时不持有 handle map 或 admission 锁，无关 handle 的新 I/O 仍可进入。
 LOOKUP/GETATTR 和目录元数据查询仍遵循 operation guard 的 namespace
 串行约束。capture/restore/destroy 使用全局 admission 屏障并排空全部

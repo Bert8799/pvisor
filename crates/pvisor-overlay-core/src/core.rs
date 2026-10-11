@@ -3625,6 +3625,66 @@ mod tests {
     }
 
     #[test]
+    fn compact_same_path_wait_does_not_block_an_unrelated_observation() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        fs::write(lower.join("file"), b"shared").unwrap();
+        fs::write(lower.join("other"), b"unrelated").unwrap();
+        let journal = temp.path().join("journal");
+        let core = OverlayCore::new_with_exclusions_and_preimages(
+            vec![lower],
+            temp.path().join("upper"),
+            None,
+            vec![],
+            Some(journal.clone()),
+        )
+        .unwrap()
+        .with_compact_preimages()
+        .unwrap();
+        let capture = core.fingerprint_flights.enter(Path::new("file")).unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| core.observe_read(Path::new("file")));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let registered = loop {
+                if core.fingerprint_flights.state.lock().unwrap().waiters != 0 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            let (sent, received) = mpsc::channel();
+            let shared = &core;
+            scope.spawn(move || {
+                sent.send(shared.observe_read(Path::new("other"))).unwrap();
+            });
+            let independent = received.recv_timeout(Duration::from_secs(2));
+            drop(capture);
+            waiting.join().unwrap().unwrap();
+            assert!(
+                registered,
+                "same-path observer did not wait for capture admission"
+            );
+            independent
+                .expect("pending fingerprint blocked an unrelated path")
+                .unwrap();
+        });
+        assert_eq!(load_preimages(&journal).unwrap().len(), 2);
+        assert!(
+            core.fingerprint_flights
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn one_core_can_publish_and_sync_other_observations_during_capture() {
         use super::*;
         use std::sync::mpsc;
