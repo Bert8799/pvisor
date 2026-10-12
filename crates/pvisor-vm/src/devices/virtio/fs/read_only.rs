@@ -112,11 +112,13 @@ impl FileSystem for PassthroughFsRo {
     // --- Delegated read-only operations ---
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let mut opts = self.inner.init(capable)?;
+        let opts = self.inner.init(capable)?;
         #[cfg(target_os = "linux")]
-        if self.dax.is_some() {
-            opts |= capable & (FsOptions::HAS_INODE_DAX | FsOptions::MAP_ALIGNMENT);
-        }
+        let opts = if self.dax.is_some() {
+            opts | (capable & (FsOptions::HAS_INODE_DAX | FsOptions::MAP_ALIGNMENT))
+        } else {
+            opts
+        };
         // Strip WRITEBACK_CACHE to prevent the guest kernel from buffering writes.
         Ok(opts & !FsOptions::WRITEBACK_CACHE)
     }

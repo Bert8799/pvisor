@@ -75,7 +75,10 @@ fn wait_pidfds(mut fds: Vec<libc::pollfd>, deadline: Instant) -> anyhow::Result<
         return Ok(());
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let millis = remaining.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+    let millis = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
     let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
     if result < 0 {
         let error = std::io::Error::last_os_error();
@@ -832,13 +835,8 @@ while True: time.sleep(1)
             .process_group(0)
             .spawn()
             .unwrap();
-        let mut tree = OwnedTree::new(
-            child.id() as i32,
-            std::process::id() as i32,
-            false,
-            0,
-        )
-        .unwrap();
+        let mut tree =
+            OwnedTree::new(child.id() as i32, std::process::id() as i32, false, 0).unwrap();
         tree.cleanup(false).unwrap();
         assert!(!tree.cleaned);
         assert!(!tree.root_exited());
@@ -850,13 +848,8 @@ while True: time.sleep(1)
     #[test]
     fn root_exit_wait_preserves_child_reaping_ownership() {
         let mut child = Command::new("/bin/true").process_group(0).spawn().unwrap();
-        let mut tree = OwnedTree::new(
-            child.id() as i32,
-            std::process::id() as i32,
-            false,
-            0,
-        )
-        .unwrap();
+        let mut tree =
+            OwnedTree::new(child.id() as i32, std::process::id() as i32, false, 0).unwrap();
         assert!(tree.wait_root(Duration::from_secs(2)).unwrap());
         tree.cleanup(true).unwrap();
         assert!(child.wait().unwrap().success());

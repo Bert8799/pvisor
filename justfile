@@ -343,16 +343,15 @@ benchmark *args:
     set -euo pipefail
     if [[ $# -eq 0 ]]; then set -- smoke; fi
     process_build="$(python3 "{{ repo }}/benchmark.new/run.py" --check "$@")"
-    benchmark_binary_args=()
     if [[ "$process_build" == process ]]; then
       benchmark_repo="${PVISOR_BENCHMARK_REPO:-{{ repo }}}"
       benchmark_build="${PVISOR_BENCHMARK_BUILD_DIR:-{{ target_dir }}/pvisor-benchmark-build}"
       CARGO_TARGET_DIR="$benchmark_build" just --justfile "$benchmark_repo/justfile" --working-directory "$benchmark_repo" build release
-      benchmark_binary_args=(--binary "$benchmark_build/release/pvisor")
+      set -- --binary "$benchmark_build/release/pvisor" "$@"
     fi
     cargo build --quiet --locked --manifest-path "{{ repo }}/tools/semspec/Cargo.toml" --target-dir "{{ target_dir }}/semspec"
     export SEMSPEC_BIN="{{ target_dir }}/semspec/debug/semspec"
-    python3 "{{ repo }}/benchmark.new/run.py" "${benchmark_binary_args[@]}" "$@"
+    python3 "{{ repo }}/benchmark.new/run.py" "$@"
 
 # ============================================================
 # 10. 文档

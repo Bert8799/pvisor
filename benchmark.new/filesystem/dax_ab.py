@@ -248,7 +248,8 @@ def analyze(batch, records):
             y = statistics.median(on[i] for i in indices)
             diffs.append(y - x)
             ratios.append((y / x - 1) * 100)
-        diffs.sort(); ratios.sort()
+        diffs.sort()
+        ratios.sort()
         off_clusters, on_clusters = separated(off), separated(on)
         split = bool(off_clusters or on_clusters)
         rows[metric] = {"pairs": 30, "off_median_ms": None if off_clusters else a,
@@ -289,7 +290,9 @@ def campaign(batch):
         print(f"completed pair {i + 1}/30", file=sys.stderr, flush=True)
     after = budget()
     save(batch / "budget-after.json", after)
-    parse_events = lambda value: dict(line.split() for line in value.splitlines())
+    def parse_events(value):
+        return dict(line.split() for line in value.splitlines())
+
     prior_events, final_events = parse_events(before["memory.events"]), parse_events(after["memory.events"])
     if any(prior_events[key] != final_events[key] for key in ("oom", "oom_kill", "oom_group_kill")):
         raise ValueError("OOM events occurred")

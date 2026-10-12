@@ -2211,6 +2211,7 @@ fn attach_mmio_device(
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg_attr(target_os = "macos", allow(clippy::too_many_arguments))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],

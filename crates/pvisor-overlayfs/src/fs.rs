@@ -126,7 +126,9 @@ impl FileIoLease {
     pub(super) fn read(&self, offset: u64, size: u32) -> io::Result<Vec<u8>> {
         let _span = self.profile.span("read");
         let mut bytes = vec![0; size as usize];
-        let count = self.core.read_at(&self.backing, &self.file, &mut bytes, offset)?;
+        let count = self
+            .core
+            .read_at(&self.backing, &self.file, &mut bytes, offset)?;
         bytes.truncate(count);
         Ok(bytes)
     }
@@ -246,7 +248,9 @@ fn time_value(value: TimeOrNow) -> SystemTime {
 
 impl OverlayFs {
     pub(super) fn file_io_lease(&self, fh: u64) -> io::Result<FileIoLease> {
-        let file = self.open_files.get(&fh)
+        let file = self
+            .open_files
+            .get(&fh)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
         Ok(FileIoLease {
             file: file.file.clone(),
@@ -272,7 +276,10 @@ impl OverlayFs {
         let lease = match lease {
             Ok(lease) => lease,
             Err(error) => {
-                let path = self.open_files.get(&fh).map(|file| file.path.clone())
+                let path = self
+                    .open_files
+                    .get(&fh)
+                    .map(|file| file.path.clone())
                     .or_else(|| self.node_path(ino).ok());
                 self.observe_result(
                     path.as_deref(),
@@ -294,8 +301,11 @@ impl OverlayFs {
 
     pub(super) fn finish_read_io(&self, lease: &FileIoLease, result: &io::Result<Vec<u8>>) {
         self.observe_result(
-            Some(&lease.path), "read", result,
-            result.as_ref().map_or(0, |bytes| bytes.len() as u64), false,
+            Some(&lease.path),
+            "read",
+            result,
+            result.as_ref().map_or(0, |bytes| bytes.len() as u64),
+            false,
         );
     }
 
@@ -307,8 +317,11 @@ impl OverlayFs {
         reply: ReplyWrite,
     ) {
         self.observe_result(
-            Some(&lease.path), "write", &result,
-            result.as_ref().copied().unwrap_or(0) as u64, true,
+            Some(&lease.path),
+            "write",
+            &result,
+            result.as_ref().copied().unwrap_or(0) as u64,
+            true,
         );
         self.mutation_reply(mutation, move |valid| {
             if !valid {
@@ -2290,18 +2303,34 @@ mod tests {
         let lower = root.path().join("lower");
         fs::create_dir(&lower).unwrap();
         fs::write(lower.join("file"), b"original").unwrap();
-        let mut overlay = OverlayFs::new(vec![lower.clone()], root.path().join("upper"), None).unwrap();
-        let ino = overlay.inode_for_path_with_metadata("file".into()).unwrap().0;
-        let (file, backing) = overlay.open_inode_with_backing(ino, libc::O_RDONLY).unwrap();
-        overlay.open_files.insert(1, OpenFile {
-            file: Arc::new(file), ino, path: "file".into(), flags: libc::O_RDONLY, backing,
-        });
+        let mut overlay =
+            OverlayFs::new(vec![lower.clone()], root.path().join("upper"), None).unwrap();
+        let ino = overlay
+            .inode_for_path_with_metadata("file".into())
+            .unwrap()
+            .0;
+        let (file, backing) = overlay
+            .open_inode_with_backing(ino, libc::O_RDONLY)
+            .unwrap();
+        overlay.open_files.insert(
+            1,
+            OpenFile {
+                file: Arc::new(file),
+                ino,
+                path: "file".into(),
+                flags: libc::O_RDONLY,
+                backing,
+            },
+        );
         let (lease, mutation) = overlay.begin_file_io(ino, 1, 0, false).unwrap();
         assert!(mutation.is_none());
         overlay.open_files.remove(&1);
         fs::remove_file(lower.join("file")).unwrap();
         assert_eq!(lease.read(0, 32).unwrap(), b"original");
-        assert_eq!(overlay.file_io_lease(1).err().unwrap().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(
+            overlay.file_io_lease(1).err().unwrap().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 
     #[test]

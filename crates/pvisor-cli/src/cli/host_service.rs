@@ -1440,9 +1440,13 @@ mod tests {
         };
         let mut unchanged = File::open(&path).unwrap();
         let before = ImageIdentity::of(&unchanged.metadata().unwrap());
-        assert_eq!(verified_digest(&mut unchanged, &image, before).unwrap(), image.digest);
         assert_eq!(
-            unchanged.stream_position().unwrap(), 0,
+            verified_digest(&mut unchanged, &image, before).unwrap(),
+            image.digest
+        );
+        assert_eq!(
+            unchanged.stream_position().unwrap(),
+            0,
             "cache hit read file contents"
         );
 
@@ -1458,16 +1462,23 @@ mod tests {
         let mut changed = File::open(&path).unwrap();
         assert_eq!(changed.metadata().unwrap().ino(), image.identity.inode);
         let before = ImageIdentity::of(&changed.metadata().unwrap());
-        assert_ne!(verified_digest(&mut changed, &image, before).unwrap(), image.digest);
+        assert_ne!(
+            verified_digest(&mut changed, &image, before).unwrap(),
+            image.digest
+        );
 
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"before").unwrap();
         let mut replaced = File::open(&path).unwrap();
         assert_ne!(replaced.metadata().unwrap().ino(), image.identity.inode);
         let before = ImageIdentity::of(&replaced.metadata().unwrap());
-        assert_eq!(verified_digest(&mut replaced, &image, before).unwrap(), image.digest);
         assert_eq!(
-            replaced.stream_position().unwrap(), 6,
+            verified_digest(&mut replaced, &image, before).unwrap(),
+            image.digest
+        );
+        assert_eq!(
+            replaced.stream_position().unwrap(),
+            6,
             "replacement was not hashed"
         );
     }

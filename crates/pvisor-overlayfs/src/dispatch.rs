@@ -9,8 +9,8 @@ use fuser::{
     ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use pvisor_overlay_core::{OverlayCore, PreparedCopyUp, service::FilesystemService};
-use std::collections::BTreeSet;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -74,19 +74,68 @@ impl Drop for NamespacePermit<'_> {
 }
 
 enum IoRequest<'a> {
-    Read { ino: u64, fh: u64, offset: i64, size: u32, reply: ReplyData },
-    Write { ino: u64, fh: u64, offset: i64, data: Cow<'a, [u8]>, flags: i32, reply: ReplyWrite },
-    Sync { fh: u64, datasync: bool, reply: ReplyEmpty },
+    Read {
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        reply: ReplyData,
+    },
+    Write {
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: Cow<'a, [u8]>,
+        flags: i32,
+        reply: ReplyWrite,
+    },
+    Sync {
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    },
 }
 
 impl IoRequest<'_> {
     fn into_owned(self) -> IoRequest<'static> {
         match self {
-            Self::Read { ino, fh, offset, size, reply } => IoRequest::Read { ino, fh, offset, size, reply },
-            Self::Write { ino, fh, offset, data, flags, reply } => IoRequest::Write {
-                ino, fh, offset, data: Cow::Owned(data.into_owned()), flags, reply,
+            Self::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
+            } => IoRequest::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
             },
-            Self::Sync { fh, datasync, reply } => IoRequest::Sync { fh, datasync, reply },
+            Self::Write {
+                ino,
+                fh,
+                offset,
+                data,
+                flags,
+                reply,
+            } => IoRequest::Write {
+                ino,
+                fh,
+                offset,
+                data: Cow::Owned(data.into_owned()),
+                flags,
+                reply,
+            },
+            Self::Sync {
+                fh,
+                datasync,
+                reply,
+            } => IoRequest::Sync {
+                fh,
+                datasync,
+                reply,
+            },
         }
     }
 
@@ -103,7 +152,13 @@ impl IoRequest<'_> {
         // Namespace publication waits here before acquiring filesystem state.
         let _permit = activity.enter();
         match self {
-            Self::Read { ino, fh, offset, size, reply } => {
+            Self::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
+            } => {
                 let lease = state.lock().map_err(|_| libc::EIO).and_then(|fs| {
                     fs.begin_file_io(ino, fh, offset, false)
                         .map(|(lease, _)| lease)
@@ -111,26 +166,42 @@ impl IoRequest<'_> {
                 });
                 let lease = match lease {
                     Ok(lease) => lease,
-                    Err(error) => { reply.error(error); return; }
+                    Err(error) => {
+                        reply.error(error);
+                        return;
+                    }
                 };
                 let result = lease.read(offset as u64, size);
                 match state.lock() {
                     Ok(fs) => fs.finish_read_io(&lease, &result),
-                    Err(_) => { reply.error(libc::EIO); return; }
+                    Err(_) => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
                 }
                 match result {
                     Ok(bytes) => reply.data(&bytes),
                     Err(error) => reply.error(error.raw_os_error().unwrap_or(libc::EIO)),
                 }
             }
-            Self::Write { ino, fh, offset, data, flags, reply } => {
+            Self::Write {
+                ino,
+                fh,
+                offset,
+                data,
+                flags,
+                reply,
+            } => {
                 let prepared = state.lock().map_err(|_| libc::EIO).and_then(|fs| {
                     fs.begin_file_io(ino, fh, offset, true)
                         .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
                 });
                 let (lease, mutation) = match prepared {
                     Ok(prepared) => prepared,
-                    Err(error) => { reply.error(error); return; }
+                    Err(error) => {
+                        reply.error(error);
+                        return;
+                    }
                 };
                 let result = lease.write(offset as u64, &data, flags);
                 match state.lock() {
@@ -139,17 +210,28 @@ impl IoRequest<'_> {
                         // Complete the reserved cache effects even after a state
                         // failure; the backing write may already have happened.
                         poisoned.into_inner().finish_write_io(
-                            &lease, mutation, Err(io::Error::from_raw_os_error(libc::EIO)), reply,
+                            &lease,
+                            mutation,
+                            Err(io::Error::from_raw_os_error(libc::EIO)),
+                            reply,
                         );
                     }
                 }
             }
-            Self::Sync { fh, datasync, reply } => {
+            Self::Sync {
+                fh,
+                datasync,
+                reply,
+            } => {
                 let lease = state.lock().map_err(|_| libc::EIO).and_then(|fs| {
-                    fs.file_io_lease(fh).map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+                    fs.file_io_lease(fh)
+                        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
                 });
-                match lease.and_then(|lease| lease.sync(datasync)
-                    .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))) {
+                match lease.and_then(|lease| {
+                    lease
+                        .sync(datasync)
+                        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+                }) {
                     Ok(()) => reply.ok(),
                     Err(error) => reply.error(error),
                 }
@@ -385,13 +467,9 @@ impl DispatchFs {
                     match worker_state.lock() {
                         Ok(mut fs) => {
                             match result {
-                                Ok((core, copies, mutation)) => complete_preparation(
-                                    &mut fs,
-                                    &core,
-                                    copies,
-                                    mutation,
-                                    callback,
-                                ),
+                                Ok((core, copies, mutation)) => {
+                                    complete_preparation(&mut fs, &core, copies, mutation, callback)
+                                }
                                 Err(error) => callback(Err(error)),
                             }
                             fs.finish_request(job.bytes, &job.inodes);
@@ -418,8 +496,8 @@ impl DispatchFs {
                         }
                     }
                     if let Ok(mut fs) = read_state.lock() {
-                            fs.pending_read_requests -= 1;
-                            fs.finish_request(job.bytes, &job.inodes);
+                        fs.pending_read_requests -= 1;
+                        fs.finish_request(job.bytes, &job.inodes);
                     }
                 }
             }) {
@@ -550,7 +628,10 @@ impl DispatchFs {
             // Keep admission locked through inline completion so shutdown drains
             // it too. A borrowed WRITE payload needs no allocation or copy.
             request.run(&self.state, &self.io_activity);
-            let mut fs = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut fs = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             fs.pending_read_requests -= usize::from(reading);
             fs.finish_request(bytes, &[ino]);
             return;
@@ -640,7 +721,10 @@ impl DispatchFs {
             };
             let mut fs = match self.state.lock() {
                 Ok(fs) => fs,
-                Err(_) => { job.work.fail(libc::EIO); return; }
+                Err(_) => {
+                    job.work.fail(libc::EIO);
+                    return;
+                }
             };
             if let Work::Callback(callback) = job.work {
                 callback(Ok(&mut fs));
@@ -898,7 +982,13 @@ impl Filesystem for DispatchFs {
             size < 64 * 1024,
             0,
             ino,
-            IoRequest::Read { ino, fh, offset, size, reply },
+            IoRequest::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
+            },
         );
     }
 
@@ -919,7 +1009,14 @@ impl Filesystem for DispatchFs {
             true,
             data.len(),
             ino,
-            IoRequest::Write { ino, fh, offset, data: Cow::Borrowed(data), flags, reply },
+            IoRequest::Write {
+                ino,
+                fh,
+                offset,
+                data: Cow::Borrowed(data),
+                flags,
+                reply,
+            },
         );
     }
 
@@ -971,7 +1068,11 @@ impl Filesystem for DispatchFs {
             true,
             0,
             _ino,
-            IoRequest::Sync { fh, datasync, reply },
+            IoRequest::Sync {
+                fh,
+                datasync,
+                reply,
+            },
         );
     }
 
@@ -1246,7 +1347,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let lower = root.path().join("lower");
         fs::create_dir(&lower).unwrap();
-        let state = Mutex::new(OverlayFs::new(vec![lower], root.path().join("upper"), None).unwrap());
+        let state =
+            Mutex::new(OverlayFs::new(vec![lower], root.path().join("upper"), None).unwrap());
         let io = activity.enter();
         let (sent, completed) = mpsc::channel();
         let other = activity.clone();
