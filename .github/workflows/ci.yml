@@ -248,7 +248,7 @@ jobs:
         run: |
           just build release
           # Queue dispatch, read-only DAX and their contract tests bring the
-          # runtime closure to 194,572 lines; retain 1,428 lines of headroom.
+          # runtime closure to 194,578 lines; retain 1,422 lines of headroom.
           just check-core-budget target/release/pvisor --max-dependencies 235 --max-workspace-lines 196000 --max-core-items 301 > target/pvisor-core-budget.json
       - uses: actions/upload-artifact@v4
         with:
