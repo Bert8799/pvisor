@@ -82,16 +82,24 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub fn capture_state(&self, next_inode: u64) -> io::Result<super::snapshot::ServerSnapshot> {
         self.profile.emit_checkpoint();
+        let options = self.options.load(Ordering::Relaxed);
+        let fs = self.fs.capture_state()?;
+        fs.validate_writeback(
+            FsOptions::from_bits_truncate(options).contains(FsOptions::WRITEBACK_CACHE),
+        )?;
         Ok(super::snapshot::ServerSnapshot {
-            options: self.options.load(Ordering::Relaxed),
+            options,
             next_inode,
-            fs: self.fs.capture_state()?,
+            fs,
         })
     }
     pub fn restore_state(&self, state: &super::snapshot::ServerSnapshot) -> io::Result<()> {
         if FsOptions::from_bits(state.options).is_none() {
             return Err(super::snapshot::invalid("invalid FUSE options"));
         }
+        state.fs.validate_writeback(
+            FsOptions::from_bits_truncate(state.options).contains(FsOptions::WRITEBACK_CACHE),
+        )?;
         self.fs.restore_state(&state.fs)?;
         self.options.store(state.options, Ordering::Relaxed);
         Ok(())
@@ -298,7 +306,10 @@ impl<F: FileSystem + Sync> Server<F> {
                     attr_valid: timeout.as_secs(),
                     attr_valid_nsec: timeout.subsec_nanos(),
                     dummy: 0,
-                    attr: st.into(),
+                    attr: Attr::with_flags(
+                        st,
+                        self.fs.attribute_flags(in_header.nodeid.into(), &st),
+                    ),
                 };
                 reply_ok(Some(out), None, in_header.unique, w)
             }
@@ -995,7 +1006,11 @@ impl<F: FileSystem + Sync> Server<F> {
                     max_write: MAX_BUFFER_SIZE,
                     time_gran: 1, // nanoseconds
                     max_pages: max_pages.try_into().unwrap(),
-                    map_alignment: 0,
+                    map_alignment: if enabled & FsOptions::MAP_ALIGNMENT.bits() != 0 {
+                        page_size.trailing_zeros() as u16
+                    } else {
+                        0
+                    },
                     flags2: (enabled >> 32) as u32,
                     ..Default::default()
                 };

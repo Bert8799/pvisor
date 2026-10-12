@@ -117,7 +117,9 @@ pub fn json_get(path: &Path, pointer: &str) -> Result<String> {
     }
     let value: serde_json::Value = serde_json::from_reader(fs::File::open(path)?)?;
     let value = value.pointer(pointer).context("JSON pointer is absent")?;
-    Ok(serde_json::to_string(value)?)
+    let mut value = value.clone();
+    value.sort_all_objects();
+    Ok(serde_json::to_string(&value)?)
 }
 pub fn file_diff(a: &Path, b: &Path) -> Result<(String, i32)> {
     fn read(path: &Path) -> Result<String> {

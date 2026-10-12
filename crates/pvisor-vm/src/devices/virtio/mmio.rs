@@ -78,6 +78,31 @@ pub struct MmioSnapshot {
 }
 
 impl MmioSnapshot {
+    /// Restore filesystem topology before registering queue kick eventfds.
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    pub(crate) fn filesystem_request_queues(
+        &self,
+        expected_tag: &[u8],
+    ) -> Result<Option<usize>, String> {
+        let DeviceSnapshotState::Fs { tag, .. } = &self.device.state else {
+            return Ok(None);
+        };
+        let end = tag.iter().position(|byte| *byte == 0).unwrap_or(tag.len());
+        if &tag[..end] != expected_tag {
+            return Ok(None);
+        }
+        let queues = self
+            .device
+            .queues
+            .as_ref()
+            .or(self.queues.as_ref())
+            .ok_or("filesystem snapshot has no queues")?;
+        if !(2..=9).contains(&queues.len()) {
+            return Err("invalid filesystem snapshot queue count".into());
+        }
+        Ok(Some(queues.len() - 1))
+    }
+
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub fn rebind_filesystem_exclusions(
         &mut self,
@@ -749,14 +774,16 @@ impl BusDevice for MmioTransport {
                     0xfc => self.config_generation,
                     0xb0..=0xbc => {
                         // For no SHM region or invalid region the kernel looks for length of -1
-                        let (shm_base, shm_len) = if self.shm_region_select > 1 {
-                            (0, !0)
-                        } else {
-                            match self.locked_device().shm_region() {
-                                Some(region) => (region.guest_addr, region.size as u64),
-                                None => (0, !0),
-                            }
-                        };
+                        let device = self.locked_device();
+                        let (shm_base, shm_len) =
+                            if self.shm_region_select != device.shm_region_id() {
+                                (0, !0)
+                            } else {
+                                match device.shm_region() {
+                                    Some(region) => (region.guest_addr, region.size as u64),
+                                    None => (0, !0),
+                                }
+                            };
                         match offset {
                             0xb0 => shm_len as u32,
                             0xb4 => (shm_len >> 32) as u32,
@@ -890,6 +917,8 @@ pub(crate) mod tests {
         avail_features: u64,
         device_activated: bool,
         config_bytes: [u8; 0xeff],
+        shm: Option<VirtioShmRegion>,
+        shm_id: u32,
     }
 
     impl DummyDevice {
@@ -899,6 +928,8 @@ pub(crate) mod tests {
                 avail_features: 0,
                 device_activated: false,
                 config_bytes: [0; 0xeff],
+                shm: None,
+                shm_id: 0,
             }
         }
 
@@ -955,6 +986,14 @@ pub(crate) mod tests {
         fn is_activated(&self) -> bool {
             self.device_activated
         }
+
+        fn shm_region(&self) -> Option<&VirtioShmRegion> {
+            self.shm.as_ref()
+        }
+
+        fn shm_region_id(&self) -> u32 {
+            self.shm_id
+        }
     }
 
     fn set_device_status(d: &mut MmioTransport, status: u32) {
@@ -986,6 +1025,50 @@ pub(crate) mod tests {
         d.queue_select = 2;
         assert_eq!(d.with_queue(0, Queue::get_max_size), 0);
         assert!(!d.with_queue_mut(|q| q.size = 16));
+    }
+
+    #[test]
+    fn shared_memory_selection_exposes_only_the_device_region_id() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let dummy = Arc::new(Mutex::new(DummyDevice::new()));
+        dummy.lock().unwrap().shm = Some(VirtioShmRegion {
+            host_addr: 0,
+            guest_addr: 0x1234_5678_9000,
+            size: 2 << 20,
+        });
+        let mut device =
+            MmioTransport::new(memory, DummyIrqChip::new().into(), dummy.clone()).unwrap();
+        let mut bytes = [0; 4];
+        // Test both virtio-fs (0) and GPU host-visible (1) ID contracts.
+        for id in [0, 1] {
+            dummy.lock().unwrap().shm_id = id;
+            for selected in [0, 1, 2, u32::MAX] {
+                write_le_u32(&mut bytes, selected);
+                device.write(0, 0xac, &bytes);
+                device.read(0, 0xb0, &mut bytes);
+                assert_eq!(
+                    read_le_u32(&bytes),
+                    if selected == id { 2 << 20 } else { u32::MAX }
+                );
+                device.read(0, 0xb4, &mut bytes);
+                assert_eq!(
+                    read_le_u32(&bytes),
+                    if selected == id { 0 } else { u32::MAX }
+                );
+                device.read(0, 0xb8, &mut bytes);
+                assert_eq!(
+                    read_le_u32(&bytes),
+                    if selected == id { 0x5678_9000 } else { 0 }
+                );
+                device.read(0, 0xbc, &mut bytes);
+                assert_eq!(read_le_u32(&bytes), if selected == id { 0x1234 } else { 0 });
+            }
+        }
+        dummy.lock().unwrap().shm = None;
+        write_le_u32(&mut bytes, 1);
+        device.write(0, 0xac, &bytes);
+        device.read(0, 0xb0, &mut bytes);
+        assert_eq!(read_le_u32(&bytes), u32::MAX);
     }
 
     #[test]

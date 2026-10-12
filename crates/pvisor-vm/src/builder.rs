@@ -336,6 +336,12 @@ impl<B: Backend> Builder<B> {
         path: &std::path::Path,
         shm_size: usize,
     ) -> io::Result<()> {
+        if shm_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "writable DAX requires an explicit lifecycle contract; use immutable_filesystem",
+            ));
+        }
         self.attach_fs(FsDeviceConfig {
             fs_id: tag.into(),
             shared_dir: Some(
@@ -352,12 +358,55 @@ impl<B: Backend> Builder<B> {
             virtual_entries: Vec::new(),
         })
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn immutable_filesystem(
+        &mut self,
+        tag: &str,
+        path: &std::path::Path,
+        window: usize,
+    ) -> io::Result<()> {
+        const UNIT: usize = 2 << 20;
+        if !(UNIT..=1 << 30).contains(&window)
+            || !window.is_multiple_of(UNIT)
+            || !path.is_absolute()
+            || !path.is_dir()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "DAX requires an absolute directory and a 2 MiB-aligned window between 2 MiB and 1 GiB"));
+        }
+        if self.resources.snapshot_profile || self.resources.machine_restore.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DAX cannot be attached to a snapshot/restore profile",
+            ));
+        }
+        let shared_dir = path
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "filesystem path is not UTF-8")
+            })?
+            .to_owned();
+        self.attach_fs(FsDeviceConfig {
+            fs_id: tag.into(),
+            shared_dir: Some(shared_dir),
+            semantics: PermissionSemantics::LinuxComplete,
+            shm_size: Some(window),
+            read_only: true,
+            overlay: None,
+            virtual_entries: Vec::new(),
+        })
+    }
     pub fn overlay(
         &mut self,
         tag: &str,
         overlay: OverlayConfig,
         shm_size: usize,
     ) -> io::Result<()> {
+        if shm_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DAX is not supported for writable merged overlays",
+            ));
+        }
         if overlay.lower_dirs.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -442,6 +491,13 @@ impl<B: Backend> Builder<B> {
 ))]
 impl<B: crate::backend::SnapshotBackend> Builder<B> {
     pub fn snapshot_profile(&mut self) -> io::Result<()> {
+        #[cfg(not(feature = "tee"))]
+        if self.resources.fs.iter().any(|fs| fs.shm_size.is_some()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snapshot profiles do not support DAX windows",
+            ));
+        }
         if self.resources.nested_enabled {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

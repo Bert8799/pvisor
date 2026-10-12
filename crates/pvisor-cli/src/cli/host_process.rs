@@ -70,6 +70,71 @@ fn exited(fd: &OwnedFd) -> bool {
     p.revents & (libc::POLLIN | libc::POLLHUP) != 0
 }
 #[cfg(target_os = "linux")]
+fn wait_pidfds(mut fds: Vec<libc::pollfd>, deadline: Instant) -> anyhow::Result<()> {
+    if fds.is_empty() {
+        return Ok(());
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let millis = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn process_stopped(pid: i32, fd: &OwnedFd) -> anyhow::Result<bool> {
+    if exited(fd) {
+        return Ok(true);
+    }
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+    // An exit between the pidfd check and /proc read is also quiescent.
+    if exited(fd) {
+        return Ok(true);
+    }
+    let state = state?;
+    let state = state
+        .rsplit_once(')')
+        .context("invalid process stat")?
+        .1
+        .split_whitespace()
+        .next()
+        .context("missing process state")?;
+    if !matches!(state, "T" | "t") {
+        return Ok(false);
+    }
+    // A stopped leader alone is insufficient while another thread is still
+    // entering a group stop: that thread may still fork a new descendant.
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"));
+    if exited(fd) {
+        return Ok(true);
+    }
+    for task in tasks? {
+        let state = match std::fs::read_to_string(task?.path().join("stat")) {
+            Ok(state) => state,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let state = state
+            .rsplit_once(')')
+            .context("invalid task stat")?
+            .1
+            .split_whitespace()
+            .next()
+            .context("missing task state")?;
+        if !matches!(state, "T" | "t" | "Z" | "X") {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+#[cfg(target_os = "linux")]
 fn stat(pid: i32) -> anyhow::Result<(i32, i32, u64)> {
     let value = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let fields: Vec<_> = value
@@ -260,6 +325,8 @@ impl StableProcess {
 
 pub(super) struct OwnedTree {
     root: i32,
+    /// Set only after successful final cleanup. Partial cleanup remains retryable.
+    cleaned: bool,
     /// Only the originating frontend adopts request orphans; its independently
     /// started service must never become part of the request cleanup.
     #[cfg(target_os = "linux")]
@@ -269,8 +336,6 @@ pub(super) struct OwnedTree {
     processes: BTreeMap<i32, OwnedFd>,
     #[cfg(target_os = "macos")]
     identity: (u64, u64),
-    #[cfg(target_os = "macos")]
-    cleaned: bool,
     #[cfg(target_os = "macos")]
     parent: i32,
     #[cfg(target_os = "macos")]
@@ -292,6 +357,7 @@ impl OwnedTree {
             );
             Ok(Self {
                 root,
+                cleaned: false,
                 adopt: _adopt.then_some(parent),
                 excluded,
                 processes: BTreeMap::from([(root, fd)]),
@@ -423,70 +489,128 @@ impl OwnedTree {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         true
     }
+    /// Wait on the pinned Linux process, without adding a polling interval to
+    /// an already completed exit. The final cleanup still discovers orphans.
+    pub(super) fn wait_root(&self, timeout: Duration) -> anyhow::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        while !self.root_exited() && Instant::now() < deadline {
+            #[cfg(target_os = "linux")]
+            wait_pidfds(
+                vec![libc::pollfd {
+                    fd: self.processes[&self.root].as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                }],
+                deadline,
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(self.root_exited())
+    }
     /// Stop every forker before killing: repeated discovery closes the snapshot
     /// race for children in different groups/sessions and double-fork orphans.
     pub(super) fn cleanup(&mut self, kill_root: bool) -> anyhow::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         {
             let deadline = Instant::now() + Duration::from_secs(2);
-            let mut stopped = BTreeSet::new();
-            loop {
-                self.refresh()?;
+            let result = (|| -> anyhow::Result<()> {
+                loop {
+                    self.refresh()?;
+                    for fd in self.processes.values() {
+                        if !exited(fd) {
+                            signal(fd, libc::SIGSTOP)?;
+                        }
+                    }
+                    // SIGSTOP delivery is asynchronous. Observe every live
+                    // forker stopped before discovering children again.
+                    loop {
+                        let mut quiescent = true;
+                        for (&pid, fd) in &self.processes {
+                            quiescent &= process_stopped(pid, fd)?;
+                        }
+                        if quiescent {
+                            break;
+                        }
+                        ensure!(
+                            Instant::now() < deadline,
+                            "request tree would not stop for cleanup"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.refresh()?;
+                    let mut quiescent = true;
+                    for (&pid, fd) in &self.processes {
+                        quiescent &= process_stopped(pid, fd)?;
+                    }
+                    if quiescent {
+                        break;
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "request tree would not quiesce for cleanup"
+                    );
+                }
                 for (&pid, fd) in &self.processes {
-                    if stopped.insert(pid) {
-                        signal(fd, libc::SIGSTOP)?;
+                    if pid != self.root {
+                        signal(fd, libc::SIGKILL)?;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(10));
-                let before = self.processes.len();
-                self.refresh()?;
-                if self.processes.len() == before {
-                    break;
+                if kill_root {
+                    self.signal_root(libc::SIGKILL)?;
+                } else {
+                    self.signal_root(libc::SIGCONT)?;
                 }
-                ensure!(
-                    Instant::now() < deadline,
-                    "request tree would not quiesce for cleanup"
-                );
-            }
-            for (&pid, fd) in &self.processes {
-                if pid != self.root {
-                    signal(fd, libc::SIGKILL)?;
+                while self
+                    .processes
+                    .iter()
+                    .any(|(&pid, fd)| (pid != self.root || kill_root) && !exited(fd))
+                {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "request descendant cleanup timed out"
+                    );
+                    let fds = self
+                        .processes
+                        .iter()
+                        .filter(|(pid, fd)| (**pid != self.root || kill_root) && !exited(fd))
+                        .map(|(_, fd)| libc::pollfd {
+                            fd: fd.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        })
+                        .collect();
+                    wait_pidfds(fds, deadline)?;
                 }
-            }
-            if kill_root {
-                self.signal_root(libc::SIGKILL)?;
-            } else {
-                self.signal_root(libc::SIGCONT)?;
-            }
-            while self
-                .processes
-                .iter()
-                .any(|(&pid, fd)| (pid != self.root || kill_root) && !exited(fd))
-            {
-                ensure!(
-                    Instant::now() < deadline,
-                    "request descendant cleanup timed out"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // Only reap adopted descendants of this frontend, never another
-            // request or the service. The root Child is reaped by its owner.
-            if self.adopt.is_some() {
-                for &pid in self.processes.keys() {
-                    if pid != self.root {
-                        unsafe {
-                            libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+                // Only reap adopted descendants of this frontend, never
+                // another request or the service. Child owns the root wait.
+                if self.adopt.is_some() {
+                    for &pid in self.processes.keys() {
+                        if pid != self.root {
+                            unsafe {
+                                libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+                            }
                         }
                     }
                 }
+                Ok(())
+            })();
+            if result.is_err() {
+                // Do not leave a still-owned process suspended on a failed
+                // stop/discovery/kill path; Drop can retry final cleanup.
+                for fd in self.processes.values() {
+                    let _ = signal(fd, libc::SIGCONT);
+                }
+            } else if kill_root {
+                self.cleaned = true;
             }
-            Ok(())
+            result
         }
         #[cfg(target_os = "macos")]
         {
-            if self.cleaned {
-                return Ok(());
-            }
             let deadline = Instant::now() + Duration::from_secs(2);
             let mut stopped = BTreeSet::new();
             // Stop the root BEFORE enumerating/killing children. This prevents
@@ -688,6 +812,49 @@ while True: time.sleep(1)
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(exited(&descendant), "escaped session survived cleanup");
         assert!(!child.wait().unwrap().success());
+        assert!(tree.cleaned);
+        // Repeated finish/Drop must not adopt and kill a later independent
+        // child merely because it now has the same frontend parent.
+        let mut unrelated = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        tree.cleanup(false).unwrap();
+        tree.cleanup(true).unwrap();
+        let survived = unrelated.try_wait().unwrap().is_none();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        assert!(survived, "completed tree adopted a later independent child");
+    }
+
+    #[test]
+    fn descendant_cleanup_does_not_finalize_live_root_ownership() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut tree =
+            OwnedTree::new(child.id() as i32, std::process::id() as i32, false, 0).unwrap();
+        tree.cleanup(false).unwrap();
+        assert!(!tree.cleaned);
+        assert!(!tree.root_exited());
+        tree.cleanup(true).unwrap();
+        assert!(tree.cleaned);
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn root_exit_wait_preserves_child_reaping_ownership() {
+        let mut child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let mut tree =
+            OwnedTree::new(child.id() as i32, std::process::id() as i32, false, 0).unwrap();
+        assert!(tree.wait_root(Duration::from_secs(2)).unwrap());
+        tree.cleanup(true).unwrap();
+        assert!(child.wait().unwrap().success());
+        tree.cleanup(true).unwrap();
+        assert!(tree.wait_root(Duration::ZERO).unwrap());
     }
 }
 

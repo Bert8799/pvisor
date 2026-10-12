@@ -477,9 +477,8 @@ pub fn inspect(args: InspectArgs) -> anyhow::Result<i32> {
             tree.cleanup(true)?;
             break child.wait()?;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tree.wait_root(std::time::Duration::from_millis(10))?;
     };
-    tree.cleanup(true)?;
     drop(foreground);
     if let Some(signal) = status.signal()
         && [libc::SIGINT, libc::SIGTERM, libc::SIGHUP].contains(&signal)

@@ -364,6 +364,8 @@ bitflags! {
         ///
         /// This feature is enabled by default if supported by the kernel.
         const MAX_PAGES = MAX_PAGES;
+        /// Negotiate the host page alignment required by DAX window mappings.
+        const MAP_ALIGNMENT = MAP_ALIGNMENT;
 
         /// Indicates that the kernel supports caching READLINK responses.
         ///

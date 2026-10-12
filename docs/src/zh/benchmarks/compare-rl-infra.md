@@ -11,6 +11,12 @@
 | 历史上下文或未缓存镜像 | 在已测范围内评估前缀准备或按需读取 |
 | 已有 RL 栈 | 保留任务、模型和训练层；专用集成仍未验证 |
 
+<!-- measurement-status:start -->
+
+本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 一次 rollout 创建环境，交替进行模型推理与工具调用，执行验证、赋予 reward，再保留或拒绝样本。失败尝试可能需要准备上下文、恢复环境并重新执行。选择 executor 时，需要分别预算这些阶段，并保留任务要求的执行边界。

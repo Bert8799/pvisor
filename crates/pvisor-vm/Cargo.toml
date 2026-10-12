@@ -95,3 +95,7 @@ path = "src/probes/hvf_ram_fault_case.rs"
 [[example]]
 name = "threaded_cold_restore_case"
 path = "src/probes/threaded_cold_restore_case.rs"
+
+[[example]]
+name = "readonly_dax_case"
+path = "src/probes/readonly_dax_case.rs"

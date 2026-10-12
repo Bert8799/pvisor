@@ -3,7 +3,7 @@ set positional-arguments
 
 repo := justfile_directory()
 target_dir := absolute_path(env("CARGO_TARGET_DIR", repo / "target"))
-python_paths := "pvisor tests examples benchmark/pvisor/test_*.py"
+python_paths := "pvisor tests examples benchmark/pvisor/test_*.py benchmark.new"
 zensical_version := "0.0.67"
 
 import "tests/justfile"
@@ -199,7 +199,7 @@ test-rust *packages:
     cargo nextest run --locked "${args[@]}" "$@"
 
 # 标准库 unittest；支持文件、测试名、-k/-v，或 discover 参数
-# 无参数时覆盖 tests/ 和 benchmark/pvisor/，目录选择用 discover -s DIR
+# 无参数时覆盖 tests/、历史 benchmark 测试和 hyperfine 测试
 [group("06. 测试与冒烟")]
 test-py *args:
     #!/usr/bin/env bash
@@ -218,6 +218,7 @@ test-py *args:
     if [[ "$selected" == 0 ]]; then
       uv run --no-project --with 'setuptools>=77' python -m unittest discover -s tests "$@"
       uv run --no-project --with 'setuptools>=77' python -m unittest discover -s benchmark/pvisor "$@"
+      uv run --no-project --with 'setuptools>=77' python -m unittest discover -s benchmark.new/tests "$@"
     else
       uv run --no-project --with 'setuptools>=77' python -m unittest "$@"
     fi
@@ -335,22 +336,22 @@ test-vm-snapshot-state: (vm-probe-build "pvisor-vm" "threaded_cold_restore_case"
 # 09. benchmark
 # ============================================================
 
-# 不传参数运行 smoke；传参数选择一个或多个已注册套件（B-PROCESS: smoke/nightly）
+# 不传参数运行 smoke；其他参数指定 benchmark.new 中的 JSON 表格。
 [group("09. benchmark")]
-benchmark *suites:
+benchmark *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ $# -eq 0 ]]; then set -- smoke; fi
-    for suite in "$@"; do
-      case "$suite" in
-        smoke|nightly) ;;
-        *) echo "unknown benchmark suite: $suite (expected smoke or nightly)" >&2; exit 2 ;;
-      esac
-    done
-    benchmark_repo="${PVISOR_BENCHMARK_REPO:-{{ repo }}}"
-    for suite in "$@"; do
-      python3 "$benchmark_repo/benchmark/pvisor/bench.py" run --suite "$suite" --repo "$benchmark_repo" --output "${PVISOR_BENCHMARK_OUTPUT:-benchmark/pvisor/.data/process-current}/$suite" --target-dir "${PVISOR_BENCHMARK_BUILD_DIR:-{{ target_dir }}/pvisor-benchmark-build}"
-    done
+    process_build="$(python3 "{{ repo }}/benchmark.new/run.py" --check "$@")"
+    if [[ "$process_build" == process ]]; then
+      benchmark_repo="${PVISOR_BENCHMARK_REPO:-{{ repo }}}"
+      benchmark_build="${PVISOR_BENCHMARK_BUILD_DIR:-{{ target_dir }}/pvisor-benchmark-build}"
+      CARGO_TARGET_DIR="$benchmark_build" just --justfile "$benchmark_repo/justfile" --working-directory "$benchmark_repo" build release
+      set -- --binary "$benchmark_build/release/pvisor" "$@"
+    fi
+    cargo build --quiet --locked --manifest-path "{{ repo }}/tools/semspec/Cargo.toml" --target-dir "{{ target_dir }}/semspec"
+    export SEMSPEC_BIN="{{ target_dir }}/semspec/debug/semspec"
+    python3 "{{ repo }}/benchmark.new/run.py" "$@"
 
 # ============================================================
 # 10. 文档
@@ -359,11 +360,13 @@ benchmark *suites:
 # 构建并检查双语文档；支持 --require-recorded
 [group("10. 文档")]
 docs-build *check_args:
+    python3 benchmark.new/docs.py check
     python3 scripts/check-reference.py
     python3 scripts/check-docs.py --preflight-build
+    cargo build --quiet --locked --manifest-path tools/semspec/Cargo.toml --target-dir "{{ target_dir }}/semspec"
     rm -rf docs/site
-    uv run --no-project --with zensical=={{ zensical_version }} zensical build --strict -f docs/zensical.zh.toml
-    uv run --no-project --with zensical=={{ zensical_version }} zensical build --strict -f docs/zensical.en.toml
+    PVISOR_DOCS_LIVE=0 PYTHONPATH="{{ repo }}${PYTHONPATH:+:$PYTHONPATH}" SEMSPEC_BIN="{{ target_dir }}/semspec/debug/semspec" uv run --no-project --with zensical=={{ zensical_version }} zensical build --clean --strict -f docs/zensical.zh.toml
+    PVISOR_DOCS_LIVE=0 PYTHONPATH="{{ repo }}${PYTHONPATH:+:$PYTHONPATH}" SEMSPEC_BIN="{{ target_dir }}/semspec/debug/semspec" uv run --no-project --with zensical=={{ zensical_version }} zensical build --clean --strict -f docs/zensical.en.toml
     cp docs/index.html docs/site/index.html
     python3 scripts/check-docs.py "$@"
 
@@ -377,7 +380,15 @@ docs-serve locale="zh" *args:
       *) echo "expected zh or en, got: $1" >&2; exit 2 ;;
     esac
     shift
-    python3 scripts/check-docs.py --preflight-build
+    if ! python3 scripts/check-docs.py --preflight-build; then
+      echo "warning: documentation preflight failed; continuing live preview" >&2
+    fi
+    if ! cargo build --quiet --locked --manifest-path tools/semspec/Cargo.toml --target-dir "{{ target_dir }}/semspec"; then
+      echo "warning: semspec build failed; continuing live preview with the existing renderer when available" >&2
+    fi
+    export PVISOR_DOCS_LIVE=1
+    export PYTHONPATH="{{ repo }}${PYTHONPATH:+:$PYTHONPATH}"
+    export SEMSPEC_BIN="{{ target_dir }}/semspec/debug/semspec"
     exec uv run --no-project --with zensical=={{ zensical_version }} zensical serve -f "$config" "$@"
 
 # ============================================================
@@ -547,14 +558,6 @@ vm-case-driver:
     fi
 
 [private]
-benchmark-startup *args:
-    python3 benchmark/pvisor/run_all.py "$@"
-
-[private]
-benchmark-startup-raw *args:
-    python3 benchmark/pvisor/startup.py --output benchmark/pvisor/.data/startup "$@"
-
-[private]
 test-semspec *args:
     cargo nextest run --manifest-path tools/semspec/Cargo.toml --locked "$@"
 
@@ -563,8 +566,8 @@ semspec *args:
     cargo run --quiet --manifest-path tools/semspec/Cargo.toml --locked -- "$@"
 
 [private]
-benchmark-compare candidate baseline="" output="benchmark/pvisor/.data/comparison" threshold="15":
-    python3 benchmark/pvisor/bench.py compare --repo "{{ repo }}" --candidate "$1" --baseline "$2" --output "$3" --regression-threshold "$4"
+benchmark-compare candidate baseline="" output="benchmark.new/process/.data/comparison" threshold="15":
+    python3 benchmark.new/process/compare.py --candidate "$1" --baseline "$2" --output "$3" --threshold "$4"
 
 [private]
 set-nightly-version *args:

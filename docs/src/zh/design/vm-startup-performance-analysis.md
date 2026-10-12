@@ -1,5 +1,27 @@
 # VM 启动：技术分析与实验记录
 
+## Linux：启动与退出修复复测，2026-10-11 {#concurrency-retest}
+
+**退出清理优化有明确收益，但启动退化尚未全部解决。** 相对 `cf8bfa5` GNU 制品，host Ready 减少约 9.11 ms、Exit 减少约 75.00 ms；VM Exit 减少约 48.26 ms，Ready 未检出改善。新版 staged Ready 出现两个明显分布簇，不能宣称已恢复。
+
+### 动机与实验设计 {#concurrency-retest-protocol}
+
+本轮检验重复二进制读取/哈希、重复进程树清理和固定等待修复，并包含新的文件系统执行模型。三个控制版本为历史 `cfe36981` GNU release/gateway 制品、`cf8bfa5fe8ad3438a096a2293bcc411176d388c8` GNU release/gateway 制品和当前冻结 `build2`。所有 VM 使用同一动态 firmware，避免混用 GNU 与 musl；候选完整 SHA256 为 `87ebb0658f2df6a84f9e4eca29c8d3d8bc01923817f04432780272c8b1b30309`。两个历史版本与当前之间还有其他源码改动，不能只归因于哈希或清理。
+
+B-STARTUP-REVISION-ENG，Linux/KVM/FUSE；每后端、每版本 3 次预热、60 个 seed 20261011 随机配对轮次，依次测 host、staged、VM，不与文件系统采样并行。整父组 CPU 0,1、两核 quota、16 GiB、swap 0，VM 为 2 vCPU、128 MiB。各版本持有独立 user/mount/PID namespace、owned pivot_root 与预热的 Host listener；输入准备、namespace 和服务首次启动在计时外。原 startup workload 从 Popen 计到精确 Ready 行及正常零退出；校验输出、Run Bundle、隔离和完整输入前后清单。正式计时不开 profiling，使用原 Python perf_counter_ns observer，不是 hyperfine。
+
+### 数据与分析 {#concurrency-retest-results}
+
+540 次正式运行、27 次预热全部通过，未检测到外部构建/测试干扰，制品前后摘要一致。5,000 次同轮配对 bootstrap，保留所有有效慢样本；分离簇不作整体中位数排名，不报告 P99。相对 `cf8bfa5`：
+
+- host Ready 为 29.14 → 20.03 ms，差值 -9.11 ms，95% CI [-9.51, -8.72]；Exit 为 99.16 → 24.16 ms，差值 -75.00 ms，CI [-75.24, -74.59]。相对历史 `cfe36981`，Ready 仍多 6.82 ms，CI [6.16, 7.27]；Exit 仍多 0.25 ms，CI [0.02, 0.63]。退出主要退化已消除，但不能称全部指标恢复。
+- staged 基线 Ready 为 41.23 ms；候选为 19 次/41 次的两个簇，各簇中位数 32.17/121.95 ms，不给整体降幅。Exit 为 118.41 → 118.67 ms，差值区间 [-31.54, 16.60] 跨零，未检出改善；历史控制的 Exit 也呈分离簇，分别为 53 次/7 次、34.12/74.43 ms。
+- VM Ready 为 119.41 → 115.25 ms，差值 -4.16 ms，CI [-7.08, 0.77] 跨零；Exit 为 218.71 → 170.45 ms，差值 -48.26 ms，CI [-67.43, -33.36]。历史 `cfe36981` 同批 Ready/Exit 为 174.06/211.83 ms，当前更快；版本差异较多，不能据此归因于单项优化。
+
+**整轮性能验收仍不通过：** staged 启动存在明显波动，且[同制品文件系统复测](filesystem-performance-analysis.md#concurrency-retest)显示 VM 写入和工具成本仍退化。需要独立诊断，不能拿 host 的退出收益替代其他后端或任务内部性能结论。
+
+[完整统计、分布与配对区间](concurrency-startup-summary.csv) · [制品与实验来源](concurrency-retest-provenance.csv)。原始数据、每次 stdout/时序、Run Bundle、输入与构建收据在本地 `benchmark.new/startup/.data/concurrency-retest2-20261011/`。这些工程版本比较不重写用户页的历史跨运行时表，不覆盖冷缓存、并发负载、macOS 或服务首次启动；0.5 s 干扰检测可能漏掉短暂、不可见或未识别活动。
+
 ## 当前通用与裁剪内核的能力检查 {#kernel-capabilities}
 
 **裁剪配置通过了工作区暂存、开发工具、IPv4 HTTP 和执行快照恢复的这些检查。** 使用当前 CLI、相同 Linux 6.12.109 源码、补丁和 compact 打包实现，两种配置分别重建固件。冻结源码的 79 个输入文件和两份实际构建输入在前后通过完整摘要校验；CLI 的 1,063 个产品源码和依赖文件与当前工作树相同。测于 2026-10-06，Linux/KVM、CPU 0,1、配置 2 vCPU，工具预检采样资源；这些能力检查不作为正式计时。

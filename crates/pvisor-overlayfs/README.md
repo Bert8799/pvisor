@@ -89,6 +89,17 @@ hardlink groups, open-handle rebinding and cache effects remain serialized by
 the existing operation handlers. macOS EXCHANGE uses the same held-handle and
 inode-remapping path as RENAME_EXCHANGE.
 
+Callbacks requiring no copy preparation execute under the state lock on the
+receive thread when the mutation lane is idle. Read callbacks do the same only
+when both lanes are idle; READ requests of at least 64 KiB always retain worker
+dispatch to preserve bulk-read pipelining. Any accepted mutation, including off-lock copy
+preparation, keeps reads on their independent worker so metadata can continue
+arriving during copying. An already accepted job prevents overtaking within its
+lane. Admission bounds, inode pins and shutdown draining also cover inline
+callbacks; copy preparation never runs on the receive thread. Normal reads and
+short mutation handlers can still hold the state lock during backing I/O, as
+they do on the worker path.
+
 Preparation records durable baseline observations, copies each physical file
 once into one exclusively created private directory per batch, and preserves
 metadata. Receipts share its directory FD instead of retaining one FD per file.

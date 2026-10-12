@@ -1531,9 +1531,12 @@ pub(super) mod tests {
                             },
                         )
                         .unwrap();
-                        socket
-                            .write_all(if failure == 3 { b"a" } else { b"bad" })
-                            .unwrap();
+                        // An oversized declaration is rejected before the body.
+                        if failure != 4 {
+                            socket
+                                .write_all(if failure == 3 { b"a" } else { b"bad" })
+                                .unwrap();
+                        }
                     }
                 }
                 drop(socket);
@@ -1559,7 +1562,10 @@ pub(super) mod tests {
                     length: 3,
                 }
             };
-            assert!(client.request(request).is_err());
+            let error = client.request(request).unwrap_err();
+            if failure == 4 {
+                assert!(error.to_string().contains("invalid cache data length"));
+            }
             let CacheTransport::Server { pool, .. } = &client.transport else {
                 panic!()
             };

@@ -37,6 +37,40 @@ tables for labels and nested arrays for sections and groups, without repeated
 Python build wrapper, source copy, temporary configuration, HTML rewriting,
 custom search index or custom HTTP server is involved.
 
+`docs.semspec_tables` is a Python-Markdown preprocessor registered in both native
+configurations. A standalone `{{ table("file.render.json") }}` line loads a JSON
+table relative to its article and becomes ordinary Markdown before HTML rendering;
+the source file retains the placeholder. `just docs-build` and `just docs-serve`
+build the standalone semspec CLI and set `SEMSPEC_BIN` and `PYTHONPATH` for the
+extension. The documentation recipes therefore also require the Rust toolchain.
+Rendering reads completed results only. Run `just semspec bench path/to/in.json`
+explicitly to execute a template and create `in.render.json` plus raw evidence in
+`in.bench.json`. See [semspec's table format](../tools/semspec/README.md#executable-benchmark-tables).
+Fixed historical benchmark tables are written directly in Markdown, retaining
+their measured values, statistical scope and source links. Tables updated by
+benchmark publication and the generated measurement-coverage table use JSON;
+their bindings are registered in
+[`benchmark.new/docs.json`](../benchmark.new/docs.json). Run
+`python3 benchmark.new/docs.py check` before building. Historical tables retain
+their original statistics and claims; only explicit live bindings are updated
+by `python3 benchmark.new/docs.py publish BATCH`. Links/code in dynamic JSON
+tables opt into `markdown: true`, with `row_names: false` when the first column
+is already present. Semspec validates optional alignments and displayed headers.
+
+Native `watch` entries track benchmark data files for preview rebuilds. Add table
+data stored in other directories to the locale configuration's `watch` list.
+`docs-build` also uses Zensical's `--clean` to discard cached table expansions.
+
+`docs-serve` sets `PVISOR_DOCS_LIVE=1` and renders tables with semspec's
+`--best-effort`: missing, malformed and unresolved tables display warnings while
+valid tables and page text remain available. Errors also appear in the terminal.
+After creating a previously missing table, save its referring Markdown page to
+trigger another render if Zensical has not yet registered the new file for watching.
+Renderer launch errors or
+timeouts leave the page text available with a warning. Preview preflight and
+semspec build failures warn and continue with an existing renderer when available.
+`docs-build` explicitly disables live mode and retains strict checks.
+
 Zensical has one theme language and search index per project. Keep exactly two
 native configurations: `zensical.zh.toml` and `zensical.en.toml`, building each
 locale directly into `site/zh` and `site/en`. `docs/index.html` is a small static
@@ -98,6 +132,25 @@ The canonical Chinese documentation uses these sections:
 - `design/`: implementation ownership, mechanisms, ADRs and research directions.
 - `community/`: contributing, development, testing, release, roadmap and policies.
 
+Experimental feature documents live under `design/experimental/` in both locale
+trees and appear in the Design and research tab. Keep the feature registry,
+designs, implementation plans and validation records there. Each feature has
+one `index.md` combining its status, design, implementation plan and validation
+records; do not split a feature into separate articles. The experimental registry
+retains its own `index.md`. Do not create a separate repository-root `experimental/`
+documentation tree. Feature code stays in its owning crate or `fw/`, and raw
+performance evidence stays with its registered benchmark. Preserve experimental
+IDs, platform/profile status and the distinction between proposals, implemented
+prototypes and accepted capabilities when moving or updating these articles.
+
+Organize each experimental feature's main design into three top-level sections:
+Problem statement, Core design, and Alternatives and comparison
+(问题提出、核心设计、方案讨论和对比). Establish the problem and current gaps
+before proposing mechanisms; compare routes, tradeoffs and decision evidence
+after explaining the core design. Keep protocol, authority and lifecycle details
+under these sections. Nest implementation plans and validation records under
+Core design while retaining their milestone and evidence structures.
+
 Readers and entry points:
 
 | Reader | Entry | Main path |
@@ -120,7 +173,16 @@ network policy guide owns the executor boundary matrix (summarized in
 observations. Other articles link to these definitions. Implementation pages
 explain mechanisms and code ownership. Benchmark and comparison pages state
 method, environment and date, and keep dated raw samples in local `.data/` directories.
-Only derived Markdown tables and same-directory CSV downloads are versioned.
+Derived Markdown tables, resolved JSON tables and same-directory CSV downloads
+are versioned. Public benchmark provenance summaries live once under
+`docs/overrides/assets/benchmarks/`; both languages link to their local
+`assets/benchmarks/` copies published by Zensical. Keep the batch, measurement
+scope, configuration and input/binary/evidence hashes in these summaries.
+Full manifests, per-file harness records, host paths and complete package receipts
+remain in the benchmark's ignored `.data/`. Publishers update the shared summary
+and only the JSON projections referenced by articles.
+Keep executable benchmark templates and raw `*.bench.json`
+evidence outside the published article tree; articles reference resolved JSON.
 The native `exclude` plugin excludes `.data/` at every depth, and the generated
 site checker rejects leaked evidence. Zensical publishes the shared theme assets
 in each locale, including images and JSON downloads, so native previews need no

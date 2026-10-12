@@ -1,5 +1,11 @@
 # PolicyVisor benchmarks
 
+新的 hyperfine JSON 模板与 semspec 入口和逐批次 CSV / Markdown 更新方式见
+[`benchmark.new/README.md`](../benchmark.new/README.md)。本文件继续维护 benchmark ID 的需求与角色；
+下述旧脚本及历史报告保留原始口径，不能作为 hyperfine 测量结果发布。
+`just benchmark` 的 B-PROCESS 已使用新入口；其余 ID 的新入口映射见
+[`benchmark.new/registry.csv`](../benchmark.new/registry.csv)，仍需显式提供准备好的单次实验条件命令。
+
 **benchmark 的目的是给用户一个可以据此做决定的结论，再用实验支撑它。** 不回答用户问题的测量不写进用户文档；没有实验支撑的结论不写进任何文档。
 
 本文件是所有 benchmark 工作的最高约束，优先于子目录 README、脚本注释和既有文档的写法。
@@ -87,7 +93,7 @@
 - 原始报告、逐次样本、运行日志、profile、输入与二进制清单、冻结源码和 harness 保存到生成目录的 `.data/`。全仓库 `.data/` 被 Git 忽略；忽略规则不会自动移除已跟踪文件，迁移时保留原字节并核对摘要。
 - Markdown 保存读者需要的加工表格与结论。需要支撑性下载时，同目录放整理后的 CSV，并在 Markdown 链接；CSV 必须保留批次、配置、样本数和统计口径。
 - 不再把 typed TSV 完整报告、原始 samples CSV、压缩证据包或源码快照发布到 `docs/src/assets/benchmarks/`。保留本地数据与加工结果之间的摘要关联。
-- 发布脚本的输入和原始归档放 `.data/`，只有加工 CSV 与图表进入公开目录。站点构建和搜索也排除 `.data/`。
+- 发布脚本的输入和原始归档放 `.data/`，公开目录只放加工 CSV、图表与精简来源摘要。摘要保留批次、口径、配置和制品/证据哈希；完整 manifest、逐文件 harness 清单与软件包收据留在本地。双语来源摘要共用 `docs/overrides/assets/benchmarks/`。站点构建和搜索也排除 `.data/`。
 - 退役脚本与模块没有新测量入口；活动 benchmark 的注册 ID、入口和复现手册必须同步。
 
 ## 注册表 {#registry}
@@ -129,7 +135,7 @@ Design: 负载、对照、控制变量与有效样本判据。
   - 环境和镜像预先准备好，准备时间单独记录；热缓存与冷镜像分成两组。
   - 统一 CPU 和内存预算，随机交替执行，每格至少 30 个样本。
   - 完整 Ubuntu 只作为"完整 OS 启动成本"的对照，不与最小 VM 做 VMM 排名。
-- **入口脚本：** `reference_baselines.py --modes ready`（`firecracker_kernels.py` 为独立制品准备 helper）、`startup.py`、`linux_vm_ready.py`、`vm_ready.py`、`run_all.py`、`ubuntu_baselines.py`；启动工程实验与诊断见下列独立条目。
+- **入口脚本：** `benchmark.new/startup/timing.json` 是八个后端的 Ready / Exit 对比表，每行调用固定的 Python timing 脚本（3 次预热、60 次样本，同一次 Popen 记录精确 Ready 行与正常退出）。启动命令由 `subjects.py` 固定；解释器启动和输入准备不计时。`just benchmark startup/timing` 输出整表并生成 `timing.render.json`；`--row` 可选择单行。单后端 `*_timing.json` 可独立执行。旧 hyperfine completion 模板已删除，历史完成时间数据保留原口径。显式保留的成功批次可通过 `update.py --startup-docs` 发布，历史报告归档于 `benchmark.new/startup/.data/history/`。Firecracker 使用 stock 内核/MMIO，预检失败不报告有效 Exit。复现见 [`benchmark.new/startup/README.md`](../benchmark.new/startup/README.md)。历史结果仍由 `reference_baselines.py`、`startup.py`、`linux_vm_ready.py`、`vm_ready.py`、`run_all.py`、`ubuntu_baselines.py`；工程实验与诊断见下列独立条目。
 
 ### B-LAZY-STARTUP：远程镜像按需读取能缩短多少启动等待 {#b-lazy-startup}
 
@@ -166,7 +172,7 @@ Design: 负载、对照、控制变量与有效样本判据。
   - 分别报告每项工具耗时和完整任务耗时（包括启动与收尾）。
   - 每个样本都要校验工具输出；暂存模式还要校验宿主原文件未被写入、upper 内容完整。
   - 不能回答的问题：大型仓库、冷磁盘、真实 registry 和并发吞吐。
-- **入口脚本：** `reference_baselines.py`（跨运行时对照）。
+- **入口脚本：** `reference_baselines.py`（跨运行时对照）。 新框架的 `benchmark.new/filesystem/tools.json` 使用两个 Python 行命令，测量原生 metadata/read 的完整 Python 命令（32 目录 / 2,048 文件 / 64 MiB、3 预热 / 30 样本）。`filesystem/prepare.py` 创建一份共享输入并预检，`fs_timing.py` 用 perf_counter_ns 采样，`audit.py` 复算逐次证据；`just benchmark filesystem/tools` 输出表格并生成 `tools.render.json`，支持 `--row`。解释器、管道和负载校验包含在完整命令时间内；输入准备与观察者启动不计时。它不能替代七工具内部阶段、跨后端任务或配对区间；新 Python 时钟数据独立于历史 `filesystem-semspec.csv`，旧结果归档于 `.data/history/`，复现见 [`filesystem/README.md`](../benchmark.new/filesystem/README.md)。
 
 ### B-FS-ENG：文件系统改动的工程 A/B {#b-fs-eng}
 
@@ -186,6 +192,14 @@ Design: 负载、对照、控制变量与有效样本判据。
 
 - **读队列与 journal 锁对照：** `host_read_journal_ab.py` / `host_read_journal_driver.rs`；冻结同一源码，仅撤销/保留读调度与指纹锁改动。macOS FSKit 的实际部分 copy-up 窗口中并发测只读 OPEN、已打开描述符 READ、OPENDIR，关闭日志、legacy 与 compact strict 分条件；另以共享 Core 的真实 1 GiB 原生文件指纹计算测 unrelated journal 观测，legacy/compact 独立成批。原生文件访问时间变化证明首次读已发生，开始探测时哈希线程必须仍在运行，不人工延迟。每格 3 次预热、30 个 seeded 随机配对样本，空闲对照、完整内容/观察/卸载和干扰门禁、配对 bootstrap 95% CI；不合并复制与哈希条件，不宣称冷磁盘、Linux、VM、吞吐或端到端工具收益。报告/加工 CSV 在 `benchmark/pvisor/`，原始来源和失败在 `.data/`。
 
+- **Linux staged 空闲调度对照：** 使用 `reference_baselines.run_trial` 的原 task timer，以冻结的 coordinator/namespace helper 随机配对同源码基线与仅修改 host dispatch 的候选，API/README 和私有测试同步更新。CPU 0,1、整父组两核 quota / 16 GiB / swap 0，Btrfs 热宿主缓存、相同空工具缓存与 Python bytecode 策略；每样本独立 user/mount/PID namespace、owned pivot_root 和 Host listener，namespace/输入准备不计时。3 warmups、30 配对轮次、完整七工具输出/Run Bundle/宿主隔离/upper 字节校验、前后输入清单与外部 0.5 s 构建/测试干扰门禁。插桩关闭、保留有效慢样本，5,000 次配对 bootstrap，分离簇不作整体排名。raw helper、冻结源码、制品和失败/中间尝试保留 `.data/`；整理 CSV 与结论仅进入 `design/filesystem-performance-analysis.md#host-idle-dispatch`。不作为 hyperfine 数据，也不与跨运行时用户批次或 macOS/VM 结果合并。
+
+- **Linux VM worker 调度对照：** 同一冻结源码的三版本配对：撤销 `65e65c93`/`09bd1d59` 的优化前版本、保留当前优化与 host 修复的基线、仅修改 VM worker 调度/私有测试及 README 的候选。每版本 3 warmups、30 个随机同轮样本；独立 namespace、owned pivot_root、fresh VM/Host listener，整父组 CPU 0,1 / quota 两核 / 16 GiB / swap 0，同 B-FS-TOOLS 七工具及输入、缓存、逐字节 upper、宿主隔离与干扰门禁。使用原 reference timer，profiling 关闭；与当前基线的差异用于候选归因，优化前版本只用于同批恢复程度对照。5,000 次配对 bootstrap，分离簇不报整体排名；各候选批次独立保留，只发布通过门禁的最终制品，不合并样本。原始 helper、冻结源码、构建和诊断在 `.data/`，加工 CSV 与结果仅进入 `design/filesystem-performance-analysis.md#vm-completion-dispatch`，不重算跨运行时用户表，不外推 macOS、冷磁盘或并发吞吐。
+
+- **不可变 share 的 DAX 开关对照：** `benchmark.new/filesystem/dax_ab.py` 准备同一优化制品、固件和物理不可变输入，生成 `in.json` 后通过 `semspec bench` 执行 Python 配对行；不使用 hyperfine。两组均通过公开 VM API 建立只读 DAX-capable share 和 128 MiB 窗口，仅 guest 挂载选项 `dax=never` / `dax=inode` 不同；statx 必须验证实际 DAX 属性。宿主热缓存、新 guest、独占 rootfs upper/work；完整 VM 组 CPU 0,1、两核 quota、2 GiB、swap 0，guest 2 vCPU/512 MiB。静态 C 探针测独立 64 MiB 文件的顺序读取、双线程读取和 mmap 页遍历，以及 128×64 KiB 小文件 open/read/close、2,048 路径 metadata；首次数据访问与 guest 内重复访问分列，全量内容验证在阶段计时之外。小文件组有超过窗口容量的映射，保留其正常回收成本。各组 3 次预热、30 个预先随机平衡配对，共 60 个正式 VM；5,000 次配对 bootstrap，先检查分布，保留有效慢样本，不报告 P99。校验错误、输入/制品变化、非零退出、预算不符、OOM 或外部构建/测试干扰使批次失败；报告失败和剔除数。冻结 harness、源码、制品、全部日志与样本在 `.data/`，加工表和 CSV 为工程报告；不将只读 share 的结果外推到 CLI 可写 workspace、启动退化或磁盘冷缓存。
+
+- **guest 写合并开关对照：** 同一冻结的直接队列 GNU release/gateway 制品，仅切换宿主 runner 的 `PVISOR_VM_FS_WRITEBACK=1` / `0`，由专用 worker 恢复并校验原环境。Linux VM 的 rootfs/workspace 均无 DAX 窗口；与 B-FS-TOOLS 相同的七项操作、完整任务和校验，整父组 CPU 0,1、两核 quota、16 GiB、swap 0，guest 2 vCPU/16 GiB。热宿主缓存、每次私有 namespace/pivot_root、独立工作区与工具缓存；每臂 3 warmups、30 个 seeded 随机配对，共 60 个正式任务。输入与制品摘要、完整 upper 字节、Run Bundle、正常退出、预算和外部构建/测试门禁通过后才能发布；保留慢有效样本，分离簇不给整体排名，5,000 次配对 bootstrap，不报告 P95/P99。原始及冻结执行入口保留 `.data/writeback-ab-*` 与 `.data/writeback-quick-*`；工程表和 CSV 进入 `design/filesystem-performance-analysis.md#writeback-ab`，生产默认值和跨运行时用户表不由该开关实验改写。
+
 ### B-FS-DIAG：文件系统请求成本分解 {#b-fs-diag}
 
 - **角色：** diagnostic
@@ -203,6 +217,16 @@ Design: 负载、对照、控制变量与有效样本判据。
 - **实验设计：** 相同 runner、rootfs 与 payload，随机交错实现，不作为跨产品用户对照。
 - **入口脚本：** `guest_init.py`。
 
+### B-STARTUP-REVISION-ENG：提交版本的启动与收尾对照 {#b-startup-revision-eng}
+
+- **角色：** engineering A/B；结果独立保存在 `benchmark.new/startup/.data/`，不更新用户启动水位。
+- **Motivation：** 定位指定提交与父提交或已归档历史版本是否改变首条有效输出和正常退出等待。
+- **想要的结论：** host、staged、VM 的 Ready / Exit 统计及同轮中位数差的 95% 配对 bootstrap 区间；不能用跨批次数字归因。
+- **实验设计：** 精确源码归档、相同 release/musl/gateway 构建参数和冻结内核；相同 rootfs、探针、CPU 0,1、2 vCPU / 128 MiB、热缓存。各条件 3 次预热、60 对正式样本，固定 seed 随机交替两个版本；Ready / Exit 同次采样。版本在独立 user/mount/PID namespace 中运行，私有 Host 状态目录，退出 namespace 时销毁自有服务；不重启宿主已有 Host。复用当前启动 observer 与完整正确性门禁，保留全部有效慢样本，无事后剔除。
+- **入口：** 每次生成并冻结的 `.data/revision-<commit>/bench.py`，由同目录 `in.json` 经 `semspec bench` 执行；构建收据、轮次顺序、逐次输出与统计一起归档。
+- **历史差距复核：** 先以同一 observer、探针和私有环境随机配对历史原始二进制与指定提交，明确 GNU 动态 / musl 静态等构建差异；此对照只能判断制品差距。确认差距后，以同一固件和构建目标重建源码版本，再判断源码贡献。原始固件提取出的内核摘要必须与冻结内核逐字节核对，不能仅根据链接方式断言固件不同。
+- **构建控制：** 历史 GNU、指定提交 GNU、指定提交 musl 可在同轮三条件随机顺序中采样，各 3 次预热 / 60 次正式试次，固定同一历史内核；分别报告 GNU 源码对照及指定提交 GNU/musl 路径对照的配对区间。内核差异另用同源码、同 musl 参数的两条件对照，不能从多个批次差值相减估算贡献。
+
 ### B-KERNEL-ENG：裁剪固件是否缩短当前产品的启动 {#b-kernel-eng}
 
 - **角色：** engineering A/B；放入 `docs/src/*/design/vm-startup-performance-analysis.md`，不作为跨产品用户排名。
@@ -214,10 +238,11 @@ Design: 负载、对照、控制变量与有效样本判据。
 ### B-STARTUP-DIAG：固件启动阶段诊断 {#b-startup-diag}
 
 - **角色：** diagnostic
-- **Motivation：** 定位内核和初始化阶段对就绪时间的贡献。
+- **Motivation：** 定位内核、初始化和宿主启动/收尾阶段对就绪时间及正常退出的贡献。
 - **想要的结论：** 各阶段计时及计时边界，不作为用户启动水位。
 - **实验设计：** 固定 guest payload 与 runner；早期内核时钟和收尾时间分别解释。
 - **入口脚本：** `firmware_boot.py`。
+- **版本退化诊断：** 冻结历史与指定版本制品，在启动工程对照的私有环境下启用 `PVISOR_STARTUP_TIMING=1` / `PVISOR_STARTUP_PROFILE=1`，各做少量独立试次，保留 stderr 阶段记录。诊断行命令与输出独立归档；插桩时间不发布为性能水位，不将重叠 span 相加，缺失阶段标记视为未知。
 
 ### B-AGENT-TASK：一次完整的 Agent 修复任务要多久，主流 CLI 能否正常运行 {#b-agent-task}
 
@@ -321,7 +346,7 @@ Design: 负载、对照、控制变量与有效样本判据。
 - **Motivation：** 训练和复现需要把历史轨迹准确还原到同一个起点。用户需要知道支持哪些轨迹格式、准备是否有副作用、成本是多少。
 - **想要的结论：** "支持的格式全部通过一致性校验，准备阶段不执行工具也不修改工作区，每条轨迹的准备耗时为 X ms"。
 - **实验设计：** 对每个适配器使用固定的原生格式样本，校验前缀结构、工具参数和观测内容，同时校验工作区没有被修改。
-- **入口脚本：** `v1/replay.py`。
+- **入口脚本：** `benchmark.new/replay/replay.json`（`prepare.py` 冻结和预检，semspec bench 直接测量，hooks 逐次验证，`docs.py publish` 更新 JSON 表格）。每个适配器一条固定轨迹的 hyperfine 数据为独立批次；历史二十条轨迹、三次重复的完整一致性证据保留 `v1/replay.py` 的原口径。
 
 ### B-VM-MEMORY：VM 闲置时能省多少内存，恢复要付出什么 {#b-vm-memory}
 
@@ -430,7 +455,7 @@ Design: 负载、对照、控制变量与有效样本判据。
 - **Motivation：** 防止 Run 的启动和 Bundle 读取在日常开发中出现回归。
 - **想要的结论：** "候选版本相对主干，最小 Run 的耗时和 status 读取耗时没有超过阈值的回归"。
 - **实验设计：** 同机同套件，smoke 使用 2 次预热、10 个样本，nightly 使用 10 次预热、50 个样本；默认 15% 阈值。
-- **入口脚本：** `bench.py`（`just benchmark`）。
+- **入口脚本：** `benchmark.new/process/smoke.json`、`nightly.json`（`prepare.py` 准备，semspec bench 测量，`just benchmark`）；旧 `bench.py` 仅保留历史复现与统计辅助函数。
 
 ## 检查清单 {#checklist}
 

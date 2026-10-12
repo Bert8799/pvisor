@@ -14,6 +14,12 @@
 | KSM | After 60 seconds, savings are 63.6% for repeated contents, 51.7% for identical random contents and 16.0% for unique random contents |
 | Daemon memory pool | About 61–124 MiB resident per instance; repeated / identical random / unique random savings are 53.7% / 39.6% / 6.5% |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](../index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 512 MiB is the guest's available capacity, not physical memory already consumed by the VM on the host. Choose compression, offload or sharing from actual host usage and the next tool's recovery cost. Guest free memory and compression ratios alone cannot establish how much host RAM was saved.

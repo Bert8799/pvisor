@@ -9,18 +9,250 @@ use fuser::{
     ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use pvisor_overlay_core::{OverlayCore, PreparedCopyUp, service::FilesystemService};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 const REQUEST_LIMIT: usize = 128;
 const BYTE_LIMIT: usize = 16 * 1024 * 1024;
 type Callback = Box<dyn FnOnce(Result<&mut OverlayFs, i32>) + Send>;
+
+#[derive(Default)]
+struct IoActivity {
+    state: Mutex<(usize, bool)>,
+    ready: Condvar,
+}
+
+impl IoActivity {
+    fn enter(&self) -> IoPermit<'_> {
+        let mut state = self.state.lock().unwrap();
+        while state.1 {
+            state = self.ready.wait(state).unwrap();
+        }
+        state.0 += 1;
+        IoPermit(self)
+    }
+
+    fn namespace(&self) -> NamespacePermit<'_> {
+        let mut state = self.state.lock().unwrap();
+        while state.1 {
+            state = self.ready.wait(state).unwrap();
+        }
+        state.1 = true;
+        while state.0 != 0 {
+            state = self.ready.wait(state).unwrap();
+        }
+        NamespacePermit(self)
+    }
+}
+
+struct IoPermit<'a>(&'a IoActivity);
+
+impl Drop for IoPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.0 -= 1;
+        if state.0 == 0 {
+            self.0.ready.notify_all();
+        }
+    }
+}
+
+struct NamespacePermit<'a>(&'a IoActivity);
+
+impl Drop for NamespacePermit<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().1 = false;
+        self.0.ready.notify_all();
+    }
+}
+
+enum IoRequest<'a> {
+    Read {
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        reply: ReplyData,
+    },
+    Write {
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: Cow<'a, [u8]>,
+        flags: i32,
+        reply: ReplyWrite,
+    },
+    Sync {
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    },
+}
+
+impl IoRequest<'_> {
+    fn into_owned(self) -> IoRequest<'static> {
+        match self {
+            Self::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
+            } => IoRequest::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
+            },
+            Self::Write {
+                ino,
+                fh,
+                offset,
+                data,
+                flags,
+                reply,
+            } => IoRequest::Write {
+                ino,
+                fh,
+                offset,
+                data: Cow::Owned(data.into_owned()),
+                flags,
+                reply,
+            },
+            Self::Sync {
+                fh,
+                datasync,
+                reply,
+            } => IoRequest::Sync {
+                fh,
+                datasync,
+                reply,
+            },
+        }
+    }
+
+    fn fail(self, error: i32) {
+        match self {
+            Self::Read { reply, .. } => reply.error(error),
+            Self::Write { reply, .. } => reply.error(error),
+            Self::Sync { reply, .. } => reply.error(error),
+        }
+    }
+
+    fn run(self, state: &Mutex<OverlayFs>, activity: &IoActivity) {
+        // This is an in-flight counter/fence, not a mutex held through I/O.
+        // Namespace publication waits here before acquiring filesystem state.
+        let _permit = activity.enter();
+        match self {
+            Self::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                reply,
+            } => {
+                let lease = state.lock().map_err(|_| libc::EIO).and_then(|fs| {
+                    fs.begin_file_io(ino, fh, offset, false)
+                        .map(|(lease, _)| lease)
+                        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+                });
+                let lease = match lease {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        reply.error(error);
+                        return;
+                    }
+                };
+                let result = lease.read(offset as u64, size);
+                match state.lock() {
+                    Ok(fs) => fs.finish_read_io(&lease, &result),
+                    Err(_) => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                }
+                match result {
+                    Ok(bytes) => reply.data(&bytes),
+                    Err(error) => reply.error(error.raw_os_error().unwrap_or(libc::EIO)),
+                }
+            }
+            Self::Write {
+                ino,
+                fh,
+                offset,
+                data,
+                flags,
+                reply,
+            } => {
+                let prepared = state.lock().map_err(|_| libc::EIO).and_then(|fs| {
+                    fs.begin_file_io(ino, fh, offset, true)
+                        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+                });
+                let (lease, mutation) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        reply.error(error);
+                        return;
+                    }
+                };
+                let result = lease.write(offset as u64, &data, flags);
+                match state.lock() {
+                    Ok(mut fs) => fs.finish_write_io(&lease, mutation, result, reply),
+                    Err(poisoned) => {
+                        // Complete the reserved cache effects even after a state
+                        // failure; the backing write may already have happened.
+                        poisoned.into_inner().finish_write_io(
+                            &lease,
+                            mutation,
+                            Err(io::Error::from_raw_os_error(libc::EIO)),
+                            reply,
+                        );
+                    }
+                }
+            }
+            Self::Sync {
+                fh,
+                datasync,
+                reply,
+            } => {
+                let lease = state.lock().map_err(|_| libc::EIO).and_then(|fs| {
+                    fs.file_io_lease(fh)
+                        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+                });
+                match lease.and_then(|lease| {
+                    lease
+                        .sync(datasync)
+                        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+                }) {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(error),
+                }
+            }
+        }
+    }
+}
+
+enum Work {
+    Callback(Callback),
+    Io(IoRequest<'static>),
+}
+
+impl Work {
+    fn fail(self, error: i32) {
+        match self {
+            Self::Callback(callback) => callback(Err(error)),
+            Self::Io(request) => request.fail(error),
+        }
+    }
+}
 
 pub(super) enum CopyRequest {
     None,
@@ -97,7 +329,7 @@ struct Job {
     preparation: CopyRequest,
     bytes: usize,
     inodes: Vec<u64>,
-    callback: Callback,
+    work: Work,
 }
 
 fn failed_preparation(
@@ -189,18 +421,31 @@ impl DispatchControl {
 
 pub(crate) struct DispatchFs {
     state: Arc<Mutex<OverlayFs>>,
+    io_activity: Arc<IoActivity>,
     pub(crate) control: Arc<DispatchControl>,
 }
 
 impl DispatchFs {
     pub(crate) fn new(filesystem: OverlayFs) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(filesystem));
+        let io_activity = Arc::new(IoActivity::default());
         let worker_state = state.clone();
+        let mutation_activity = io_activity.clone();
         let (sender, receiver) = mpsc::sync_channel::<Job>(REQUEST_LIMIT);
         let worker = std::thread::Builder::new()
             .name("overlay-mutations".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
+                    let callback = match job.work {
+                        Work::Callback(callback) => callback,
+                        Work::Io(request) => {
+                            request.run(&worker_state, &mutation_activity);
+                            if let Ok(mut fs) = worker_state.lock() {
+                                fs.finish_request(job.bytes, &job.inodes);
+                            }
+                            continue;
+                        }
+                    };
                     let result = (|| {
                         let (core, plan, mutation) = {
                             let fs = worker_state.lock().map_err(|_| libc::EIO)?;
@@ -218,37 +463,41 @@ impl DispatchFs {
                             .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
                         Ok((core, copies, mutation))
                     })();
+                    let _namespace = mutation_activity.namespace();
                     match worker_state.lock() {
                         Ok(mut fs) => {
                             match result {
-                                Ok((core, copies, mutation)) => complete_preparation(
-                                    &mut fs,
-                                    &core,
-                                    copies,
-                                    mutation,
-                                    job.callback,
-                                ),
-                                Err(error) => (job.callback)(Err(error)),
+                                Ok((core, copies, mutation)) => {
+                                    complete_preparation(&mut fs, &core, copies, mutation, callback)
+                                }
+                                Err(error) => callback(Err(error)),
                             }
                             fs.finish_request(job.bytes, &job.inodes);
                         }
-                        Err(_) => (job.callback)(Err(libc::EIO)),
+                        Err(_) => callback(Err(libc::EIO)),
                     }
                 }
             })?;
         let read_state = state.clone();
+        let read_activity = io_activity.clone();
         let (read_sender, read_receiver) = mpsc::sync_channel::<Job>(REQUEST_LIMIT);
         let read_worker = match std::thread::Builder::new()
             .name("overlay-reads".into())
             .spawn(move || {
                 while let Ok(job) = read_receiver.recv() {
-                    match read_state.lock() {
-                        Ok(mut fs) => {
-                            (job.callback)(Ok(&mut fs));
-                            fs.pending_read_requests -= 1;
-                            fs.finish_request(job.bytes, &job.inodes);
+                    match job.work {
+                        Work::Io(request) => request.run(&read_state, &read_activity),
+                        Work::Callback(callback) => {
+                            let _permit = read_activity.enter();
+                            match read_state.lock() {
+                                Ok(mut fs) => callback(Ok(&mut fs)),
+                                Err(_) => callback(Err(libc::EIO)),
+                            }
                         }
-                        Err(_) => (job.callback)(Err(libc::EIO)),
+                    }
+                    if let Ok(mut fs) = read_state.lock() {
+                        fs.pending_read_requests -= 1;
+                        fs.finish_request(job.bytes, &job.inodes);
                     }
                 }
             }) {
@@ -261,6 +510,7 @@ impl DispatchFs {
         };
         Ok(Self {
             state,
+            io_activity,
             control: Arc::new(DispatchControl {
                 stopped: AtomicBool::new(false),
                 senders: Mutex::new(vec![sender, read_sender]),
@@ -300,11 +550,12 @@ impl DispatchFs {
     }
 
     fn enqueue(&self, preparation: CopyRequest, bytes: usize, inodes: &[u64], callback: Callback) {
-        self.enqueue_on(false, preparation, bytes, inodes, callback);
+        let short = matches!(preparation, CopyRequest::None);
+        self.enqueue_on(false, short, preparation, bytes, inodes, callback);
     }
 
     fn enqueue_read(&self, inodes: &[u64], callback: Callback) {
-        self.enqueue_on(true, CopyRequest::None, 0, inodes, callback);
+        self.enqueue_on(true, true, CopyRequest::None, 0, inodes, callback);
     }
 
     fn enqueue_open(&self, ino: u64, flags: i32, callback: Callback) {
@@ -334,34 +585,28 @@ impl DispatchFs {
         }
     }
 
-    fn enqueue_on(
+    fn enqueue_io(
         &self,
         reading: bool,
-        preparation: CopyRequest,
+        short: bool,
         bytes: usize,
-        inodes: &[u64],
-        callback: Callback,
+        ino: u64,
+        request: IoRequest<'_>,
     ) {
-        let job = Job {
-            preparation,
-            bytes,
-            inodes: inodes.to_owned(),
-            callback,
-        };
         let Ok(senders) = self.control.senders.lock() else {
-            (job.callback)(Err(libc::EIO));
+            request.fail(libc::EIO);
             return;
         };
         if self.control.stopped.load(Ordering::Acquire) {
-            (job.callback)(Err(libc::EIO));
+            request.fail(libc::EIO);
             return;
         }
         let Some(sender) = senders.get(usize::from(reading)) else {
-            (job.callback)(Err(libc::EIO));
+            request.fail(libc::EIO);
             return;
         };
         let Ok(mut fs) = self.state.lock() else {
-            (job.callback)(Err(libc::EIO));
+            request.fail(libc::EIO);
             return;
         };
         let pending = if reading {
@@ -371,7 +616,85 @@ impl DispatchFs {
         };
         if pending >= REQUEST_LIMIT || bytes > BYTE_LIMIT - fs.pending_bytes {
             drop(fs);
-            (job.callback)(Err(libc::EAGAIN));
+            request.fail(libc::EAGAIN);
+            return;
+        }
+        *fs.pending_inodes.entry(ino).or_default() += 1;
+        fs.pending_requests += 1;
+        fs.pending_read_requests += usize::from(reading);
+        fs.pending_bytes += bytes;
+        if short && pending == 0 && (!reading || fs.pending_requests == 1) {
+            drop(fs);
+            // Keep admission locked through inline completion so shutdown drains
+            // it too. A borrowed WRITE payload needs no allocation or copy.
+            request.run(&self.state, &self.io_activity);
+            let mut fs = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            fs.pending_read_requests -= usize::from(reading);
+            fs.finish_request(bytes, &[ino]);
+            return;
+        }
+        // Copy only an admitted, actually queued WRITE. Rejections and idle
+        // inline writes never allocate a payload or a boxed callback.
+        let job = Job {
+            preparation: CopyRequest::None,
+            bytes,
+            inodes: vec![ino],
+            work: Work::Io(request.into_owned()),
+        };
+        if let Err(error) = sender.try_send(job) {
+            let (job, errno) = match error {
+                mpsc::TrySendError::Full(job) => (job, libc::EAGAIN),
+                mpsc::TrySendError::Disconnected(job) => (job, libc::EIO),
+            };
+            fs.pending_read_requests -= usize::from(reading);
+            fs.finish_request(bytes, &[ino]);
+            drop(fs);
+            job.work.fail(errno);
+        }
+    }
+
+    fn enqueue_on(
+        &self,
+        reading: bool,
+        short: bool,
+        preparation: CopyRequest,
+        bytes: usize,
+        inodes: &[u64],
+        callback: Callback,
+    ) {
+        let job = Job {
+            preparation,
+            bytes,
+            inodes: inodes.to_owned(),
+            work: Work::Callback(callback),
+        };
+        let Ok(senders) = self.control.senders.lock() else {
+            job.work.fail(libc::EIO);
+            return;
+        };
+        if self.control.stopped.load(Ordering::Acquire) {
+            job.work.fail(libc::EIO);
+            return;
+        }
+        let Some(sender) = senders.get(usize::from(reading)) else {
+            job.work.fail(libc::EIO);
+            return;
+        };
+        let Ok(mut fs) = self.state.lock() else {
+            job.work.fail(libc::EIO);
+            return;
+        };
+        let pending = if reading {
+            fs.pending_read_requests
+        } else {
+            fs.pending_requests - fs.pending_read_requests
+        };
+        if pending >= REQUEST_LIMIT || bytes > BYTE_LIMIT - fs.pending_bytes {
+            drop(fs);
+            job.work.fail(libc::EAGAIN);
             return;
         }
         for ino in &job.inodes {
@@ -382,6 +705,39 @@ impl DispatchFs {
             fs.pending_read_requests += 1;
         }
         fs.pending_bytes += bytes;
+        // These handlers execute under the state lock. When
+        // their lane is idle, a worker handoff only adds scheduling latency.
+        // Keep admission, inode pins and the sender lock through completion:
+        // shutdown must also wait for an inline callback. Reads may be inline
+        // only when *both* lanes were idle: any accepted mutation, including
+        // off-lock copy preparation, keeps the receive thread free for metadata.
+        // Never overtake an accepted job in the same lane.
+        if short && pending == 0 && (!reading || fs.pending_requests == 1) {
+            drop(fs);
+            let (read_permit, namespace_permit) = if reading {
+                (Some(self.io_activity.enter()), None)
+            } else {
+                (None, Some(self.io_activity.namespace()))
+            };
+            let mut fs = match self.state.lock() {
+                Ok(fs) => fs,
+                Err(_) => {
+                    job.work.fail(libc::EIO);
+                    return;
+                }
+            };
+            if let Work::Callback(callback) = job.work {
+                callback(Ok(&mut fs));
+            }
+            if reading {
+                fs.pending_read_requests -= 1;
+            }
+            fs.finish_request(bytes, &job.inodes);
+            drop(fs);
+            drop(read_permit);
+            drop(namespace_permit);
+            return;
+        }
         if let Err(error) = sender.try_send(job) {
             let (job, errno) = match error {
                 mpsc::TrySendError::Full(job) => (job, libc::EAGAIN),
@@ -392,7 +748,7 @@ impl DispatchFs {
             }
             fs.finish_request(bytes, &job.inodes);
             drop(fs);
-            (job.callback)(Err(errno));
+            job.work.fail(errno);
         }
     }
 }
@@ -620,12 +976,19 @@ impl Filesystem for DispatchFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        self.enqueue_read(
-            &[ino],
-            Box::new(reply_callback!(
+        // Preserve worker pipelining for bulk reads, even on an idle mount.
+        self.enqueue_io(
+            true,
+            size < 64 * 1024,
+            0,
+            ino,
+            IoRequest::Read {
+                ino,
+                fh,
+                offset,
+                size,
                 reply,
-                read(ino, fh, offset, size, _flags, _lock_owner)
-            )),
+            },
         );
     }
 
@@ -641,16 +1004,19 @@ impl Filesystem for DispatchFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let data = data.to_owned();
-        let preparation = CopyRequest::None;
-        self.enqueue(
-            preparation,
+        self.enqueue_io(
+            false,
+            true,
             data.len(),
-            &[ino],
-            Box::new(reply_callback!(
+            ino,
+            IoRequest::Write {
+                ino,
+                fh,
+                offset,
+                data: Cow::Borrowed(data),
+                flags,
                 reply,
-                write(ino, fh, offset, &data, _write_flags, flags, _lock_owner)
-            )),
+            },
         );
     }
 
@@ -697,11 +1063,16 @@ impl Filesystem for DispatchFs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.enqueue(
-            CopyRequest::None,
+        self.enqueue_io(
+            false,
+            true,
             0,
-            &[_ino],
-            Box::new(reply_callback!(reply, fsync(_ino, fh, datasync))),
+            _ino,
+            IoRequest::Sync {
+                fh,
+                datasync,
+                reply,
+            },
         );
     }
 
@@ -970,6 +1341,37 @@ mod tests {
     use std::sync::mpsc::{Receiver, SyncSender};
     use std::time::{Duration, UNIX_EPOCH};
 
+    #[test]
+    fn namespace_publication_drains_io_without_holding_filesystem_state() {
+        let activity = Arc::new(IoActivity::default());
+        let root = tempfile::tempdir().unwrap();
+        let lower = root.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let state =
+            Mutex::new(OverlayFs::new(vec![lower], root.path().join("upper"), None).unwrap());
+        let io = activity.enter();
+        let (sent, completed) = mpsc::channel();
+        let other = activity.clone();
+        let worker = std::thread::spawn(move || {
+            let _namespace = other.namespace();
+            sent.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if activity.state.lock().unwrap().1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(completed.try_recv().is_err());
+        assert!(state.try_lock().is_ok());
+        drop(io);
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        let _next = activity.enter();
+    }
+
     struct SlowLower {
         root: PathBuf,
         first: AtomicBool,
@@ -1076,6 +1478,102 @@ mod tests {
     }
     fn service(fs: &OverlayFs) -> Arc<FilesystemService> {
         fs.copy_plan(&CopyRequest::None).unwrap().0
+    }
+
+    #[test]
+    fn idle_short_callbacks_complete_without_a_worker_handoff() {
+        let f = fixture(false);
+        let caller = std::thread::current().id();
+        for reading in [false, true] {
+            let callback: Callback = Box::new(move |state| {
+                let fs = state.unwrap();
+                assert_eq!(std::thread::current().id(), caller);
+                assert_eq!(fs.pending_inodes.get(&FUSE_ROOT_ID), Some(&1));
+                assert_eq!(fs.pending_requests, 1);
+                assert_eq!(fs.pending_read_requests, usize::from(reading));
+            });
+            if reading {
+                f.dispatch.enqueue_read(&[FUSE_ROOT_ID], callback);
+            } else {
+                f.dispatch
+                    .enqueue(CopyRequest::None, 0, &[FUSE_ROOT_ID], callback);
+            }
+            let state = f.dispatch.state.lock().unwrap();
+            assert_eq!(state.pending_requests, 0);
+            assert!(state.pending_inodes.is_empty());
+        }
+        f.dispatch.control.shutdown().unwrap();
+    }
+
+    #[test]
+    fn idle_bulk_read_work_keeps_its_worker_and_inode_pin() {
+        let f = fixture(false);
+        let caller = std::thread::current().id();
+        let (done, result) = mpsc::channel();
+        f.dispatch.enqueue_on(
+            true,
+            false,
+            CopyRequest::None,
+            0,
+            &[FUSE_ROOT_ID],
+            Box::new(move |state| {
+                let fs = state.unwrap();
+                assert_ne!(std::thread::current().id(), caller);
+                assert_eq!(fs.pending_inodes.get(&FUSE_ROOT_ID), Some(&1));
+                assert_eq!(fs.pending_read_requests, 1);
+                done.send(service(fs).metadata(Path::new("quick")).unwrap().len())
+                    .unwrap();
+            }),
+        );
+        assert_eq!(result.recv_timeout(Duration::from_secs(2)).unwrap(), 8);
+        f.dispatch.control.shutdown().unwrap();
+        let state = f.dispatch.state.lock().unwrap();
+        assert_eq!(state.pending_requests, 0);
+        assert!(state.pending_inodes.is_empty());
+    }
+
+    #[test]
+    fn shutdown_waits_for_an_inline_callback_and_rejects_new_admission() {
+        let f = fixture(false);
+        let (entered, active) = mpsc::channel();
+        let (resume, gate) = mpsc::channel();
+        let dispatch = f.dispatch.clone();
+        let caller = std::thread::spawn(move || {
+            dispatch.enqueue(
+                CopyRequest::None,
+                0,
+                &[FUSE_ROOT_ID],
+                Box::new(move |state| {
+                    assert!(state.is_ok());
+                    entered.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                }),
+            );
+        });
+        active.recv_timeout(Duration::from_secs(2)).unwrap();
+        let control = f.dispatch.control.clone();
+        let (done, joined) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            control.shutdown().unwrap();
+            done.send(()).unwrap();
+        });
+        while !f.dispatch.control.stopped.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        assert!(joined.try_recv().is_err());
+        f.dispatch
+            .metadata(|state| assert_eq!(state.err(), Some(libc::EIO)));
+        resume.send(()).unwrap();
+        caller.join().unwrap();
+        joined.recv_timeout(Duration::from_secs(2)).unwrap();
+        shutdown.join().unwrap();
+        f.dispatch.enqueue_read(
+            &[FUSE_ROOT_ID],
+            Box::new(|state| {
+                assert_eq!(state.err(), Some(libc::EIO));
+            }),
+        );
+        assert_eq!(f.dispatch.state.lock().unwrap().pending_requests, 0);
     }
 
     #[test]
@@ -1268,6 +1766,17 @@ mod tests {
     #[test]
     fn shutdown_drains_the_read_worker_and_rejects_new_reads() {
         let f = fixture(false);
+        // A real pending copy keeps reads on the independent worker. Keep the
+        // existing drain test on that path, alongside the idle-inline drain test.
+        f.dispatch.enqueue(
+            copy_request(),
+            0,
+            &[FUSE_ROOT_ID],
+            Box::new(|state| {
+                assert!(state.is_ok());
+            }),
+        );
+        f.entered.recv_timeout(Duration::from_secs(2)).unwrap();
         let (entered, active) = mpsc::channel();
         let (resume, gate) = mpsc::channel();
         f.dispatch.enqueue_read(
@@ -1307,6 +1816,7 @@ mod tests {
             Some(libc::EIO)
         );
         assert!(joined.try_recv().is_err());
+        f.resume.send(()).unwrap();
         resume.send(()).unwrap();
         joined
             .recv_timeout(Duration::from_secs(2))

@@ -5,9 +5,10 @@ use crossbeam_channel::Sender;
 
 use std::io;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
+#[cfg(test)]
 use std::time::Instant;
 
 use crate::utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -18,7 +19,9 @@ use super::super::Queue;
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{OwnedDescriptorChain, Reader, Writer};
-use super::fuse::{InHeader, Opcode, ReadIn};
+#[cfg(test)]
+use super::fuse::ReadIn;
+use super::fuse::{InHeader, Opcode};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::overlay::{Config as OverlayConfig, OverlayFs};
@@ -27,6 +30,8 @@ use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;
 use crate::devices::virtio::{InterruptTransport, VirtioShmRegion};
+
+mod scheduler;
 
 enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
@@ -113,14 +118,9 @@ impl Execution {
     fn handle(&self, request: &Request) -> usize {
         let decoded = request
             .buffers
-            .reader_writer(&self.mem)
-            .and_then(|(mut reader, writer)| {
-                // The owner captured the header exactly once. Skip its guest bytes
-                // without trusting a second read of the driver-controlled opcode.
-                reader
-                    .split_at(std::mem::size_of::<InHeader>())
-                    .map(|body| (body, writer))
-            });
+            // The owner captured the header exactly once. Skip its guest bytes
+            // without constructing or decoding another header reader.
+            .reader_writer_after(&self.mem, std::mem::size_of::<InHeader>());
         match decoded {
             Ok((reader, writer)) => self.handle_decoded(request.header, reader, writer),
             Err(error) => {
@@ -160,9 +160,10 @@ impl Execution {
     }
 }
 
-/// Keep short metadata operations inline to avoid a thread handoff. Directory
-/// enumeration and large reads use the pool even when they arrive alone, so
-/// the queue owner stays available for metadata and high-priority requests.
+// The old pool is retained only as a test fixture for the existing descriptor,
+// memory-lease and wakeup regressions during this scheduling migration. The
+// production worker exclusively uses scheduler::serve below.
+#[cfg(test)]
 fn parallel_candidate(header: &InHeader, body: &Reader) -> bool {
     match header.opcode {
         x if x == Opcode::Read as u32 => body
@@ -184,11 +185,12 @@ struct Request {
     index: u16,
     header: InHeader,
     buffers: OwnedDescriptorChain,
-    // Submit timestamp, replaced by completion-ready timestamp after service.
-    // None when diagnostics are disabled; normal requests read no clock.
+    // Legacy pool test diagnostics; queue-local execution reads no clock here.
+    #[cfg(test)]
     profile_timestamp: Option<Instant>,
 }
 
+#[cfg(test)]
 struct Completion {
     // Keep both captured descriptors and the RAM lease until add_used finishes.
     request: Request,
@@ -198,16 +200,20 @@ struct Completion {
 /// A per-device bounded blocking-I/O pool. Completion is asynchronous to the
 /// queue owner; the existing pread/pwrite implementation remains zero-copy.
 /// No borrowed VolatileSlice or unsafe Send implementation crosses threads.
+#[cfg(test)]
 struct RequestPool {
     jobs: Option<crossbeam_channel::Sender<Request>>,
+    idle_jobs: Option<crossbeam_channel::Sender<Request>>,
     completed: crossbeam_channel::Receiver<Completion>,
     wake: Arc<EventFd>,
+    awaiting_wake: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
     in_flight: usize,
     limit: usize,
     profile: pvisor_overlay_core::profile::Profile,
 }
 
+#[cfg(test)]
 impl RequestPool {
     fn new(
         handle: impl Fn(&Request) -> usize + Send + Sync + 'static,
@@ -223,14 +229,19 @@ impl RequestPool {
         }
         let handle = Arc::new(handle);
         let (jobs, receive) = crossbeam_channel::bounded::<Request>(limit);
+        // Keep isolated requests on one warm worker. Bursts still use the
+        // shared FIFO; this slot counts against the same in-flight bound.
+        let (idle_jobs, idle_receive) = crossbeam_channel::bounded::<Request>(1);
         // Although this channel is unbounded, at most `limit` accepted requests
         // can exist, including queued, executing and unpublished completions.
         let (completed, completions) = crossbeam_channel::unbounded();
         let wake = Arc::new(EventFd::new(EFD_NONBLOCK)?);
         let mut pool = Self {
             jobs: Some(jobs),
+            idle_jobs: Some(idle_jobs),
             completed: completions,
             wake,
+            awaiting_wake: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             in_flight: 0,
             limit,
@@ -238,8 +249,10 @@ impl RequestPool {
         };
         for id in 0..workers {
             let receive = receive.clone();
+            let idle_receive = idle_receive.clone();
             let completed = completed.clone();
             let wake = pool.wake.clone();
+            let awaiting_wake = pool.awaiting_wake.clone();
             let handle = handle.clone();
             let profile = pool.profile.clone();
             pool.threads
@@ -247,7 +260,16 @@ impl RequestPool {
                     thread::Builder::new()
                         .name(format!("fs io {id}"))
                         .spawn(move || {
-                            for mut request in receive {
+                            loop {
+                                let received = if id == 0 {
+                                    crossbeam_channel::select_biased! {
+                                        recv(idle_receive) -> result => result.or_else(|_| receive.recv()),
+                                        recv(receive) -> result => result,
+                                    }
+                                } else {
+                                    receive.recv()
+                                };
+                                let Ok(mut request) = received else { break };
                                 profile.record_since("pool_queue_wait", request.profile_timestamp);
                                 let service = profile.span("pool_service");
                                 // A lost worker would make freeze wait forever. Fail the
@@ -265,9 +287,11 @@ impl RequestPool {
                                 if completed.send(Completion { request, len }).is_err() {
                                     break;
                                 }
-                                if let Err(error) = wake.write(1) {
-                                    error!("filesystem completion wake failed: {error}");
-                                    std::process::abort();
+                                if awaiting_wake.swap(false, Ordering::AcqRel) {
+                                    if let Err(error) = wake.write(1) {
+                                        error!("filesystem completion wake failed: {error}");
+                                        std::process::abort();
+                                    }
                                 }
                             }
                         })?,
@@ -276,12 +300,30 @@ impl RequestPool {
         Ok(pool)
     }
 
+    fn wait_timeout(&self) -> i32 {
+        // Pair the owner's arm with the worker's disarm after channel send.
+        // If completion wins, acquire makes it visible before the empty check;
+        // if arm wins, that worker signals the sleeping owner. Never park with
+        // an already queued completion, but still poll stop/kick events first.
+        self.awaiting_wake.swap(true, Ordering::AcqRel);
+        if self.completed.is_empty() {
+            -1
+        } else {
+            0
+        }
+    }
+
     fn submit(&mut self, mut request: Request) {
         request.profile_timestamp = self.profile.timestamp();
         assert!(self.in_flight < self.limit);
         // Capacity covers every in-flight request, so the owner never blocks
         // behind I/O and can always service the dedicated high-priority queue.
-        self.jobs
+        let sender = if self.in_flight == 0 {
+            &self.idle_jobs
+        } else {
+            &self.jobs
+        };
+        sender
             .as_ref()
             .expect("filesystem pool closed")
             .try_send(request)
@@ -290,9 +332,11 @@ impl RequestPool {
     }
 }
 
+#[cfg(test)]
 impl Drop for RequestPool {
     fn drop(&mut self) {
         self.jobs.take();
+        self.idle_jobs.take();
         for worker in self.threads.drain(..) {
             if worker.join().is_err() {
                 std::process::abort();
@@ -301,9 +345,9 @@ impl Drop for RequestPool {
     }
 }
 
-fn worker_count() -> usize {
-    // Host-side diagnostic override. The public VM API and guest queue topology
-    // stay platform-independent. One restores entirely synchronous dispatch.
+pub(super) fn worker_count() -> usize {
+    // Controls normal queue count; hiprio always gets its own lane. The guest
+    // may initialize fewer queues, for example on a single-vCPU VM.
     std::env::var("PVISOR_VM_FS_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -362,8 +406,28 @@ impl FsWorker {
                     virtual_entries,
                 ))))
             }
-            (None, Some(cfg)) if read_only => {
+            (None, Some(mut cfg)) if read_only => {
+                // A shared-memory window on a read-only attachment is created
+                // only by immutable_filesystem, whose caller owns physical
+                // contents and namespace for this VM's lifetime. Ordinary ro
+                // mounts do not imply that guarantee. Extend only metadata and
+                // entry TTLs; keep the existing data-cache policy with dax=never.
+                if shm_region.is_some() {
+                    cfg.entry_timeout = std::time::Duration::from_secs(60);
+                    // LinuxSimplified attributes depend on the requesting uid.
+                    if !cfg.attr_timeout.is_zero() {
+                        cfg.attr_timeout = std::time::Duration::from_secs(60);
+                    }
+                }
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
+                #[cfg(target_os = "linux")]
+                let inner = {
+                    let mut inner = inner;
+                    if let Some(region) = shm_region.as_ref() {
+                        inner.enable_dax(region.clone())?;
+                    }
+                    inner
+                };
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -448,80 +512,19 @@ impl FsWorker {
     }
 
     fn work(mut self) -> Self {
-        let workers = worker_count();
-        let mut pool = None;
-        let epoll = Epoll::new().unwrap();
-        for fd in self
-            .queue_evts
-            .iter()
-            .map(|event| event.as_raw_fd())
-            .chain(std::iter::once(self.stop_fd.as_raw_fd()))
-        {
-            epoll
-                .ctl(
-                    ControlOperation::Add,
-                    fd,
-                    &EpollEvent::new(EventSet::IN, fd as u64),
-                )
-                .expect("filesystem epoll registration");
-        }
-        // A restored/thawed queue may already contain requests without a new
-        // kick. Scan before waiting, and after every completion frees capacity.
-        self.service_queues(&mut pool, workers, &epoll);
-        let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-        loop {
-            let count = match epoll.wait(events.len(), -1, &mut events) {
-                Ok(count) => count,
-                Err(error) => {
-                    debug!("filesystem epoll wait: {error}");
-                    continue;
-                }
-            };
-            // Stop admission before servicing any other event in this batch.
-            if events[..count]
-                .iter()
-                .any(|e| e.fd() == self.stop_fd.as_raw_fd())
-            {
-                let _ = self.stop_fd.read();
-                if let Some(pool) = &mut pool {
-                    let mut completed = [false; 2];
-                    while pool.in_flight != 0 {
-                        let completion = pool.completed.recv().expect("filesystem completion lost");
-                        completed[completion.request.queue] = true;
-                        self.publish_completion(completion);
-                        pool.in_flight -= 1;
-                    }
-                    self.notify_completed(completed);
-                }
-                // Dropping the pool joins every I/O worker before returning the
-                // parked device to capture_state, reset or offload.
-                drop(pool);
-                self.dispatch_profile.emit_checkpoint();
-                return self;
-            }
-            for event in &events[..count] {
-                if let Some(queue) = self.queue_evts.iter().find(|q| q.as_raw_fd() == event.fd()) {
-                    let _ = queue.read();
-                } else if let Some(pool) = &mut pool {
-                    if event.fd() == pool.wake.as_raw_fd() {
-                        // macOS uses a pipe, so consume all pending wake tokens.
-                        while pool.wake.read().is_ok() {}
-                    }
-                }
-            }
-            if let Some(pool) = &mut pool {
-                let mut completed = [false; 2];
-                while let Ok(completion) = pool.completed.try_recv() {
-                    completed[completion.request.queue] = true;
-                    self.publish_completion(completion);
-                    pool.in_flight -= 1;
-                }
-                self.notify_completed(completed);
-            }
-            self.service_queues(&mut pool, workers, &epoll);
-        }
+        self.queues = scheduler::serve(
+            std::mem::take(&mut self.queues),
+            &self.queue_evts,
+            &self.stop_fd,
+            self.interrupt.clone(),
+            self.execution.clone(),
+            self.dispatch_profile.clone(),
+        );
+        self.dispatch_profile.emit_checkpoint();
+        self
     }
 
+    #[cfg(test)]
     fn complete(&mut self, completion: Completion) {
         let index = completion.request.queue;
         self.publish_completion(completion);
@@ -530,6 +533,7 @@ impl FsWorker {
         self.notify_completed(completed);
     }
 
+    #[cfg(test)]
     fn publish_completion(&mut self, completion: Completion) {
         self.dispatch_profile
             .record_since("pool_completion_wait", completion.request.profile_timestamp);
@@ -546,6 +550,7 @@ impl FsWorker {
         self.dispatch_profile.add("published_completions", 1);
     }
 
+    #[cfg(test)]
     fn notify_completed(&mut self, completed: [bool; 2]) {
         let mut notify = false;
         for (index, completed) in completed.into_iter().enumerate() {
@@ -562,6 +567,7 @@ impl FsWorker {
         }
     }
 
+    #[cfg(test)]
     fn service_queues(&mut self, pool: &mut Option<RequestPool>, workers: usize, epoll: &Epoll) {
         let profile = self.dispatch_profile.clone();
         let _span = profile.span("admission");
@@ -696,11 +702,12 @@ mod tests {
     use std::time::Duration;
     use vm_memory::GuestAddress;
 
-    fn queue_worker(mem: GuestMemoryMmap, queues: Vec<Queue>) -> FsWorker {
+    pub(super) fn queue_worker(mem: GuestMemoryMmap, queues: Vec<Queue>) -> FsWorker {
         use crate::devices::legacy::DummyIrqChip;
+        let queue_count = queues.len();
         let mut worker = FsWorker::new(FsWorkerConfig {
             queues,
-            queue_evts: (0..2)
+            queue_evts: (0..queue_count)
                 .map(|_| Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
                 .collect(),
             interrupt: InterruptTransport::new(DummyIrqChip::new().into(), "test".into()).unwrap(),
@@ -1059,6 +1066,91 @@ mod tests {
             .unwrap();
         assert_eq!(reply.error, 0);
         assert_eq!(reply.unique, 99);
+    }
+
+    #[test]
+    fn completion_wakes_only_an_armed_owner_and_ready_completion_never_parks() {
+        for armed in [false, true] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let chain = create_descriptor_chain(
+                &mem,
+                GuestAddress(0),
+                GuestAddress(0x2000),
+                vec![(DescriptorType::Readable, 8), (DescriptorType::Writable, 8)],
+                0,
+            )
+            .unwrap();
+            let mut pool = RequestPool::new(|_| 8, 2, 8, Default::default()).unwrap();
+            if armed {
+                assert_eq!(pool.wait_timeout(), -1);
+            }
+            pool.submit(Request {
+                queue: REQ_INDEX,
+                index: 0,
+                header: InHeader::default(),
+                buffers: OwnedDescriptorChain::new(chain).unwrap(),
+                profile_timestamp: None,
+            });
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while pool.completed.is_empty() {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            let wake = pool.wake.clone();
+            // Joining ensures the worker finished the send/disarm/wake sequence.
+            for worker in pool.threads.drain(..) {
+                // Disconnect both job inputs before joining.
+                pool.jobs.take();
+                pool.idle_jobs.take();
+                worker.join().unwrap();
+            }
+            assert_eq!(wake.read().is_ok(), armed);
+            assert_eq!(pool.wait_timeout(), 0);
+            assert_eq!(pool.completed.try_recv().unwrap().len, 8);
+            pool.in_flight -= 1;
+        }
+    }
+
+    #[test]
+    fn isolated_requests_reuse_the_primary_worker_without_losing_completion() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let caller = thread::current().id();
+        let mut pool = RequestPool::new(
+            move |_| {
+                assert_ne!(thread::current().id(), caller);
+                assert_eq!(thread::current().name(), Some("fs io 0"));
+                8
+            },
+            4,
+            8,
+            Default::default(),
+        )
+        .unwrap();
+        for index in 0..16 {
+            let chain = create_descriptor_chain(
+                &mem,
+                GuestAddress(index as u64 * 0x100),
+                GuestAddress(0x2000 + index as u64 * 0x100),
+                vec![(DescriptorType::Readable, 8), (DescriptorType::Writable, 8)],
+                0,
+            )
+            .unwrap();
+            pool.submit(Request {
+                queue: REQ_INDEX,
+                index,
+                header: InHeader::default(),
+                buffers: OwnedDescriptorChain::new(chain).unwrap(),
+                profile_timestamp: None,
+            });
+            let completed = pool
+                .completed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(completed.request.index, index);
+            assert_eq!(completed.len, 8);
+            pool.in_flight -= 1;
+        }
+        drop(pool);
     }
 
     #[test]

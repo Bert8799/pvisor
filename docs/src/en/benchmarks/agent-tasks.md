@@ -11,6 +11,12 @@
 | Independent guest kernel | Validate CLI compatibility and complete tool cost before choosing VM |
 | Remote API and managed elasticity | Evaluate clouds by repository synchronization, deployment and operations needs; matched performance and billing are unmeasured |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 A task includes environment preparation, model/tool interaction, verification, review/application and cleanup. Startup alone misses tool and result-handling costs; tool speed alone misses repeated workspace creation. A fixed tool plan removes inference and public-network variability, while a separate complete review workflow measures how the same edits reach the original workspace.

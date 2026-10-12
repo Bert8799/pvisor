@@ -10,7 +10,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub const WHITEOUT_PREFIX: &str = ".wh.";
 pub const OPAQUE_NAME: &str = ".wh..wh..opq";
@@ -245,9 +245,57 @@ pub struct OverlayCore {
     hard_link_sources: Mutex<HashMap<(u64, u64), PathBuf>>,
     preimage_dir: Option<PathBuf>,
     preimage_log: Option<Mutex<crate::preimage_log::PreimageLog>>,
+    fingerprint_flights: FingerprintFlights,
     // Read observations are published without fsync. Before the first upper
     // mutation, their file and directory are synced under this lock.
     preimage_lock: Mutex<BTreeSet<PathBuf>>,
+}
+
+#[derive(Debug, Default)]
+struct FingerprintFlights {
+    state: Mutex<FingerprintFlightState>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct FingerprintFlightState {
+    paths: BTreeSet<PathBuf>,
+    waiters: usize,
+}
+
+// This tracks captures in progress, not fingerprints or journal membership.
+// Its memory is bounded by simultaneous first observations and is released
+// on both capture and publication errors. No journal lock is held while waiting.
+struct FingerprintFlight<'a> {
+    flights: &'a FingerprintFlights,
+    path: &'a Path,
+}
+
+impl FingerprintFlights {
+    fn enter<'a>(&'a self, path: &'a Path) -> io::Result<FingerprintFlight<'a>> {
+        let poisoned = |_| io::Error::other("fingerprint admission lock poisoned");
+        let mut state = self.state.lock().map_err(poisoned)?;
+        while state.paths.contains(path) {
+            state.waiters += 1;
+            state = self.ready.wait(state).map_err(poisoned)?;
+            state.waiters -= 1;
+        }
+        state.paths.insert(path.to_path_buf());
+        Ok(FingerprintFlight {
+            flights: self,
+            path,
+        })
+    }
+}
+
+impl Drop for FingerprintFlight<'_> {
+    fn drop(&mut self) {
+        let mut state = self.flights.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.paths.remove(self.path);
+        if state.waiters != 0 {
+            self.flights.ready.notify_all();
+        }
+    }
 }
 
 /// Private file contents prepared without publishing an upper namespace entry.
@@ -1034,6 +1082,7 @@ impl OverlayCore {
             access: crate::FileAccessPolicy::default(),
             preimage_dir,
             preimage_log,
+            fingerprint_flights: FingerprintFlights::default(),
             preimage_lock: Mutex::new(BTreeSet::new()),
         };
         if initialize
@@ -1306,6 +1355,24 @@ impl OverlayCore {
                 return Ok(());
             }
             after_missing()?;
+            let _flight = if observed_absent {
+                None
+            } else {
+                Some(self.fingerprint_flights.enter(rel)?)
+            };
+            if _flight.is_some() {
+                let mut published = log
+                    .lock()
+                    .map_err(|_| io::Error::other("preimage log lock poisoned"))?;
+                // A same-Core predecessor may have published after our first
+                // check. The cheap hint avoids another flock on an uncontended
+                // first observation; a hit still refreshes/validates membership
+                // and promotes the actual winner, including external consume.
+                if published.may_contain(rel) && published.contains_or_promote(rel, durable)? {
+                    self.profile.add("coalesced_fingerprints", 1);
+                    return Ok(());
+                }
+            }
             let state = if observed_absent {
                 PathFingerprint::Absent
             } else {
@@ -1947,7 +2014,10 @@ impl OverlayCore {
         reject_symlink: bool,
     ) -> io::Result<ResolvedMetadata> {
         let _span = self.profile.span("observe_read");
-        if !self.layout.frozen_baseline && self.preimage_dir.is_some() {
+        if !self.layout.frozen_baseline
+            && self.preimage_dir.is_some()
+            && !self.read_observation_is_recorded(rel)
+        {
             let before = self.metadata_resolved(rel)?;
             if reject_symlink && before.metadata.file_type().is_symlink() {
                 return Err(error(libc::ELOOP));
@@ -1959,6 +2029,23 @@ impl OverlayCore {
             return Err(error(libc::ELOOP));
         }
         Ok(backing)
+    }
+
+    // An already published observation needs no new capture or pre-publication
+    // resolution. Always resolve the live merged path afterward. The local map
+    // is only a miss hint; a hit must refresh consumption and verify the log's
+    // named binding under its file lock. Errors take the original checked path
+    // so policy and journal failure precedence are preserved.
+    fn read_observation_is_recorded(&self, rel: &Path) -> bool {
+        if !self.stage_writable || self.require_visible(rel).is_err() {
+            return false;
+        }
+        self.preimage_log
+            .as_ref()
+            .and_then(|log| log.lock().ok())
+            .is_some_and(|mut log| {
+                log.may_contain(rel) && log.contains_or_promote(rel, false).unwrap_or(false)
+            })
     }
 
     fn metadata_resolved_with_parents(
@@ -2075,11 +2162,11 @@ impl OverlayCore {
         for component in parent.components() {
             current.push(component.as_os_str());
             let upper = self.upper_path(&current);
-            if exists(&upper) {
-                if !crate::backend::symlink_metadata(&upper)?.is_dir() {
-                    return Err(error(libc::ENOTDIR));
-                }
-                continue;
+            match crate::backend::symlink_metadata(&upper) {
+                Ok(metadata) if metadata.is_dir() => continue,
+                Ok(_) => return Err(error(libc::ENOTDIR)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
             let resolved = self.resolve(&current).ok_or_else(|| error(libc::ENOENT))?;
             let metadata = crate::backend::symlink_metadata(&resolved.path)?;
@@ -2134,7 +2221,9 @@ impl OverlayCore {
             {
                 continue;
             }
-            if let Some(copy) = self.prepare_copy_up(path, truncate, &mut directory)? {
+            if let Some(copy) =
+                self.prepare_copy_up(path, resolved, metadata, truncate, &mut directory)?
+            {
                 copies.push(copy);
             }
         }
@@ -2144,23 +2233,18 @@ impl OverlayCore {
     fn prepare_copy_up(
         &self,
         rel: &Path,
+        resolved: Resolved,
+        metadata: Metadata,
         truncate: bool,
         directory: &mut Option<Arc<CopyDirectory>>,
     ) -> io::Result<Option<PreparedCopyUp>> {
         let _span = self.profile.span("copy_up_prepare");
-        self.require_visible(rel)?;
-        Self::validate_rel(rel)?;
-        let Some(resolved) = self.resolve(rel) else {
-            return Ok(None);
-        };
-        if resolved.is_upper {
+        // The caller already validated/resolved this path and recorded its
+        // baseline. Reuse that request-local work; source identity is still
+        // checked after materialization, copying and before publication.
+        if self.copied_hard_link_metadata(rel)?.is_some() {
             return Ok(None);
         }
-        let metadata = self.metadata(rel)?;
-        if !metadata.is_file() || self.copied_hard_link_metadata(rel)?.is_some() {
-            return Ok(None);
-        }
-        self.record_preimage(rel)?;
         let links = crate::backend::link_count(&resolved.path, metadata.nlink())?;
         let attributes = crate::backend::attributes(&resolved.path)?;
         let skip_contents = truncate && links == 1;
@@ -3431,6 +3515,176 @@ mod tests {
     }
 
     #[test]
+    fn compact_concurrent_first_observations_hash_once_and_consumption_recaptures() {
+        use std::sync::Barrier;
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        let journal = temp.path().join("journal");
+        fs::create_dir(&lower).unwrap();
+        let bytes = vec![0x5a; 16 << 20];
+        fs::write(lower.join("file"), &bytes).unwrap();
+        let expected = fingerprint_at(&lower, Path::new("file")).unwrap();
+        let profile = crate::profile::Profile::enabled("first-observation-flight");
+        let core = OverlayCore::new_with_exclusions_and_preimages(
+            vec![lower.clone()],
+            temp.path().join("upper"),
+            None,
+            vec![],
+            Some(journal.clone()),
+        )
+        .unwrap()
+        .with_compact_preimages()
+        .unwrap()
+        .with_profile(profile.clone());
+        let barrier = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    core.observe_read(Path::new("file")).unwrap();
+                });
+            }
+        });
+        assert_eq!(load_preimages(&journal).unwrap()[0].state, expected);
+        assert_eq!(
+            profile.report().unwrap().measurements["fingerprinted_paths"].units,
+            1
+        );
+        assert_eq!(
+            profile.report().unwrap().measurements["fingerprint_bytes"].units,
+            bytes.len() as u64
+        );
+        assert!(
+            core.fingerprint_flights
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+        remove_preimages(&journal, &[PathBuf::from("file")]).unwrap();
+        fs::write(lower.join("file"), b"new generation").unwrap();
+        core.observe_read(Path::new("file")).unwrap();
+        let expected = fingerprint_at(&lower, Path::new("file")).unwrap();
+        assert_eq!(load_preimages(&journal).unwrap()[0].state, expected);
+        assert_eq!(
+            profile.report().unwrap().measurements["fingerprinted_paths"].units,
+            2
+        );
+        assert!(
+            core.fingerprint_flights
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_compact_fingerprint_releases_its_path_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        let journal = temp.path().join("journal");
+        fs::create_dir_all(lower.join("dir")).unwrap();
+        fs::write(lower.join("dir/file"), b"original").unwrap();
+        let core = OverlayCore::new_with_exclusions_and_preimages(
+            vec![lower.clone()],
+            temp.path().join("upper"),
+            None,
+            vec![],
+            Some(journal.clone()),
+        )
+        .unwrap()
+        .with_compact_preimages()
+        .unwrap();
+        // A malformed saved identity fails fingerprinting after admission,
+        // without relying on root-sensitive chmod permission failures.
+        let identity = OsStr::new("user.containers.override_stat");
+        match sys::set_xattr(&lower.join("dir/file"), identity, b"invalid", 0) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => return,
+            Err(error) => panic!("cannot install malformed identity: {error}"),
+        }
+        let error = core
+            .capture_preimage(Path::new("dir/file"), false)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(
+            core.fingerprint_flights
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+        assert!(load_preimages(&journal).unwrap().is_empty());
+        sys::remove_xattr(&lower.join("dir/file"), identity).unwrap();
+        core.observe_read(Path::new("dir/file")).unwrap();
+        assert_eq!(load_preimages(&journal).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compact_same_path_wait_does_not_block_an_unrelated_observation() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        fs::write(lower.join("file"), b"shared").unwrap();
+        fs::write(lower.join("other"), b"unrelated").unwrap();
+        let journal = temp.path().join("journal");
+        let core = OverlayCore::new_with_exclusions_and_preimages(
+            vec![lower],
+            temp.path().join("upper"),
+            None,
+            vec![],
+            Some(journal.clone()),
+        )
+        .unwrap()
+        .with_compact_preimages()
+        .unwrap();
+        let capture = core.fingerprint_flights.enter(Path::new("file")).unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| core.observe_read(Path::new("file")));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let registered = loop {
+                if core.fingerprint_flights.state.lock().unwrap().waiters != 0 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            let (sent, received) = mpsc::channel();
+            let shared = &core;
+            scope.spawn(move || {
+                sent.send(shared.observe_read(Path::new("other"))).unwrap();
+            });
+            let independent = received.recv_timeout(Duration::from_secs(2));
+            drop(capture);
+            waiting.join().unwrap().unwrap();
+            assert!(
+                registered,
+                "same-path observer did not wait for capture admission"
+            );
+            independent
+                .expect("pending fingerprint blocked an unrelated path")
+                .unwrap();
+        });
+        assert_eq!(load_preimages(&journal).unwrap().len(), 2);
+        assert!(
+            core.fingerprint_flights
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn one_core_can_publish_and_sync_other_observations_during_capture() {
         use super::*;
         use std::sync::mpsc;
@@ -4520,6 +4774,92 @@ mod backing_resolution_tests {
                 .unwrap()
                 .len(),
             15
+        );
+    }
+
+    #[test]
+    fn denied_repeated_read_does_not_repair_a_journal_tail() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        fs::write(lower.join("file"), b"original").unwrap();
+        let journal = temp.path().join("journal");
+        let core = OverlayCore::new_with_exclusions_and_preimages(
+            vec![lower],
+            temp.path().join("upper"),
+            None,
+            vec![],
+            Some(journal.clone()),
+        )
+        .unwrap()
+        .with_compact_preimages()
+        .unwrap();
+        core.prepare_file_read(Path::new("file")).unwrap();
+        let path = journal.join(PREIMAGE_LOG_NAME);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"PVR")
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let core = core.with_access_policy(
+            &crate::FileAccessPolicy::new(vec!["file".into()], vec![]).unwrap(),
+        );
+        assert_eq!(
+            core.prepare_file_read(Path::new("file"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn repeated_compact_read_resolves_once_but_refreshes_external_consumption() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        fs::create_dir_all(lower.join("a/b")).unwrap();
+        let rel = Path::new("a/b/file");
+        fs::write(lower.join(rel), b"original").unwrap();
+        let journal = temp.path().join("journal");
+        let core = OverlayCore::new_with_exclusions_and_preimages(
+            vec![lower.clone()],
+            temp.path().join("upper"),
+            None,
+            vec![],
+            Some(journal.clone()),
+        )
+        .unwrap()
+        .with_compact_preimages()
+        .unwrap()
+        .with_profile(crate::profile::Profile::enabled("repeated-read"));
+        core.prepare_file_read(rel).unwrap();
+        let original = load_preimages(&journal).unwrap()[0].state.clone();
+        let resolves = core.profile_report().unwrap().measurements["resolve"].calls;
+        fs::write(lower.join(rel), b"fresh live bytes").unwrap();
+        assert_eq!(core.prepare_file_read(rel).unwrap().metadata.len(), 16);
+        assert_eq!(
+            core.profile_report().unwrap().measurements["resolve"].calls,
+            resolves + 1
+        );
+        assert!(
+            load_preimages(&journal).unwrap()[0]
+                .state
+                .matches(&original)
+        );
+        // A different owner consumes the old generation. Local membership must
+        // not suppress a new observation, even though the hint still says hit.
+        remove_preimages(&journal, &[rel.to_path_buf()]).unwrap();
+        core.prepare_file_read(rel).unwrap();
+        let current = fingerprint_at(&lower, rel).unwrap();
+        assert!(load_preimages(&journal).unwrap()[0].state.matches(&current));
+        fs::remove_file(lower.join(rel)).unwrap();
+        std::os::unix::fs::symlink("missing", lower.join(rel)).unwrap();
+        assert_eq!(
+            core.prepare_file_read(rel).unwrap_err().raw_os_error(),
+            Some(libc::ELOOP)
         );
     }
 

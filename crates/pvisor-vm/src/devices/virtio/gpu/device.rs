@@ -234,4 +234,8 @@ impl VirtioDevice for Gpu {
         debug!("virtio_gpu: GET_shm_region");
         self.shm_region.as_ref()
     }
+
+    fn shm_region_id(&self) -> u32 {
+        u32::from(super::protocol::VIRTIO_GPU_SHM_ID_HOST_VISIBLE)
+    }
 }

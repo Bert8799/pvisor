@@ -8,13 +8,8 @@ use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
 use std::path::Path;
 
 fn supported(fs: &PassthroughFs) -> io::Result<()> {
-    if fs.writeback.load(Ordering::Relaxed)
-        || fs.cfg.export_table.is_some()
-        || fs.cfg.proc_sfd_rawfd.is_some()
-    {
-        return Err(snapshot::unsupported(
-            "filesystem writeback or exported descriptors",
-        ));
+    if fs.cfg.export_table.is_some() || fs.cfg.proc_sfd_rawfd.is_some() {
+        return Err(snapshot::unsupported("filesystem exported descriptors"));
     }
     Ok(())
 }
@@ -166,6 +161,7 @@ pub(super) fn capture(fs: &PassthroughFs) -> io::Result<FsSnapshot> {
         handles,
         next_handle: fs.next_handle.load(Ordering::Relaxed),
         submounts: fs.announce_submounts.load(Ordering::Relaxed),
+        writeback: fs.writeback.load(Ordering::Relaxed),
     }))
 }
 
@@ -181,6 +177,7 @@ pub(super) fn restore(fs: &PassthroughFs, state: &FsSnapshot) -> io::Result<()> 
         || fs.cfg.attr_timeout != state.attr_timeout
         || fs.cfg.cache_policy != state.cache_policy
         || fs.cfg.xattr != state.xattr
+        || (state.writeback && !fs.cfg.writeback)
     {
         return Err(snapshot::invalid("filesystem binding mismatch"));
     }
@@ -262,6 +259,9 @@ pub(super) fn restore(fs: &PassthroughFs, state: &FsSnapshot) -> io::Result<()> 
             || handles.contains_key(&saved.handle)
             || saved.flags & !allowed != 0
             || saved.flags & libc::O_ACCMODE == libc::O_ACCMODE
+            || (state.writeback
+                && (saved.flags & libc::O_APPEND != 0
+                    || saved.flags & libc::O_ACCMODE == libc::O_WRONLY))
             || saved.offset > i64::MAX as u64
         {
             return Err(snapshot::invalid("invalid handle flags/id/offset"));
@@ -324,5 +324,6 @@ pub(super) fn restore(fs: &PassthroughFs, state: &FsSnapshot) -> io::Result<()> 
     fs.next_handle.store(state.next_handle, Ordering::Relaxed);
     fs.announce_submounts
         .store(state.submounts, Ordering::Relaxed);
+    fs.writeback.store(state.writeback, Ordering::Relaxed);
     Ok(())
 }

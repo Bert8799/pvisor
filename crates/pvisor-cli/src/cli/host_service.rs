@@ -29,7 +29,7 @@ use std::os::{
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Seek},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -161,7 +161,40 @@ struct Executable {
     inode: u64,
     digest: String,
 }
-fn hash_file(mut file: File) -> anyhow::Result<String> {
+// Only metadata sampled around a successful content hash is reusable. In
+// particular, dev/ino alone misses in-place builds and preserved mtimes.
+#[derive(Debug, PartialEq, Eq)]
+struct ImageIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+impl ImageIdentity {
+    fn of(m: &fs::Metadata) -> Self {
+        Self {
+            device: m.dev(),
+            inode: m.ino(),
+            size: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+        }
+    }
+}
+struct RunningImage {
+    digest: String,
+    identity: ImageIdentity,
+    // Pin the verified inode for the lifetime of the cached identity.
+    _file: File,
+}
+fn hash_file(mut file: impl Read) -> anyhow::Result<String> {
     let mut hash = blake3::Hasher::new();
     let mut buffer = [0; 64 * 1024];
     loop {
@@ -173,10 +206,10 @@ fn hash_file(mut file: File) -> anyhow::Result<String> {
     }
     Ok(hash.finalize().to_hex().to_string())
 }
-fn running_digest() -> anyhow::Result<String> {
-    static DIGEST: OnceLock<String> = OnceLock::new();
-    if let Some(digest) = DIGEST.get() {
-        return Ok(digest.clone());
+fn running_image() -> anyhow::Result<&'static RunningImage> {
+    static IMAGE: OnceLock<RunningImage> = OnceLock::new();
+    if let Some(image) = IMAGE.get() {
+        return Ok(image);
     }
     #[cfg(target_os = "linux")]
     let file = File::open("/proc/self/exe")?;
@@ -188,8 +221,38 @@ fn running_digest() -> anyhow::Result<String> {
         super::host_image::attest(&mut file)?;
         file
     };
-    let digest = hash_file(file)?;
-    let _ = DIGEST.set(digest.clone());
+    let mut file = file;
+    let identity = ImageIdentity::of(&file.metadata()?);
+    let digest = hash_file(&mut file)?;
+    ensure!(
+        identity == ImageIdentity::of(&file.metadata()?),
+        "running executable changed during content verification"
+    );
+    let _ = IMAGE.set(RunningImage {
+        digest,
+        identity,
+        _file: file,
+    });
+    Ok(IMAGE.get().expect("running image initialized"))
+}
+fn running_digest() -> anyhow::Result<String> {
+    Ok(running_image()?.digest.clone())
+}
+fn verified_digest(
+    file: &mut File,
+    image: &RunningImage,
+    before: ImageIdentity,
+) -> anyhow::Result<String> {
+    let digest = if before == image.identity {
+        image.digest.clone()
+    } else {
+        file.rewind()?;
+        hash_file(&mut *file)?
+    };
+    ensure!(
+        before == ImageIdentity::of(&file.metadata()?),
+        "worker executable changed during content verification"
+    );
     Ok(digest)
 }
 fn current_executable() -> anyhow::Result<Executable> {
@@ -217,7 +280,7 @@ fn validate_executable(executable: &Executable) -> anyhow::Result<()> {
             parent.display()
         );
     }
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&executable.path)?;
@@ -234,7 +297,7 @@ fn validate_executable(executable: &Executable) -> anyhow::Result<()> {
         "worker executable ownership/identity mismatch"
     );
     ensure!(
-        hash_file(file)? == executable.digest,
+        verified_digest(&mut file, running_image()?, ImageIdentity::of(&m))? == executable.digest,
         "worker executable content changed, including an in-place build"
     );
     Ok(())
@@ -1040,7 +1103,9 @@ fn serve(listener: UnixListener, dir: PathBuf, g: Generation) -> anyhow::Result<
                 }
                 let mut response = loop {
                     tree.refresh()?;
-                    if let Ok(result) = rx.try_recv() {
+                    // A worker event wakes this wait immediately. Cancellation
+                    // and descendant discovery retain a bounded check interval.
+                    if let Ok(result) = rx.recv_timeout(Duration::from_millis(10)) {
                         break match result {
                             Ok(WorkerEvent::Complete { response }) => response,
                             Ok(WorkerEvent::Finalizing) => {
@@ -1100,15 +1165,10 @@ fn serve(listener: UnixListener, dir: PathBuf, g: Generation) -> anyhow::Result<
                                 "request teardown exceeded its cleanup deadline; effects may be ambiguous; not retried".into())
                         };
                     }
-                    std::thread::sleep(Duration::from_millis(10));
                 };
                 tree.cleanup(false)?;
                 let _ = write_frame(&mut authority, &WorkerInstruction::Finish);
-                let deadline = Instant::now() + GRACE;
-                while !tree.root_exited() && Instant::now() < deadline {
-                    tree.refresh()?;
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+                tree.wait_root(GRACE)?;
                 tree.cleanup(true)?;
                 if let Some(sig) = cancelled {
                     response.result = Ok(Completion {
@@ -1169,6 +1229,9 @@ impl FrontWorker {
 }
 impl Drop for FrontWorker {
     fn drop(&mut self) {
+        if self.child.is_none() {
+            return; // finish() already completed cleanup and reaped the Child.
+        }
         let cleanup = self.tree.cleanup(true);
         if let Some(mut child) = self.child.take() {
             if cleanup.is_ok() && self.tree.root_exited() {
@@ -1183,7 +1246,11 @@ impl Drop for FrontWorker {
 }
 pub(crate) fn call(mut command: JobCommand) -> anyhow::Result<i32> {
     // Install and latch signals before autostart, any FD transfer, and admission.
-    let rt = tokio::runtime::Runtime::new()?;
+    // The frontend only latches signals; execution has its own worker runtime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
     let signal = signals(&rt)?;
     let target = command.pin_target()?;
     let interactive = command.inherits_terminal_input()?;
@@ -1210,7 +1277,8 @@ pub(crate) fn call(mut command: JobCommand) -> anyhow::Result<i32> {
     }
     let request_id = uuid::Uuid::new_v4().to_string();
     let executable = current_executable()?;
-    validate_executable(&executable)?;
+    // The service validates before issuing a ticket; this frontend validates
+    // again immediately before spawn, when pathname authority is needed.
     let request = Request {
         version: AGENTCTL_HOST_VERSION,
         request_id: request_id.clone(),
@@ -1356,6 +1424,64 @@ pub(crate) fn call(mut command: JobCommand) -> anyhow::Result<i32> {
 mod tests {
     use super::*;
     use pvisor_core::host_protocol::AGENTCTL_HOST_MAX_FRAME_BYTES;
+
+    #[test]
+    fn verified_image_reuses_hash_but_detects_in_place_and_inode_changes() {
+        use std::io::Seek;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        fs::write(&path, b"before").unwrap();
+        let file = File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let image = RunningImage {
+            digest: hash_file(File::open(&path).unwrap()).unwrap(),
+            identity: ImageIdentity::of(&metadata),
+            _file: file,
+        };
+        let mut unchanged = File::open(&path).unwrap();
+        let before = ImageIdentity::of(&unchanged.metadata().unwrap());
+        assert_eq!(
+            verified_digest(&mut unchanged, &image, before).unwrap(),
+            image.digest
+        );
+        assert_eq!(
+            unchanged.stream_position().unwrap(),
+            0,
+            "cache hit read file contents"
+        );
+
+        // Same inode, size and restored mtime: ctime must still invalidate the
+        // verified identity. Do not trust a timestamp/size-only cache.
+        fs::write(&path, b"after!").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        let mut changed = File::open(&path).unwrap();
+        assert_eq!(changed.metadata().unwrap().ino(), image.identity.inode);
+        let before = ImageIdentity::of(&changed.metadata().unwrap());
+        assert_ne!(
+            verified_digest(&mut changed, &image, before).unwrap(),
+            image.digest
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"before").unwrap();
+        let mut replaced = File::open(&path).unwrap();
+        assert_ne!(replaced.metadata().unwrap().ino(), image.identity.inode);
+        let before = ImageIdentity::of(&replaced.metadata().unwrap());
+        assert_eq!(
+            verified_digest(&mut replaced, &image, before).unwrap(),
+            image.digest
+        );
+        assert_eq!(
+            replaced.stream_position().unwrap(),
+            6,
+            "replacement was not hashed"
+        );
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_signal_is_reported_before_hung_finalization() {

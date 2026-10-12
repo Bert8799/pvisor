@@ -101,7 +101,7 @@ controls, with platform-dependent container/VM support. See [capabilities and ev
 - [Security](https://deeplink-org.github.io/pvisor/en/security/) — threat model, executor boundaries, and known limitations
 - [Benchmarks](https://deeplink-org.github.io/pvisor/en/benchmarks/) — methods and current data
 - [Design and research](https://deeplink-org.github.io/pvisor/en/design/) — architecture, isolation, and research directions
-- [Experimental features](experimental/README.md) — proposed capabilities, implementation stages, and validation gates
+- [Experimental features](docs/src/en/design/experimental/index.md) — proposed capabilities, implementation stages, and validation gates
 - [Community](https://deeplink-org.github.io/pvisor/en/community/) — contributing, testing, and roadmap
 - [中文文档](https://deeplink-org.github.io/pvisor/zh/start/)
 
@@ -126,6 +126,11 @@ The remaining crates are `pvisor-core`, `pvisor-journal`, `pvisor-gateway`,
 [engineering guide](docs/src/en/community/development.md) for source ownership,
 dependencies and targeted tests (`just test pvisor` for the runtime,
 `just test cli` for application frontends).
+
+Release builds optimize the virtio-fs adapter (`pvisor-vm`) and shared filesystem
+mechanics (`pvisor-overlay-core`) for execution speed. Other crates retain the
+distribution profile's size optimization; the `performance` profile optimizes
+the complete application for speed.
 
 ## Guest firmware
 

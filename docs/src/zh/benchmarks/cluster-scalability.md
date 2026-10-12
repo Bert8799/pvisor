@@ -10,6 +10,12 @@
 | 规划本机执行或停驻状态 | 使用[容量](density.md)和[VM 内存](vm-memory/index.md)，不使用 Worker 曲线 |
 | 规划 daemon 或比较调度系统 | 未测；不能沿用旧吞吐或历史成本数字 |
 
+<!-- measurement-status:start -->
+
+本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 容量决策需要与实际部署实现相匹配的证据。Controller/Worker 退役后，实验对象已不再存在，把旧测量改名会掩盖这一边界。就绪、有效任务完成和可恢复停驻状态回答不同问题。

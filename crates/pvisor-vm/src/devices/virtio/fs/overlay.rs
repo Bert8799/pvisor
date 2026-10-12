@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use pvisor_overlay_core::{
@@ -86,6 +86,112 @@ struct FileHandle {
     relative_path: Vec<u8>,
 }
 
+/// The handle map and admission state jointly protect descriptor acquisition.
+/// Namespace remains serialized, but a fence closes only affected handle IDs.
+#[derive(Default)]
+struct IoState {
+    active: HashMap<u64, usize>,
+    blocked: HashMap<u64, usize>,
+    global: usize,
+}
+
+#[derive(Default)]
+struct IoActivity {
+    state: Mutex<IoState>,
+    ready: Condvar,
+}
+
+struct IoFence {
+    activity: Arc<IoActivity>,
+    handles: Vec<u64>,
+    global: bool,
+}
+
+impl IoActivity {
+    fn fence(self: &Arc<Self>, handles: Vec<u64>, global: bool) -> IoFence {
+        let fence = IoFence {
+            activity: self.clone(),
+            handles,
+            global,
+        };
+        if !global && fence.handles.is_empty() {
+            return fence;
+        }
+        let mut state = self.state.lock().unwrap();
+        if global {
+            state.global += 1;
+        }
+        for id in &fence.handles {
+            *state.blocked.entry(*id).or_default() += 1;
+        }
+        fence
+    }
+}
+
+impl IoFence {
+    fn drain(&self) {
+        if !self.global && self.handles.is_empty() {
+            return;
+        }
+        let mut state = self.activity.state.lock().unwrap();
+        while if self.global {
+            !state.active.is_empty()
+        } else {
+            self.handles.iter().any(|id| state.active.contains_key(id))
+        } {
+            state = self.activity.ready.wait(state).unwrap();
+        }
+    }
+}
+
+impl Drop for IoFence {
+    fn drop(&mut self) {
+        if !self.global && self.handles.is_empty() {
+            return;
+        }
+        let mut state = self.activity.state.lock().unwrap();
+        if self.global {
+            state.global -= 1;
+        }
+        for id in &self.handles {
+            let count = state.blocked.get_mut(id).expect("missing I/O fence");
+            *count -= 1;
+            if *count == 0 {
+                state.blocked.remove(id);
+            }
+        }
+        self.activity.ready.notify_all();
+    }
+}
+
+struct FileIoLease {
+    id: u64,
+    // Native descriptor ownership outlives removal from the backing map.
+    native: passthrough::HandleLease,
+    handle: Arc<FileHandle>,
+    activity: Arc<IoActivity>,
+}
+
+impl Drop for FileIoLease {
+    fn drop(&mut self) {
+        let mut state = self.activity.state.lock().unwrap();
+        let count = state
+            .active
+            .get_mut(&self.id)
+            .expect("missing I/O admission");
+        *count -= 1;
+        if *count == 0 {
+            state.active.remove(&self.id);
+            // Only a global drain or a fence on this handle can be waiting
+            // for its count to reach zero. Ordinary uncontended I/O neither
+            // opens admission nor needs to wake unrelated fenced handles.
+            if state.global != 0 || state.blocked.contains_key(&self.id) {
+                self.activity.ready.notify_all();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(
     any(target_os = "macos", target_os = "linux"),
@@ -111,7 +217,10 @@ struct DirectoryItem {
     serde(tag = "kind", content = "state", deny_unknown_fields)
 )]
 enum Handle {
-    File(FileHandle),
+    // Immutable open metadata is shared by descriptor leases. Cloning a lease
+    // must not allocate and copy the saved path for every WRITE/FLUSH/FSYNC.
+    // Arc serializes transparently, preserving the persisted handle format.
+    File(Arc<FileHandle>),
     Directory(Arc<Vec<DirectoryItem>>),
     // Keep the old Directory variant for snapshots with materialized entries.
     // New handles defer metadata/inode work until the caller consumes a page.
@@ -148,6 +257,13 @@ pub struct OverlaySnapshot {
 }
 
 impl OverlaySnapshot {
+    pub(super) fn validate_writeback(&self, enabled: bool) -> io::Result<()> {
+        for layer in &self.layers {
+            layer.validate_writeback(enabled)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn verify_frozen_backing(&self) -> io::Result<()> {
         for layer in &self.layers {
             layer.verify_frozen_backing()?;
@@ -528,6 +644,16 @@ struct CachedDirectory {
     used: u64,
 }
 
+enum BackingLookup {
+    Native(Entry),
+    #[cfg(target_os = "linux")]
+    RegularAttributes {
+        attr: bindings::stat64,
+        attr_timeout: Duration,
+        entry_timeout: Duration,
+    },
+}
+
 #[derive(Default)]
 struct DirectoryCache {
     entries: HashMap<(usize, PathBuf), CachedDirectory>,
@@ -536,11 +662,14 @@ struct DirectoryCache {
 
 pub struct OverlayFs {
     profile: pvisor_overlay_core::profile::Profile,
-    // Readers may overlap, but guest namespace changes, copy-up and handle
-    // release remain exclusive. Hold the guard through backing I/O: cloning
-    // numeric handle IDs alone would not pin the native handle against release.
+    // Namespace and metadata remain serialized. Descriptor I/O admission
+    // uses the handle map and scoped fences without acquiring this guard.
     operation_lock: RwLock<()>,
+    io_activity: Arc<IoActivity>,
     core: FilesystemService,
+    // New INITs use the caller's current preference. Restoring an already
+    // negotiated session must not silently change its saved writeback mode.
+    new_session_writeback: bool,
     virtual_metadata: bool,
     snapshot_config: Config,
     roots: Vec<PathBuf>,
@@ -572,12 +701,71 @@ impl OverlayFs {
 
     fn write_operation(&self) -> io::Result<std::sync::RwLockWriteGuard<'_, ()>> {
         let _wait = self.profile.span("operation_write_lock_wait");
-        self.operation_lock
+        let operation = self
+            .operation_lock
             .write()
-            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+        Ok(operation)
+    }
+
+    // Caller holds the exclusive operation guard, so admission and handle
+    // mappings cannot change while selecting and draining affected objects.
+    fn fence_paths(&self, paths: &[&Path]) -> IoFence {
+        let handles = self.handles.lock().unwrap();
+        if handles.is_empty() {
+            return self.io_activity.fence(Vec::new(), false);
+        }
+        let nodes = self.nodes.lock().unwrap();
+        let mut overlay_objects = BTreeSet::new();
+        let mut native_objects = BTreeSet::new();
+        for handle in handles.values() {
+            if let Handle::File(h) = handle {
+                // The namespace path can have moved while an opened backing
+                // descriptor continues to own its original physical generation.
+                if paths.iter().any(|path| {
+                    Path::new(OsStr::from_bytes(&h.relative_path)).starts_with(path)
+                        || nodes
+                            .by_inode
+                            .get(&h.overlay_inode)
+                            .is_some_and(|p| p.starts_with(path))
+                }) {
+                    overlay_objects.insert(h.overlay_inode);
+                    native_objects.insert((h.layer.0, h.inode));
+                }
+            }
+        }
+        drop(nodes);
+        let ids: Vec<_> = handles
+            .iter()
+            .filter_map(|(id, handle)| match handle {
+                Handle::File(h)
+                    if overlay_objects.contains(&h.overlay_inode)
+                        || native_objects.contains(&(h.layer.0, h.inode)) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        // Mark blocked under the handle-map lock: an I/O admission cannot
+        // slip between selecting the IDs and closing those IDs to new leases.
+        let fence = self.io_activity.fence(ids, false);
+        drop(handles);
+        fence.drain();
+        fence
     }
 
     fn build(cfg: Config, inode_alloc: Arc<InodeAllocator>, restoring: bool) -> io::Result<Self> {
+        let writeback_setting = std::env::var("PVISOR_VM_FS_WRITEBACK").ok();
+        Self::build_with_writeback(cfg, inode_alloc, restoring, writeback_setting.as_deref())
+    }
+
+    fn build_with_writeback(
+        cfg: Config,
+        inode_alloc: Arc<InodeAllocator>,
+        restoring: bool,
+        writeback_setting: Option<&str>,
+    ) -> io::Result<Self> {
         if cfg.lower_dirs.is_empty() || (cfg.baseline_lower.is_some() && cfg.apply_target.is_none())
         {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -614,6 +802,11 @@ impl OverlayFs {
         let mut roots = Vec::with_capacity(lowers.len() + 1);
         roots.push(upper);
         roots.extend(lowers);
+        let new_session_writeback = writeback_setting.is_some_and(|value| value != "0");
+        // Unset allows old enabled snapshots to restore, while explicit "0"
+        // retains the existing refusal. Native restore still checks every
+        // saved mode, backing identity and handle before installing the state.
+        let restore_capability = writeback_setting.map_or(restoring, |value| value != "0");
         let layers = roots
             .iter()
             .map(|root| {
@@ -623,6 +816,9 @@ impl OverlayFs {
                         semantics: cfg.semantics,
                         attr_timeout: TTL,
                         entry_timeout: TTL,
+                        // The merged stage is guest-owned. Writeback READs on
+                        // O_WRONLY and guest-managed append use native support.
+                        writeback: restore_capability,
                         ..Default::default()
                     },
                     inode_alloc.clone(),
@@ -649,7 +845,9 @@ impl OverlayFs {
             virtual_metadata,
             profile: pvisor_overlay_core::profile::Profile::from_env("virtio-fs-overlay"),
             operation_lock: RwLock::new(()),
+            io_activity: Arc::new(IoActivity::default()),
             core,
+            new_session_writeback,
             snapshot_config: cfg,
             roots,
             layers,
@@ -826,6 +1024,21 @@ impl OverlayFs {
         ctx: Context,
         parents: &[BackingIdentity],
     ) -> io::Result<Entry> {
+        match self.inner_lookup_with_parents(layer, path, ctx, parents, false)? {
+            BackingLookup::Native(entry) => Ok(entry),
+            #[cfg(target_os = "linux")]
+            BackingLookup::RegularAttributes { .. } => Err(io::Error::from_raw_os_error(libc::EIO)),
+        }
+    }
+
+    fn inner_lookup_with_parents(
+        &self,
+        layer: Layer,
+        path: &Path,
+        ctx: Context,
+        parents: &[BackingIdentity],
+        reply_attributes: bool,
+    ) -> io::Result<BackingLookup> {
         let _span = self.profile.span("inner_inode");
         let fs = &self.layers[layer.0];
         let mut inode = fuse::ROOT_ID;
@@ -833,6 +1046,10 @@ impl OverlayFs {
         let mut held_directory = None;
         let mut result = None;
         let mut prefix = PathBuf::new();
+        #[cfg(not(target_os = "linux"))]
+        let _ = reply_attributes;
+        #[cfg(target_os = "linux")]
+        let components = path.components().count();
         let cacheable = !parents.is_empty()
             && parents.len() + 1 == path.components().count()
             && parents
@@ -878,6 +1095,33 @@ impl OverlayFs {
                 self.profile.add("directory_cache_misses", 1);
             }
             let name = CString::new(component.as_os_str().as_bytes())?;
+            #[cfg(target_os = "linux")]
+            if reply_attributes && index + 1 == components {
+                let attributes = {
+                    let _span = self.profile.span("backing_regular_attributes");
+                    fs.regular_lookup_attributes(inode, &name)
+                };
+                match attributes {
+                    Ok(Some((attr, attr_timeout, entry_timeout))) => {
+                        if temporary_reference {
+                            fs.forget(ctx, inode, 1);
+                        }
+                        drop(held_directory);
+                        return Ok(BackingLookup::RegularAttributes {
+                            attr,
+                            attr_timeout,
+                            entry_timeout,
+                        });
+                    }
+                    Ok(None) => {} // Directory/symlink/replacement needs native lookup.
+                    Err(error) => {
+                        if temporary_reference {
+                            fs.forget(ctx, inode, 1);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             let entry = {
                 let _span = self.profile.span("backing_lookup");
                 fs.lookup(ctx, inode, &name)
@@ -911,17 +1155,17 @@ impl OverlayFs {
         }
         drop(held_directory);
         if let Some(entry) = result {
-            return Ok(entry);
+            return Ok(BackingLookup::Native(entry));
         }
         let (attr, timeout) = fs.getattr(ctx, fuse::ROOT_ID, None)?;
-        Ok(Entry {
+        Ok(BackingLookup::Native(Entry {
             inode: fuse::ROOT_ID,
             generation: 0,
             attr,
             attr_flags: 0,
             attr_timeout: timeout,
             entry_timeout: TTL,
-        })
+        }))
     }
 
     fn inner_inode(&self, layer: Layer, path: &Path, ctx: Context) -> io::Result<u64> {
@@ -929,6 +1173,7 @@ impl OverlayFs {
     }
 
     fn observed_inner(&self, ctx: Context, path: &Path) -> io::Result<(Layer, u64)> {
+        let _io = self.fence_paths(&[path]);
         let backing = self
             .core
             .observe_read_for_backing_lookup(path)
@@ -947,10 +1192,36 @@ impl OverlayFs {
     ) -> io::Result<Entry> {
         let _span = self.profile.span("entry");
         let layer = Layer(backing.entry.layer);
-        let mut entry = self.inner_entry_with_parents(layer, path, ctx, &backing.parents)?;
-        if entry.inode != fuse::ROOT_ID {
-            self.layers[layer.0].forget(ctx, entry.inode, 1);
-        }
+        // Core still performs every namespace, alias and policy check. Its
+        // path metadata is only a type hint: attributes must come from the
+        // native parent's pinned FD, including after a host root replacement.
+        let mut entry = match self.inner_lookup_with_parents(
+            layer,
+            path,
+            ctx,
+            &backing.parents,
+            backing.entry.metadata.is_file(),
+        )? {
+            BackingLookup::Native(entry) => {
+                if entry.inode != fuse::ROOT_ID {
+                    self.layers[layer.0].forget(ctx, entry.inode, 1);
+                }
+                entry
+            }
+            #[cfg(target_os = "linux")]
+            BackingLookup::RegularAttributes {
+                attr,
+                attr_timeout,
+                entry_timeout,
+            } => Entry {
+                inode,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout,
+                entry_timeout,
+            },
+        };
         self.backing_attributes(&backing.entry.resolved.path, &mut entry.attr)?;
         entry.inode = inode;
         entry.attr.st_ino = inode as _;
@@ -966,7 +1237,8 @@ impl OverlayFs {
     }
 
     fn backing_attributes(&self, path: &Path, attr: &mut bindings::stat64) -> io::Result<()> {
-        if let Some(remote) = backend::attributes(path).map_err(linux_error)? {
+        let remote = backend::attributes(path).map_err(linux_error)?;
+        if let Some(remote) = &remote {
             attr.st_mode = (remote.kind.mode() | u32::from(remote.perm)) as _;
             attr.st_uid = remote.uid;
             attr.st_gid = remote.gid;
@@ -985,7 +1257,7 @@ impl OverlayFs {
             attr.st_ctime_nsec = nsec as _;
         }
         #[cfg(target_os = "linux")]
-        if self.virtual_metadata && backend::attributes(path).map_err(linux_error)?.is_none() {
+        if self.virtual_metadata && remote.is_none() {
             // Copy-up retains the source's virtual ownership when an unprivileged
             // host cannot chown the native upper. Native mode/size/times stay live.
             if let Ok(bytes) = pvisor_overlay_core::sys::get_xattr(
@@ -1013,6 +1285,7 @@ impl OverlayFs {
     }
 
     fn writable_inner(&self, ctx: Context, path: &Path) -> io::Result<u64> {
+        let _io = self.fence_paths(&[path]);
         // OverlayCore reports host errno; passthrough already reports Linux
         // errno. Convert only at the core boundary, never the whole request.
         self.core.copy_up(path).map_err(linux_error)?;
@@ -1049,13 +1322,38 @@ impl OverlayFs {
         id: u64,
         f: impl FnOnce(&PassthroughFs, &FileHandle) -> io::Result<T>,
     ) -> io::Result<T> {
-        // Every caller holds an operation guard, so release cannot remove the
-        // backing handle while this small map lookup is followed by I/O.
-        let handle = match self.handles.lock().unwrap().get(&id) {
-            Some(Handle::File(handle)) => handle.clone(),
-            _ => return Err(io::Error::from_raw_os_error(libc::EBADF)),
-        };
-        f(&self.layers[handle.layer.0], &handle)
+        // RELEASE shares the namespace read guard with metadata queries.
+        // Admit the whole callback so it cannot lose its native mapping while
+        // GETATTR or LSEEK is still using the opened object.
+        let lease = self.file_io_lease(id)?;
+        f(&self.layers[lease.handle.layer.0], &lease.handle)
+    }
+
+    fn file_io_lease(&self, id: u64) -> io::Result<FileIoLease> {
+        loop {
+            let handles = self.handles.lock().unwrap();
+            let handle = match handles.get(&id) {
+                Some(Handle::File(handle)) => handle.clone(),
+                _ => return Err(io::Error::from_raw_os_error(libc::EBADF)),
+            };
+            let mut state = self.io_activity.state.lock().unwrap();
+            if state.global != 0 || state.blocked.contains_key(&id) {
+                drop(handles);
+                // Wait without the operation or handle-map lock; after the
+                // fence opens, revalidate the handle and its native mapping.
+                state = self.io_activity.ready.wait(state).unwrap();
+                drop(state);
+                continue;
+            }
+            let native = self.layers[handle.layer.0].lease_handle(handle.inode, handle.handle)?;
+            *state.active.entry(id).or_default() += 1;
+            return Ok(FileIoLease {
+                id,
+                native,
+                handle,
+                activity: self.io_activity.clone(),
+            });
+        }
     }
 
     fn dtype(mode: u32) -> u32 {
@@ -1067,6 +1365,8 @@ impl OverlayFs {
 impl FileSystem for OverlayFs {
     fn capture_state(&self) -> io::Result<super::snapshot::FsSnapshot> {
         let _operation = self.write_operation().unwrap();
+        let _io = self.io_activity.fence(Vec::new(), true);
+        _io.drain();
         self.core.sync_preimages()?;
         for root in self.roots.iter().skip(1) {
             backend::materialize_tree(root)?;
@@ -1187,6 +1487,8 @@ impl FileSystem for OverlayFs {
             return Err(invalid("overlay filesystem type mismatch"));
         };
         let _operation = self.write_operation().unwrap();
+        let _io = self.io_activity.fence(Vec::new(), true);
+        _io.drain();
         if state.config != self.snapshot_config
             || state.layers.len() != self.layers.len()
             || state.next_handle == 0
@@ -1291,6 +1593,10 @@ impl FileSystem for OverlayFs {
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         let _operation = self.write_operation()?;
+        let mut capable = capable;
+        if !self.new_session_writeback {
+            capable.remove(FsOptions::WRITEBACK_CACHE);
+        }
         let mut options = None;
         for layer in &self.layers {
             let layer_options = layer.init(capable)?;
@@ -1309,6 +1615,8 @@ impl FileSystem for OverlayFs {
 
     fn destroy(&self) {
         let _operation = self.write_operation().unwrap();
+        let _io = self.io_activity.fence(Vec::new(), true);
+        _io.drain();
         self.clear_directory_cache();
         self.handles.lock().unwrap().clear();
         for layer in &self.layers {
@@ -1338,15 +1646,22 @@ impl FileSystem for OverlayFs {
         let _operation = self.read_operation()?;
         // GETATTR may omit FH (e.g. stat through /proc/self/fd). An unlinked
         // inode still belongs to its open file, even after its path is gone.
-        let handle = handle.or_else(|| {
-            if self.path(inode).is_ok() {
-                return None;
-            }
-            // Only detached inodes require a linear scan of open handles.
-            self.handles.lock().unwrap().iter().find_map(|(id, h)| {
-                matches!(h, Handle::File(h) if h.overlay_inode == inode).then_some(*id)
-            })
-        });
+        let (handle, path) = match handle {
+            Some(handle) => (Some(handle), None),
+            None => match self.path(inode) {
+                Ok(path) => (None, Some(path)),
+                Err(error) => {
+                    // Only detached inodes require a linear scan of open handles.
+                    let handle = self.handles.lock().unwrap().iter().find_map(|(id, h)| {
+                        matches!(h, Handle::File(h) if h.overlay_inode == inode).then_some(*id)
+                    });
+                    match handle {
+                        Some(handle) => (Some(handle), None),
+                        None => return Err(error),
+                    }
+                }
+            },
+        };
         if let Some(handle) = handle {
             return self.with_file_handle(handle, |fs, h| {
                 if h.overlay_inode != inode {
@@ -1367,7 +1682,7 @@ impl FileSystem for OverlayFs {
                 Ok((attr, timeout))
             });
         }
-        let entry = self.entry(ctx, &self.path(inode)?, inode)?;
+        let entry = self.entry(ctx, &path.expect("GETATTR resolved the inode path"), inode)?;
         Ok((entry.attr, entry.attr_timeout))
     }
 
@@ -1381,6 +1696,7 @@ impl FileSystem for OverlayFs {
     ) -> io::Result<(bindings::stat64, Duration)> {
         let _operation = self.write_operation()?;
         let path = self.path(inode)?;
+        let _io = self.fence_paths(&[&path]);
         self.core
             .prepare_metadata_change(&path)
             .map_err(linux_error)?;
@@ -1514,6 +1830,7 @@ impl FileSystem for OverlayFs {
     fn unlink(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         let _operation = self.write_operation()?;
         let path = self.child(parent, name)?;
+        let _io = self.fence_paths(&[&path]);
         self.core.remove(&path, false).map_err(linux_error)?;
         self.remove_path(&path);
         Ok(())
@@ -1522,6 +1839,7 @@ impl FileSystem for OverlayFs {
     fn rmdir(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         let _operation = self.write_operation()?;
         let path = self.child(parent, name)?;
+        let _io = self.fence_paths(&[&path]);
         self.core.remove(&path, true).map_err(linux_error)?;
         self.remove_path(&path);
         Ok(())
@@ -1539,6 +1857,7 @@ impl FileSystem for OverlayFs {
         let _operation = self.write_operation()?;
         let old = self.child(olddir, oldname)?;
         let new = self.child(newdir, newname)?;
+        let _io = self.fence_paths(&[&old, &new]);
         match flags {
             0 => self.core.rename(&old, &new, false).map_err(linux_error)?,
             RENAME_NOREPLACE => self.core.rename(&old, &new, true).map_err(linux_error)?,
@@ -1561,6 +1880,7 @@ impl FileSystem for OverlayFs {
         let _operation = self.write_operation()?;
         let source = self.path(inode)?;
         let destination = self.child(newparent, newname)?;
+        let _io = self.fence_paths(&[&source, &destination]);
         self.core
             .hard_link(&source, &destination)
             .map_err(linux_error)?;
@@ -1592,6 +1912,7 @@ impl FileSystem for OverlayFs {
             Some(self.write_operation()?)
         };
         let path = self.path(inode)?;
+        let _io = (!readonly).then(|| self.fence_paths(&[&path]));
         let (layer, inner) = match self
             .core
             .prepare_open_for_backing_lookup(&path, flags as i32)
@@ -1617,13 +1938,13 @@ impl FileSystem for OverlayFs {
                 };
             }
         };
-        let id = self.allocate_handle(Handle::File(FileHandle {
+        let id = self.allocate_handle(Handle::File(Arc::new(FileHandle {
             overlay_inode: inode,
             layer,
             inode: inner,
             handle,
             relative_path: path.as_os_str().as_bytes().to_vec(),
-        }));
+        })));
         Ok((Some(id), options))
     }
 
@@ -1640,6 +1961,7 @@ impl FileSystem for OverlayFs {
     ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
         let _operation = self.write_operation()?;
         let path = self.child(parent, name)?;
+        let _io = self.fence_paths(&[&path]);
         let inode = self.allocate_inode(path.clone());
         let (upper_parent, upper_name) = self.upper_parent(ctx, &path)?;
         let (mut entry, handle, options) = self.layers[0].create(
@@ -1659,42 +1981,41 @@ impl FileSystem for OverlayFs {
         entry.inode = inode;
         entry.attr.st_ino = inode as _;
         let handle = handle.ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
-        let id = self.allocate_handle(Handle::File(FileHandle {
+        let id = self.allocate_handle(Handle::File(Arc::new(FileHandle {
             overlay_inode: inode,
             layer: Layer(0),
             inode: inner_inode,
             handle,
             relative_path: path.as_os_str().as_bytes().to_vec(),
-        }));
+        })));
         Ok((entry, Some(id), options))
     }
 
     fn read<W: io::Write + ZeroCopyWriter>(
         &self,
-        ctx: Context,
+        _ctx: Context,
         _inode: u64,
         handle: u64,
         mut w: W,
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        flags: u32,
+        _lock_owner: Option<u64>,
+        _flags: u32,
     ) -> io::Result<usize> {
         let _span = self.profile.span("read");
-        let _operation = self.read_operation()?;
-        self.with_file_handle(handle, |fs, h| {
-            let backing = self.roots[h.layer.0].join(OsStr::from_bytes(&h.relative_path));
-            if let Some(bytes) = self
-                .core
-                .read_remote(&backing, offset, size)
-                .map_err(linux_error)?
-            {
-                w.write_all(&bytes)?;
-                Ok(bytes.len())
-            } else {
-                fs.read(ctx, h.inode, h.handle, w, size, offset, lock_owner, flags)
-            }
-        })
+        let lease = self.file_io_lease(handle)?;
+        let h = &lease.handle;
+        let backing = self.roots[h.layer.0].join(OsStr::from_bytes(&h.relative_path));
+        if let Some(bytes) = self
+            .core
+            .read_remote(&backing, offset, size)
+            .map_err(linux_error)?
+        {
+            w.write_all(&bytes)?;
+            Ok(bytes.len())
+        } else {
+            self.layers[h.layer.0].read_leased(&lease.native, w, size, offset)
+        }
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
@@ -1705,38 +2026,32 @@ impl FileSystem for OverlayFs {
         r: R,
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        delayed_write: bool,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
         kill_priv: bool,
-        flags: u32,
+        _flags: u32,
     ) -> io::Result<usize> {
         let _span = self.profile.span("write");
-        let _operation = self.write_operation()?;
-        self.with_file_handle(handle, |fs, h| {
-            fs.write(
-                ctx,
-                h.inode,
-                h.handle,
-                r,
-                size,
-                offset,
-                lock_owner,
-                delayed_write,
-                kill_priv,
-                flags,
-            )
-        })
+        let lease = self.file_io_lease(handle)?;
+        self.layers[lease.handle.layer.0].write_leased(
+            ctx,
+            &lease.native,
+            r,
+            size,
+            offset,
+            kill_priv,
+        )
     }
 
-    fn flush(&self, ctx: Context, _inode: u64, handle: u64, lock_owner: u64) -> io::Result<()> {
-        let _operation = self.write_operation()?;
-        self.with_file_handle(handle, |fs, h| fs.flush(ctx, h.inode, h.handle, lock_owner))
+    fn flush(&self, _ctx: Context, _inode: u64, handle: u64, _lock_owner: u64) -> io::Result<()> {
+        let lease = self.file_io_lease(handle)?;
+        self.layers[lease.handle.layer.0].flush_leased(&lease.native)
     }
 
-    fn fsync(&self, ctx: Context, _inode: u64, datasync: bool, handle: u64) -> io::Result<()> {
-        let _operation = self.write_operation()?;
+    fn fsync(&self, _ctx: Context, _inode: u64, datasync: bool, handle: u64) -> io::Result<()> {
+        let lease = self.file_io_lease(handle)?;
         self.core.sync_preimages()?;
-        self.with_file_handle(handle, |fs, h| fs.fsync(ctx, h.inode, datasync, h.handle))
+        self.layers[lease.handle.layer.0].sync_leased(&lease.native, datasync)
     }
 
     fn fsyncdir(&self, _ctx: Context, inode: u64, _datasync: bool, _handle: u64) -> io::Result<()> {
@@ -1764,7 +2079,12 @@ impl FileSystem for OverlayFs {
         flock_release: bool,
         lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        let _operation = self.write_operation()?;
+        // Closing an open description does not mutate the namespace. A shared
+        // guard still orders it against capture/destroy and namespace changes;
+        // only this handle's admitted operations need to finish first.
+        let _operation = self.read_operation()?;
+        let _io = self.io_activity.fence(vec![handle], false);
+        _io.drain();
         let handle = self.handles.lock().unwrap().remove(&handle);
         match handle {
             Some(Handle::File(h)) => {
@@ -1808,6 +2128,7 @@ impl FileSystem for OverlayFs {
         pvisor_overlay_core::validate_guest_xattr(OsStr::from_bytes(name.to_bytes()))
             .map_err(linux_error)?;
         let path = self.path(inode)?;
+        let _io = self.fence_paths(&[&path]);
         self.core
             .prepare_metadata_change(&path)
             .map_err(linux_error)?;
@@ -1846,6 +2167,7 @@ impl FileSystem for OverlayFs {
         pvisor_overlay_core::validate_guest_xattr(OsStr::from_bytes(name.to_bytes()))
             .map_err(linux_error)?;
         let path = self.path(inode)?;
+        let _io = self.fence_paths(&[&path]);
         self.core
             .prepare_metadata_change(&path)
             .map_err(linux_error)?;
@@ -2015,7 +2337,9 @@ impl FileSystem for OverlayFs {
     }
 
     fn releasedir(&self, _ctx: Context, _inode: u64, _flags: u32, handle: u64) -> io::Result<()> {
-        let _operation = self.write_operation()?;
+        // An enumeration already owns an Arc snapshot. Removing its registry
+        // entry cannot invalidate that snapshot or change namespace contents.
+        let _operation = self.read_operation()?;
         match self.handles.lock().unwrap().remove(&handle) {
             Some(Handle::Directory(_) | Handle::DirectoryNames { .. }) => Ok(()),
             _ => Err(io::Error::from_raw_os_error(libc::EBADF)),
@@ -2112,6 +2436,706 @@ mod tests {
             self.bytes.extend_from_slice(&bytes[..len]);
             Ok(len)
         }
+    }
+
+    struct WriteReader(io::Cursor<Vec<u8>>);
+
+    #[cfg(target_os = "linux")]
+    struct WritebackTestFs(Arc<OverlayFs>);
+
+    #[cfg(target_os = "linux")]
+    impl FileSystem for WritebackTestFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn capture_state(&self) -> io::Result<super::super::snapshot::FsSnapshot> {
+            self.0.capture_state()
+        }
+
+        fn restore_state(&self, state: &super::super::snapshot::FsSnapshot) -> io::Result<()> {
+            self.0.restore_state(state)
+        }
+
+        fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+            self.0.init(capable)
+        }
+
+        fn destroy(&self) {
+            self.0.destroy();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn writeback_test_overlay(
+        root: &Path,
+        restoring: bool,
+        setting: Option<&str>,
+    ) -> Arc<OverlayFs> {
+        Arc::new(
+            OverlayFs::build_with_writeback(
+                Config {
+                    lower_mutability: Vec::new(),
+                    lower_dirs: vec![root.join("lower").to_string_lossy().into_owned()],
+                    apply_target: None,
+                    baseline_lower: None,
+                    baseline_content_index: None,
+                    upper_dir: root.join("upper").to_string_lossy().into_owned(),
+                    work_dir: None,
+                    preimage_dir: None,
+                    excluded_paths: Vec::new(),
+                    access_policy: Default::default(),
+                    semantics: passthrough::PermissionSemantics::LinuxComplete,
+                },
+                Arc::new(InodeAllocator::new()),
+                restoring,
+                setting,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn writeback_test_control_request(
+        server: &super::super::server::Server<WritebackTestFs>,
+        opcode: fuse::Opcode,
+        body: &[u8],
+    ) -> (vm_memory::GuestMemoryMmap, vm_memory::GuestAddress, usize) {
+        use super::super::descriptor_utils::{
+            create_descriptor_chain, DescriptorType, OwnedDescriptorChain,
+        };
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x100),
+            vec![
+                (DescriptorType::Readable, body.len() as u32),
+                (DescriptorType::Writable, 256),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_slice(body, GuestAddress(0x100)).unwrap();
+        let plan = OwnedDescriptorChain::new(chain).unwrap();
+        let (reader, writer) = plan.reader_writer(&mem).unwrap();
+        let len = server
+            .handle_message(
+                (
+                    fuse::InHeader {
+                        len: (std::mem::size_of::<fuse::InHeader>() + body.len()) as u32,
+                        opcode: opcode as u32,
+                        unique: 1,
+                        ..Default::default()
+                    },
+                    reader,
+                ),
+                writer,
+                false,
+                &None,
+                &Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            )
+            .unwrap();
+        (mem, GuestAddress(0x100 + body.len() as u64), len)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn negotiate_writeback_test_session(
+        server: &super::super::server::Server<WritebackTestFs>,
+        capable: FsOptions,
+    ) -> FsOptions {
+        use vm_memory::{Address, ByteValued, Bytes};
+        let body = fuse::InitInCompat {
+            major: fuse::KERNEL_VERSION,
+            minor: fuse::KERNEL_MINOR_VERSION,
+            flags: capable.bits() as u32,
+            ..Default::default()
+        };
+        let (mem, address, len) =
+            writeback_test_control_request(server, fuse::Opcode::Init, body.as_slice());
+        let reply: fuse::OutHeader = mem.read_obj(address).unwrap();
+        assert_eq!(reply.error, 0);
+        assert!(
+            len >= std::mem::size_of::<fuse::OutHeader>() + std::mem::size_of::<fuse::InitOut>()
+        );
+        let out: fuse::InitOut = mem
+            .read_obj(
+                address
+                    .checked_add(std::mem::size_of::<fuse::OutHeader>() as u64)
+                    .unwrap(),
+            )
+            .unwrap();
+        FsOptions::from_bits((u64::from(out.flags2) << 32) | u64::from(out.flags)).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_overlay_sessions_require_explicit_writeback_and_guest_capability() {
+        for (setting, capable, expected) in [
+            (None, FsOptions::WRITEBACK_CACHE, false),
+            (Some("0"), FsOptions::WRITEBACK_CACHE, false),
+            (Some("1"), FsOptions::WRITEBACK_CACHE, true),
+            (Some("1"), FsOptions::empty(), false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            let fs = writeback_test_overlay(temp.path(), false, setting);
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let options = negotiate_writeback_test_session(&server, capable);
+            assert_eq!(options.contains(FsOptions::WRITEBACK_CACHE), expected);
+            let state = server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap();
+            assert_eq!(state.options, options.bits());
+            state.fs.validate_writeback(expected).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_restore_preserves_enabled_session_and_write_only_append_handles() {
+        use super::super::snapshot::{FsSnapshot, ServerSnapshot};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/file"), b"abcd").unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let options = negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let flags = (libc::O_WRONLY | libc::O_APPEND) as u32;
+        let handle = fs.open(ctx, inode, false, flags).unwrap().0.unwrap();
+        let saved = server
+            .capture_state(fs.inode_alloc.snapshot_next())
+            .unwrap();
+        let saved: ServerSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        drop((server, fs));
+
+        let fs = writeback_test_overlay(temp.path(), true, None);
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        server.restore_state(&saved).unwrap();
+        fs.inode_alloc.restore_next(saved.next_inode).unwrap();
+        let recaptured = server
+            .capture_state(fs.inode_alloc.snapshot_next())
+            .unwrap();
+        assert_eq!(recaptured.options, options.bits());
+        let (FsSnapshot::Overlay(old), FsSnapshot::Overlay(new)) = (&saved.fs, &recaptured.fs)
+        else {
+            panic!("overlay snapshots expected")
+        };
+        assert_eq!(
+            serde_json::to_value(&new.handles).unwrap(),
+            serde_json::to_value(&old.handles).unwrap()
+        );
+        for (old, new) in old.layers.iter().zip(&new.layers) {
+            let (FsSnapshot::Passthrough(old), FsSnapshot::Passthrough(new)) = (old, new) else {
+                panic!("native snapshots expected")
+            };
+            assert!(new.writeback);
+            // Existing restore reopens the verified path with O_NOFOLLOW,
+            // while normal OPEN follows the retained /proc/self/fd symlink.
+            // All other flags and the saved handle state must be preserved.
+            let mut expected_handles = old.handles.clone();
+            for handle in &mut expected_handles {
+                handle.flags |= libc::O_NOFOLLOW;
+            }
+            assert_eq!(
+                serde_json::to_value(&new.handles).unwrap(),
+                serde_json::to_value(&expected_handles).unwrap()
+            );
+        }
+        let mut output = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        assert_eq!(
+            fs.read(ctx, inode, handle, &mut output, 4, 0, None, 0)
+                .unwrap(),
+            4
+        );
+        assert_eq!(output.bytes, b"abcd");
+        // WB allows partial-page READ on O_WRONLY; guest append offsets must
+        // still reach the restored native FD without host O_APPEND rewriting.
+        fs.write(
+            ctx,
+            inode,
+            handle,
+            WriteReader(io::Cursor::new(b"X".to_vec())),
+            1,
+            0,
+            None,
+            true,
+            false,
+            flags,
+        )
+        .unwrap();
+        fs.fsync(ctx, inode, false, handle).unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("upper/file")).unwrap(),
+            b"Xbcd"
+        );
+        fs.release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+        assert_eq!(
+            fs.release(ctx, inode, 0, handle, false, false, None)
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_pre_init_snapshot_uses_the_new_session_preference() {
+        for (setting, expected) in [(None, false), (Some("1"), true)] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            let fs = writeback_test_overlay(temp.path(), false, None);
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let saved = server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap();
+            assert_eq!(saved.options, 0);
+            saved.fs.validate_writeback(false).unwrap();
+            drop((server, fs));
+
+            let fs = writeback_test_overlay(temp.path(), true, setting);
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            server.restore_state(&saved).unwrap();
+            fs.inode_alloc.restore_next(saved.next_inode).unwrap();
+            assert_eq!(
+                server
+                    .capture_state(fs.inode_alloc.snapshot_next())
+                    .unwrap()
+                    .options,
+                0
+            );
+            let options = negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
+            assert_eq!(options.contains(FsOptions::WRITEBACK_CACHE), expected);
+            let recaptured = server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap();
+            assert_eq!(recaptured.options, options.bits());
+            recaptured.fs.validate_writeback(expected).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_enabled_session_reinitializes_using_the_new_session_preference() {
+        for (setting, expected) in [(None, false), (Some("1"), true)] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
+            let saved = server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap();
+            drop((server, fs));
+
+            let fs = writeback_test_overlay(temp.path(), true, setting);
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            server.restore_state(&saved).unwrap();
+            fs.inode_alloc.restore_next(saved.next_inode).unwrap();
+            server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap()
+                .fs
+                .validate_writeback(true)
+                .unwrap();
+            assert_eq!(
+                writeback_test_control_request(&server, fuse::Opcode::Destroy, &[]).2,
+                0
+            );
+            let options = negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
+            assert_eq!(options.contains(FsOptions::WRITEBACK_CACHE), expected);
+            let recaptured = server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap();
+            assert_eq!(recaptured.options, options.bits());
+            recaptured.fs.validate_writeback(expected).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enabled_snapshot_restore_keeps_explicit_off_and_session_mismatch_rejections() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
+        let saved = server
+            .capture_state(fs.inode_alloc.snapshot_next())
+            .unwrap();
+        drop((server, fs));
+
+        let fs = writeback_test_overlay(temp.path(), true, Some("0"));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        assert!(server.restore_state(&saved).is_err());
+        assert_eq!(
+            server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap()
+                .options,
+            0
+        );
+        drop((server, fs));
+
+        let fs = writeback_test_overlay(temp.path(), true, None);
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let mut mismatched = saved.clone();
+        mismatched.options &= !FsOptions::WRITEBACK_CACHE.bits();
+        assert!(server.restore_state(&mismatched).is_err());
+        assert_eq!(
+            server
+                .capture_state(fs.inode_alloc.snapshot_next())
+                .unwrap()
+                .options,
+            0
+        );
+    }
+
+    #[test]
+    fn writeback_mode_and_write_only_append_handles_survive_snapshot_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file"), b"abcd").unwrap();
+        let config = passthrough::Config {
+            root_dir: temp.path().to_string_lossy().into_owned(),
+            writeback: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(config.clone(), Arc::new(InodeAllocator::new())).unwrap();
+        assert!(fs
+            .init(FsOptions::WRITEBACK_CACHE)
+            .unwrap()
+            .contains(FsOptions::WRITEBACK_CACHE));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let flags = (libc::O_WRONLY | libc::O_APPEND) as u32;
+        let handle = fs.open(ctx, inode, false, flags).unwrap().0.unwrap();
+        let state = fs.capture_state().unwrap();
+        state.validate_writeback(true).unwrap();
+        assert!(state.validate_writeback(false).is_err());
+        let state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(fs);
+        let restored = PassthroughFs::new(config, Arc::new(InodeAllocator::new())).unwrap();
+        restored.restore_state(&state).unwrap();
+        let mut output = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        assert_eq!(
+            restored
+                .read(ctx, inode, handle, &mut output, 4, 0, None, 0)
+                .unwrap(),
+            4
+        );
+        assert_eq!(output.bytes, b"abcd");
+        // Guest supplies append offsets after merging; the native fd must not
+        // retain O_APPEND, which would override this explicit offset.
+        restored
+            .write(
+                ctx,
+                inode,
+                handle,
+                WriteReader(io::Cursor::new(b"X".to_vec())),
+                1,
+                0,
+                None,
+                true,
+                false,
+                flags,
+            )
+            .unwrap();
+        restored.fsync(ctx, inode, false, handle).unwrap();
+        assert_eq!(std::fs::read(temp.path().join("file")).unwrap(), b"Xbcd");
+    }
+
+    impl io::Read for WriteReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            io::Read::read(&mut self.0, bytes)
+        }
+    }
+
+    impl ZeroCopyReader for WriteReader {
+        fn read_to(
+            &mut self,
+            file: &std::fs::File,
+            count: usize,
+            offset: u64,
+        ) -> io::Result<usize> {
+            use std::os::unix::fs::FileExt;
+            let mut bytes = vec![0; count];
+            let count = io::Read::read(&mut self.0, &mut bytes)?;
+            file.write_at(&bytes[..count], offset)
+        }
+    }
+
+    #[test]
+    fn restored_open_file_handles_support_leased_io_and_release() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/file"), b"before").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let handle = fs
+            .open(ctx, inode, false, libc::O_RDWR as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let config = fs.snapshot_config.clone();
+        let wire = serde_json::to_vec(&fs.capture_state().unwrap()).unwrap();
+        drop(fs);
+
+        let restored = OverlayFs::open_existing(config, Arc::new(InodeAllocator::new())).unwrap();
+        restored.init(FsOptions::empty()).unwrap();
+        restored
+            .restore_state(&serde_json::from_slice(&wire).unwrap())
+            .unwrap();
+        let mut output = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        assert_eq!(
+            restored
+                .read(ctx, inode, handle, &mut output, 6, 0, None, 0)
+                .unwrap(),
+            6
+        );
+        assert_eq!(output.bytes, b"before");
+        assert_eq!(
+            restored
+                .write(
+                    ctx,
+                    inode,
+                    handle,
+                    WriteReader(io::Cursor::new(b"after!".to_vec())),
+                    6,
+                    0,
+                    None,
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap(),
+            6
+        );
+        restored.fsync(ctx, inode, false, handle).unwrap();
+        restored
+            .release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+        assert_eq!(
+            restored.file_io_lease(handle).err().unwrap().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("upper/file")).unwrap(),
+            b"after!"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("lower/file")).unwrap(),
+            b"before"
+        );
+    }
+
+    #[test]
+    fn backing_read_releases_the_operation_lock_and_allows_independent_write_and_fsync() {
+        use std::sync::mpsc::channel;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/a"), b"first").unwrap();
+        std::fs::write(temp.path().join("lower/b"), b"second").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let a = fs.lookup(ctx, fuse::ROOT_ID, c"a").unwrap().inode;
+        let b = fs.lookup(ctx, fuse::ROOT_ID, c"b").unwrap().inode;
+        let ah = fs
+            .open(ctx, a, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let bh = fs
+            .open(ctx, b, false, libc::O_RDWR as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let (started, entered) = channel();
+        let (resume, waiting) = channel();
+        let (sent, completed) = channel();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let mut writer = ReadWriter {
+                    gate: Some((started, waiting)),
+                    bytes: Vec::new(),
+                };
+                let result = fs.read(ctx, a, ah, &mut writer, 16, 0, None, 0);
+                (result, writer.bytes)
+            });
+            if let Err(error) = entered.recv_timeout(Duration::from_secs(2)) {
+                let _ = resume.send(());
+                panic!("READ did not reach backing I/O: {error}");
+            }
+            let lock_is_free = fs.operation_lock.try_write().is_ok();
+            scope.spawn(|| {
+                let result = fs
+                    .write(
+                        ctx,
+                        b,
+                        bh,
+                        WriteReader(io::Cursor::new(b"updated".to_vec())),
+                        7,
+                        0,
+                        None,
+                        false,
+                        false,
+                        0,
+                    )
+                    .and_then(|count| fs.fsync(ctx, b, false, bh).map(|()| count));
+                sent.send(result).unwrap();
+            });
+            let result = completed.recv_timeout(Duration::from_secs(2));
+            resume.send(()).unwrap();
+            let (read, bytes) = first.join().unwrap();
+            assert!(lock_is_free, "READ retained the global operation lock");
+            assert_eq!(
+                result
+                    .expect("unrelated WRITE/FSYNC blocked on READ")
+                    .unwrap(),
+                7
+            );
+            assert_eq!(read.unwrap(), 5);
+            assert_eq!(bytes, b"first");
+        });
+        fs.release(ctx, a, 0, ah, false, false, None).unwrap();
+        fs.release(ctx, b, 0, bh, false, false, None).unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("upper/b")).unwrap(),
+            b"updated"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("lower/b")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn snapshot_global_drain_is_woken_by_the_last_file_io_lease() {
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/a"), b"first").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"a").unwrap().inode;
+        let handle = fs
+            .open(ctx, inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let lease = fs.file_io_lease(handle).unwrap();
+        let (sent, received) = channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                sent.send(fs.capture_state()).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let installed = loop {
+                if fs.io_activity.state.lock().unwrap().global != 0 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            let premature = received.try_recv();
+            drop(lease);
+            let completed = received.recv_timeout(Duration::from_secs(2));
+            assert!(installed, "snapshot did not install its global drain");
+            assert!(premature.is_err(), "snapshot captured admitted I/O");
+            completed
+                .expect("last lease did not wake the global drain")
+                .unwrap();
+        });
+        fs.release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn native_descriptor_lease_survives_native_handle_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/a"), b"first").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"a").unwrap().inode;
+        let handle = fs
+            .open(ctx, inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let lease = fs.file_io_lease(handle).unwrap();
+        let native = &fs.layers[lease.handle.layer.0];
+        native
+            .release(
+                ctx,
+                lease.handle.inode,
+                0,
+                lease.handle.handle,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(native
+            .lease_handle(lease.handle.inode, lease.handle.handle)
+            .is_err());
+        let mut writer = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        assert_eq!(
+            native
+                .read_leased(&lease.native, &mut writer, 16, 0)
+                .unwrap(),
+            5
+        );
+        assert_eq!(writer.bytes, b"first");
+        drop(lease);
+        assert!(fs.io_activity.state.lock().unwrap().active.is_empty());
     }
     #[test]
     fn cached_directory_borrow_survives_eviction_and_releases_the_final_reference() {
@@ -2268,10 +3292,27 @@ mod tests {
                 released.send(result).unwrap();
             });
             let premature = done.recv_timeout(Duration::from_millis(20));
+            let (queried, query_done) = channel();
+            scope.spawn(move || {
+                queried
+                    .send(
+                        fs.lookup(ctx, fuse::ROOT_ID, c"b")
+                            .map(|entry| entry.attr.st_size),
+                    )
+                    .unwrap();
+            });
+            // A blocked close must not exclude metadata on another object.
+            let unrelated_metadata = query_done.recv_timeout(Duration::from_secs(2));
             resume.send(()).unwrap();
             assert_eq!(result.unwrap(), 6);
             assert_eq!(bytes, b"second");
             assert!(premature.is_err(), "release raced retained backing handle");
+            assert_eq!(
+                unrelated_metadata
+                    .expect("RELEASE blocked unrelated LOOKUP")
+                    .unwrap(),
+                6
+            );
             done.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
             let (result, bytes) = first.join().unwrap();
             assert_eq!(result.unwrap(), 5);
@@ -2289,6 +3330,7 @@ mod tests {
         std::fs::create_dir(temp.path().join("lower")).unwrap();
         std::fs::write(temp.path().join("lower/a"), b"first").unwrap();
         std::fs::write(temp.path().join("lower/b"), b"second").unwrap();
+        std::fs::write(temp.path().join("lower/c"), b"third").unwrap();
         let fs = parent_cache_fixture(temp.path());
         fs.init(FsOptions::empty()).unwrap();
         let ctx = Context {
@@ -2300,6 +3342,12 @@ mod tests {
         let b = fs.lookup(ctx, fuse::ROOT_ID, c"b").unwrap().inode;
         let ah = fs
             .open(ctx, a, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let c = fs.lookup(ctx, fuse::ROOT_ID, c"c").unwrap().inode;
+        let ch = fs
+            .open(ctx, c, false, libc::O_RDONLY as u32)
             .unwrap()
             .0
             .unwrap();
@@ -2339,16 +3387,67 @@ mod tests {
                     panic!("read-only OPEN failed: {result:?}");
                 }
             };
+            let (changed, change_ready) = channel();
+            scope.spawn(move || {
+                let result = (|| {
+                    let wh = fs.open(ctx, b, false, libc::O_RDWR as u32)?.0.unwrap();
+                    fs.release(ctx, b, libc::O_RDWR as u32, wh, false, false, None)?;
+                    fs.rename(ctx, fuse::ROOT_ID, c"b", fuse::ROOT_ID, c"renamed", 0)?;
+                    fs.unlink(ctx, fuse::ROOT_ID, c"renamed")?;
+                    fs.release(ctx, b, libc::O_RDONLY as u32, bh, false, false, None)
+                })();
+                changed.send(result).unwrap();
+            });
+            let independent = change_ready.recv_timeout(Duration::from_secs(2));
+            if independent.is_err() {
+                resume.send(()).unwrap();
+                panic!("independent namespace mutation waited for unrelated READ");
+            }
+            independent.unwrap().unwrap();
             scope.spawn(move || {
                 write_started.send(()).unwrap();
                 write_opened
-                    .send(fs.open(ctx, b, false, libc::O_RDWR as u32))
+                    .send(fs.open(ctx, a, false, libc::O_RDWR as u32))
                     .unwrap();
             });
             if let Err(error) = write_entered.recv_timeout(Duration::from_secs(2)) {
                 resume.send(()).unwrap();
                 panic!("writable OPEN did not start: {error}");
             }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !fs
+                .io_activity
+                .state
+                .lock()
+                .unwrap()
+                .blocked
+                .contains_key(&ah)
+            {
+                if std::time::Instant::now() >= deadline {
+                    resume.send(()).unwrap();
+                    panic!("same-object writer did not install its fence");
+                }
+                std::thread::yield_now();
+            }
+            // The namespace writer is now waiting for a, holding the metadata
+            // write guard. New I/O admission on c must still proceed.
+            let (read_done, read_ready) = channel();
+            scope.spawn(move || {
+                let mut writer = ReadWriter {
+                    gate: None,
+                    bytes: Vec::new(),
+                };
+                let result = fs.read(ctx, c, ch, &mut writer, 16, 0, None, 0);
+                read_done.send((result, writer.bytes)).unwrap();
+            });
+            let other = read_ready.recv_timeout(Duration::from_secs(2));
+            if other.is_err() {
+                resume.send(()).unwrap();
+                panic!("new unrelated I/O admission waited for the namespace writer");
+            }
+            let (result, bytes) = other.unwrap();
+            assert_eq!(result.unwrap(), 5);
+            assert_eq!(bytes, b"third");
             let premature = write_ready.recv_timeout(Duration::from_millis(20));
             resume.send(()).unwrap();
             assert!(
@@ -2362,12 +3461,12 @@ mod tests {
                 .0
                 .unwrap();
             first.join().unwrap();
-            fs.release(ctx, b, libc::O_RDONLY as u32, bh, false, false, None)
-                .unwrap();
-            fs.release(ctx, b, libc::O_RDWR as u32, wh, false, false, None)
+            fs.release(ctx, a, libc::O_RDWR as u32, wh, false, false, None)
                 .unwrap();
         });
         fs.release(ctx, a, libc::O_RDONLY as u32, ah, false, false, None)
+            .unwrap();
+        fs.release(ctx, c, libc::O_RDONLY as u32, ch, false, false, None)
             .unwrap();
         assert_eq!(
             std::fs::read(temp.path().join("lower/b")).unwrap(),
@@ -2451,6 +3550,185 @@ mod tests {
         .unwrap();
         fs.init(FsOptions::empty()).unwrap();
         fs
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_metadata_reply_keeps_the_pinned_root_after_host_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        let original = temp.path().join("original-lower");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::write(lower.join("file"), b"old root").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        std::fs::rename(&lower, &original).unwrap();
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::write(lower.join("file"), b"different root contents").unwrap();
+        assert_eq!(fs.core.metadata(Path::new("file")).unwrap().len(), 23);
+        let before = std::fs::symlink_metadata(original.join("file")).unwrap();
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert_eq!(entry.attr.st_size, 8);
+        assert_eq!(fs.getattr(ctx, entry.inode, None).unwrap().0.st_size, 8);
+        let after = std::fs::symlink_metadata(original.join("file")).unwrap();
+        assert_eq!(
+            (after.atime(), after.atime_nsec()),
+            (before.atime(), before.atime_nsec())
+        );
+        let handle = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let mut output = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        assert_eq!(
+            fs.read(ctx, entry.inode, handle, &mut output, 64, 0, None, 0)
+                .unwrap(),
+            8
+        );
+        assert_eq!(output.bytes, b"old root");
+        fs.release(ctx, entry.inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_metadata_reply_revalidates_parents_and_rejects_symlink_retargeting() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir_all(lower.join("directory")).unwrap();
+        std::fs::write(lower.join("directory/file"), b"old").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let directory = fs.lookup(ctx, fuse::ROOT_ID, c"directory").unwrap().inode;
+        let original = fs.lookup(ctx, directory, c"file").unwrap();
+        assert_eq!(original.attr.st_size, 3);
+        assert_eq!(fs.getattr(ctx, original.inode, None).unwrap().0.st_size, 3);
+        std::fs::rename(lower.join("directory"), lower.join("old-directory")).unwrap();
+        std::fs::create_dir(lower.join("directory")).unwrap();
+        std::fs::write(lower.join("directory/file"), b"updated").unwrap();
+        let replaced = fs.lookup(ctx, directory, c"file").unwrap();
+        assert_eq!(replaced.attr.st_size, 7);
+        let handle = fs
+            .open(ctx, replaced.inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let mut output = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        fs.read(ctx, replaced.inode, handle, &mut output, 64, 0, None, 0)
+            .unwrap();
+        assert_eq!(output.bytes, b"updated");
+        fs.release(ctx, replaced.inode, 0, handle, false, false, None)
+            .unwrap();
+        std::fs::rename(lower.join("directory"), lower.join("replaced-directory")).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), b"must not follow the ancestor link").unwrap();
+        std::os::unix::fs::symlink(&outside, lower.join("directory")).unwrap();
+        assert_eq!(
+            fs.lookup(ctx, directory, c"file")
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        let symlink = fs.lookup(ctx, fuse::ROOT_ID, c"directory").unwrap();
+        assert_eq!(symlink.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+        assert_eq!(
+            fs.getattr(ctx, symlink.inode, None).unwrap().0.st_mode & libc::S_IFMT,
+            libc::S_IFLNK
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_metadata_hint_preserves_leaf_replacement_type_and_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::write(lower.join("file"), b"original").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let path = Path::new("file");
+        let inode = fs.allocate_inode(path.to_path_buf());
+        let backing = fs.core.metadata_for_backing_lookup(path).unwrap();
+        std::fs::remove_file(lower.join("file")).unwrap();
+        std::os::unix::fs::symlink("outside", lower.join("file")).unwrap();
+        let entry = fs.entry_on_backing(ctx, path, inode, &backing).unwrap();
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+        assert_eq!(entry.attr.st_size, 7);
+        std::fs::remove_file(lower.join("file")).unwrap();
+        std::fs::create_dir(lower.join("file")).unwrap();
+        let entry = fs.entry_on_backing(ctx, path, inode, &backing).unwrap();
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        std::fs::remove_dir(lower.join("file")).unwrap();
+        assert_eq!(
+            fs.entry_on_backing(ctx, path, inode, &backing)
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_metadata_reply_keeps_upper_virtual_owners_and_hardlink_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        let upper = temp.path().join("upper");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::create_dir(&upper).unwrap();
+        let marker = OsStr::new("user.containers.override_stat");
+        pvisor_overlay_core::sys::set_xattr(&upper, marker, b"1234:2345:700", 0).unwrap();
+        std::fs::write(upper.join("file"), b"upper bytes").unwrap();
+        pvisor_overlay_core::sys::set_xattr(&upper.join("file"), marker, b"1234:2345:751", 0)
+            .unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (1234, 2345));
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(entry.attr.st_mode & 0o7777, 0o751);
+        assert_eq!(entry.attr.st_size, 11);
+        std::fs::write(upper.join("file"), b"fresh upper metadata").unwrap();
+        let (attr, _) = fs.getattr(ctx, entry.inode, None).unwrap();
+        assert_eq!((attr.st_uid, attr.st_gid), (1234, 2345));
+        assert_eq!(attr.st_mode & 0o7777, 0o751);
+        assert_eq!(attr.st_size, 20);
+        std::fs::write(lower.join("public"), b"protected alias").unwrap();
+        std::fs::create_dir(lower.join("private")).unwrap();
+        std::fs::hard_link(lower.join("public"), lower.join("private/alias")).unwrap();
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"public")
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"private").is_err());
     }
 
     #[test]
@@ -2972,7 +4250,16 @@ mod tests {
             hard_link_origins: vec![],
             layers: vec![],
             nodes: vec![(1, b"/".to_vec())],
-            handles: vec![],
+            handles: vec![(
+                1,
+                Handle::File(Arc::new(FileHandle {
+                    overlay_inode: 1,
+                    layer: Layer(0),
+                    inode: 1,
+                    handle: 7,
+                    relative_path: b"file".to_vec(),
+                })),
+            )],
             next_handle: 2,
         };
         let legacy = serde_json::to_value(&state.config).unwrap();
@@ -2984,6 +4271,18 @@ mod tests {
         let roundtrip: Config =
             serde_json::from_value(serde_json::to_value(&declared).unwrap()).unwrap();
         assert_eq!(roundtrip.lower_mutability, declared.lower_mutability);
+        // Shared in-memory ownership adds no fields or wrapper to old handles.
+        let legacy_handle = serde_json::json!({
+            "kind": "File",
+            "state": { "overlay_inode": 1, "layer": 0, "inode": 1,
+                       "handle": 7, "relative_path": [102, 105, 108, 101] }
+        });
+        assert_eq!(
+            serde_json::to_value(&state.handles[0].1).unwrap(),
+            legacy_handle
+        );
+        let decoded_handle: Handle = serde_json::from_value(legacy_handle.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded_handle).unwrap(), legacy_handle);
         // Box must add no wrapper to the tagged enum's persisted state format,
         // including when nested in layers.
         let old_wire = serde_json::json!({

@@ -659,6 +659,47 @@ impl Vm {
         &self.supported_msrs
     }
 
+    /// Protects a complete DAX window before any vCPU starts running.
+    #[cfg(not(feature = "tee"))]
+    pub(crate) fn protect_readonly_window(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        start: u64,
+        size: usize,
+    ) -> Result<()> {
+        // Only called immediately after initial memory registration, before
+        // vCPUs or additional slots exist. DAX windows each own a whole region.
+        let (slot, region) = guest_mem
+            .iter()
+            .enumerate()
+            .find(|(_, region)| {
+                region.start_addr().raw_value() == start && region.len() == size as u64
+            })
+            .ok_or(Error::NotEnoughMemorySlots)?;
+        if self.next_mem_slot as usize != guest_mem.num_regions() {
+            return Err(Error::NotEnoughMemorySlots);
+        }
+        let mapping = kvm_userspace_memory_region {
+            slot: slot as u32,
+            flags: kvm_bindings::KVM_MEM_READONLY,
+            guest_phys_addr: start,
+            memory_size: region.len(),
+            userspace_addr: guest_mem.get_host_address(region.start_addr()).unwrap() as u64,
+        };
+        // READONLY avoids KVM requesting writable pins (and causing COW) on
+        // normal reads. Physical guest stores become MMIO exits, not file writes.
+        // KVM rejects changing READONLY on an existing slot. No vCPU exists
+        // yet, so unregister and reinstall this same window atomically with
+        // respect to guest execution. On failure the fresh VM is discarded.
+        let empty = kvm_userspace_memory_region {
+            memory_size: 0,
+            flags: 0,
+            ..mapping
+        };
+        unsafe { self.fd.set_user_memory_region(empty) }.map_err(Error::SetUserMemoryRegion)?;
+        unsafe { self.fd.set_user_memory_region(mapping) }.map_err(Error::SetUserMemoryRegion)
+    }
+
     /// Initializes the guest memory.
     pub fn memory_init(
         &mut self,
@@ -2195,6 +2236,90 @@ mod tests {
         ])
         .unwrap();
         assert!(vm.memory_init(&gm, kvm_context.max_memslots()).is_err());
+    }
+
+    /// Guest reads must share file pages; guest physical stores must exit to
+    /// userspace instead of silently creating private copies in the DAX window.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn readonly_dax_slot_shares_reads_and_traps_physical_writes() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        use vm_memory::Bytes;
+
+        let kvm = KvmContext::new().unwrap();
+        let mut vm = Vm::new(kvm.fd()).unwrap();
+        let memory =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(0x2000), 4096)])
+                .unwrap();
+        vm.memory_init(&memory, kvm.max_memslots()).unwrap();
+        // Partial/unknown windows cannot change RAM slot protection.
+        assert!(vm.protect_readonly_window(&memory, 0x2000, 2048).is_err());
+        vm.protect_readonly_window(&memory, 0x2000, 4096).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0x5a; 4096]).unwrap();
+        let address = memory.get_host_address(GuestAddress(0x2000)).unwrap();
+        // Mirrors the host mapping protection, including the private COW
+        // fallback for host descriptor access to guest physical memory.
+        assert_ne!(
+            unsafe {
+                libc::mmap(
+                    address.cast(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            },
+            libc::MAP_FAILED
+        );
+        // Real mode: MOV AL,[0x2000]; OUT 0x80,AL;
+        // MOV BYTE [0x2000],0x11; HLT.
+        memory
+            .write_slice(
+                &[
+                    0xa0, 0x00, 0x20, 0xe6, 0x80, 0xc6, 0x06, 0x00, 0x20, 0x11, 0xf4,
+                ],
+                GuestAddress(0),
+            )
+            .unwrap();
+        let mut cpu = vm.fd().create_vcpu(0).unwrap();
+        let mut sregs = cpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        cpu.set_sregs(&sregs).unwrap();
+        cpu.set_regs(&kvm_regs {
+            rip: 0,
+            rflags: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        match cpu.run().unwrap() {
+            VcpuExit::IoOut(0x80, data) => assert_eq!(data, &[0x5a]),
+            other => panic!("unexpected DAX read exit: {other:?}"),
+        }
+        // pagemap's file bit is readable without disclosing physical addresses.
+        let pagemap = std::fs::File::open("/proc/self/pagemap").unwrap();
+        let mut entry = [0; 8];
+        pagemap
+            .read_exact_at(&mut entry, (address as u64 / 4096) * 8)
+            .unwrap();
+        let entry = u64::from_le_bytes(entry);
+        assert_ne!(entry & (1 << 63), 0, "DAX page is not resident");
+        assert_ne!(entry & (1 << 61), 0, "KVM read caused a private COW page");
+        match cpu.run().unwrap() {
+            VcpuExit::MmioWrite(0x2000, data) => assert_eq!(data, &[0x11]),
+            other => panic!("unexpected DAX physical write exit: {other:?}"),
+        }
+        assert!(matches!(cpu.run().unwrap(), VcpuExit::Hlt));
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0x2000)).unwrap(), 0x5a);
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, 0).unwrap();
+        assert_eq!(byte, [0x5a]);
     }
 
     #[cfg(target_arch = "x86_64")]

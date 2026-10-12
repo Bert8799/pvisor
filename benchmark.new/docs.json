@@ -1,0 +1,886 @@
+{
+  "format": 1,
+  "scope": "all bilingual benchmark articles and benchmark design/evidence articles",
+  "preservation": "Fixed historical tables live directly in Markdown with their original statistics, scope and source links. This inventory tracks dynamic JSON tables and publication bindings. Raw evidence remains under ignored .data.",
+  "pages": [
+    {
+      "locale": "zh",
+      "page": "benchmarks/agent-tasks.md",
+      "benchmark_ids": [
+        "B-AGENT-TASK",
+        "B-COMPARE"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "agent-tasks.csv",
+        "runtime-comparisons.csv",
+        "runtime-provenance.csv",
+        "runtime-summary.csv",
+        "task-scenarios.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/cluster-scalability.md",
+      "benchmark_ids": [
+        "B-CLUSTER"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "cluster-comparisons.csv",
+        "cluster-provenance.csv",
+        "cluster-summary.csv",
+        "controller-history-provenance.csv",
+        "controller-history-summary.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/compare-rl-infra.md",
+      "benchmark_ids": [
+        "B-COMPARE"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "agent-tasks.csv",
+        "compare-rl-infra.csv",
+        "density-summary.csv",
+        "isolation-tests.csv",
+        "lazy-startup-summary.csv",
+        "replay-fidelity.csv",
+        "startup.csv",
+        "vm-memory/memory-choices.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/density.md",
+      "benchmark_ids": [
+        "B-DENSITY"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "density-provenance.csv",
+        "density-summary.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/filesystem.md",
+      "benchmark_ids": [
+        "B-FS-TOOLS",
+        "B-MACOS"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "filesystem-cache-policy.csv",
+        "filesystem-comparisons.csv",
+        "filesystem-provenance.csv",
+        "filesystem.csv",
+        "runtime-provenance.csv",
+        "runtime-summary.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/index.md",
+      "benchmark_ids": [
+        "B-OVERVIEW"
+      ],
+      "role": "user-facing",
+      "tables": [
+        {
+          "json": "benchmarks/measurement-coverage.render.json",
+          "kind": "coverage",
+          "rows": 14,
+          "columns": [
+            "数据状态",
+            "实测范围"
+          ],
+          "options": {
+            "markdown": true
+          }
+        }
+      ],
+      "source_csv": [
+        "runtime-comparisons.csv",
+        "runtime-provenance.csv",
+        "runtime-summary.csv",
+        "workflow-comparisons.csv",
+        "workflow-provenance.csv",
+        "workflow-summary.csv",
+        "measurement-coverage.csv",
+        "filesystem.csv",
+        "filesystem-comparisons.csv",
+        "filesystem-provenance.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/isolation-tests.md",
+      "benchmark_ids": [
+        "B-ISOLATION"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "evidence-sources.csv",
+        "isolation-provenance.csv",
+        "isolation-tests.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/lazy-image-startup.md",
+      "benchmark_ids": [
+        "B-LAZY-STARTUP"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "lazy-numpy-details.csv",
+        "lazy-numpy-provenance.csv",
+        "lazy-numpy-summary.csv",
+        "lazy-startup-details.csv",
+        "lazy-startup-provenance.csv",
+        "lazy-startup-summary.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/methodology.md",
+      "benchmark_ids": [
+        "B-METHOD"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "evidence-sources.csv",
+        "methodology.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/network.md",
+      "benchmark_ids": [
+        "B-NETWORK"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "network-comparisons.csv",
+        "network-provenance.csv",
+        "network-summary.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/replay-fidelity.md",
+      "benchmark_ids": [
+        "B-REPLAY"
+      ],
+      "role": "user-facing",
+      "tables": [
+        {
+          "json": "benchmarks/replay-semspec.render.json",
+          "kind": "published",
+          "columns": [
+            "N",
+            "Median ms",
+            "Mean ms",
+            "SD ms",
+            "Min ms",
+            "Max ms"
+          ],
+          "rows": 7,
+          "options": {}
+        }
+      ],
+      "source_csv": [
+        "evidence-sources.csv",
+        "replay-fidelity.csv",
+        "replay-provenance.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/startup.md",
+      "benchmark_ids": [
+        "B-STARTUP",
+        "B-MACOS"
+      ],
+      "role": "user-facing",
+      "tables": [
+        {
+          "json": "benchmarks/startup-timing.ready.render.json",
+          "kind": "published",
+          "columns": [
+            "N",
+            "Ready 中位数 ms",
+            "Ready 均值 ms",
+            "Ready 标准差 ms",
+            "Ready 最小 ms",
+            "Ready 最大 ms"
+          ],
+          "rows": 8,
+          "options": {}
+        },
+        {
+          "json": "benchmarks/startup-timing.exit.render.json",
+          "kind": "published",
+          "columns": [
+            "N",
+            "Exit 中位数 ms",
+            "Exit 均值 ms",
+            "Exit 标准差 ms",
+            "Exit 最小 ms",
+            "Exit 最大 ms"
+          ],
+          "rows": 8,
+          "options": {}
+        }
+      ],
+      "source_csv": [
+        "startup-hyperfine.csv",
+        "startup-semspec.csv",
+        "startup-stock-comparisons.csv",
+        "startup-stock-provenance.csv",
+        "startup.csv",
+        "startup-ready.csv",
+        "startup-ready-exit.csv",
+        "startup-timing.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/supervision-cost.md",
+      "benchmark_ids": [
+        "B-WORKFLOW",
+        "B-SUPERVISION",
+        "B-APPLY"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "apply-comparisons.csv",
+        "apply-concurrent-conflicts.csv",
+        "apply-provenance.csv",
+        "apply-recovery.csv",
+        "apply.csv",
+        "evidence-sources.csv",
+        "supervision-comparisons.csv",
+        "supervision-cost.csv",
+        "supervision-provenance.csv",
+        "supervision-summary.csv",
+        "workflow-comparisons.csv",
+        "workflow-provenance.csv",
+        "workflow-summary.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "benchmarks/vm-memory/index.md",
+      "benchmark_ids": [
+        "B-VM-MEMORY"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "memory-choices-comparisons.csv",
+        "memory-choices-provenance.csv",
+        "memory-choices.csv",
+        "memory-sharing-comparisons.csv",
+        "memory-sharing-provenance.csv",
+        "memory-sharing.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "design/vm-startup-performance-analysis.md",
+      "benchmark_ids": [
+        "B-STARTUP-ENG",
+        "B-KERNEL-ENG",
+        "B-STARTUP-DIAG"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": [
+        "kernel-capabilities.csv",
+        "kernel-config-capabilities.csv",
+        "concurrency-startup-summary.csv",
+        "concurrency-retest-provenance.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "design/vm-memory-performance-analysis.md",
+      "benchmark_ids": [
+        "B-MEMORY-SCALE",
+        "B-MEMORY-DIAG",
+        "B-COLD-RUNTIME-ENG"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "zh",
+      "page": "design/filesystem-performance-analysis.md",
+      "benchmark_ids": [
+        "B-FS-ENG",
+        "B-FS-DIAG"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": [
+        "apply-engineering-comparisons.csv",
+        "apply-engineering-provenance.csv",
+        "apply-engineering-summary.csv",
+        "apply-sync-counts.csv",
+        "filesystem-counters.csv",
+        "filesystem-durability-counters.csv",
+        "filesystem-exec-provenance.csv",
+        "filesystem-exec-summary.csv",
+        "filesystem-executor-scratch.csv",
+        "filesystem-fuse-counters.csv",
+        "filesystem-node-cache.csv",
+        "host-copy-up-summary.csv",
+        "host-idle-dispatch-provenance.csv",
+        "host-idle-dispatch-summary.csv",
+        "host-read-summary.csv",
+        "immutable-lower-cache-counters.csv",
+        "immutable-lower-cache-summary.csv",
+        "journal-lock-summary.csv",
+        "kernel-cache-counters.csv",
+        "kernel-cache-summary.csv",
+        "vm-completion-dispatch-provenance.csv",
+        "vm-completion-dispatch-summary.csv",
+        "concurrency-filesystem-summary.csv",
+        "concurrency-retest-provenance.csv",
+        "direct-queue-filesystem-summary.csv",
+        "direct-queue-provenance.csv",
+        "readonly-dax-summary.csv",
+        "readonly-dax-provenance.csv",
+        "writeback-filesystem-summary.csv",
+        "writeback-provenance.csv",
+        "filesystem-evidence-overview.csv",
+        "filesystem-measurement-status.csv",
+        "filesystem-optimization-n30-summary.csv",
+        "filesystem-optimization-n30-provenance.csv"
+      ]
+    },
+    {
+      "locale": "zh",
+      "page": "design/agent-task-performance-analysis.md",
+      "benchmark_ids": [
+        "B-AGENT-TASK"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "zh",
+      "page": "design/cluster-performance-analysis.md",
+      "benchmark_ids": [
+        "B-CLUSTER"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "zh",
+      "page": "design/cluster-benchmark-plan.md",
+      "benchmark_ids": [
+        "B-CLUSTER"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "zh",
+      "page": "design/benchmark-methodology-evidence.md",
+      "benchmark_ids": [
+        "B-METHOD"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/agent-tasks.md",
+      "benchmark_ids": [
+        "B-AGENT-TASK",
+        "B-COMPARE"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "agent-tasks.csv",
+        "runtime-comparisons.csv",
+        "runtime-provenance.csv",
+        "runtime-summary.csv",
+        "task-scenarios.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/cluster-scalability.md",
+      "benchmark_ids": [
+        "B-CLUSTER"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "cluster-comparisons.csv",
+        "cluster-provenance.csv",
+        "cluster-summary.csv",
+        "controller-history-provenance.csv",
+        "controller-history-summary.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/compare-rl-infra.md",
+      "benchmark_ids": [
+        "B-COMPARE"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "agent-tasks.csv",
+        "compare-rl-infra.csv",
+        "density-summary.csv",
+        "isolation-tests.csv",
+        "lazy-startup-summary.csv",
+        "replay-fidelity.csv",
+        "startup.csv",
+        "vm-memory/memory-choices.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/density.md",
+      "benchmark_ids": [
+        "B-DENSITY"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "density-provenance.csv",
+        "density-summary.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/filesystem.md",
+      "benchmark_ids": [
+        "B-FS-TOOLS",
+        "B-MACOS"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "filesystem-cache-policy.csv",
+        "filesystem-comparisons.csv",
+        "filesystem-provenance.csv",
+        "filesystem.csv",
+        "runtime-provenance.csv",
+        "runtime-summary.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/index.md",
+      "benchmark_ids": [
+        "B-OVERVIEW"
+      ],
+      "role": "user-facing",
+      "tables": [
+        {
+          "json": "benchmarks/measurement-coverage.render.json",
+          "kind": "coverage",
+          "rows": 14,
+          "columns": [
+            "Data status",
+            "Measured scope"
+          ],
+          "options": {
+            "markdown": true
+          }
+        }
+      ],
+      "source_csv": [
+        "runtime-comparisons.csv",
+        "runtime-provenance.csv",
+        "runtime-summary.csv",
+        "workflow-comparisons.csv",
+        "workflow-provenance.csv",
+        "workflow-summary.csv",
+        "measurement-coverage.csv",
+        "filesystem.csv",
+        "filesystem-comparisons.csv",
+        "filesystem-provenance.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/isolation-tests.md",
+      "benchmark_ids": [
+        "B-ISOLATION"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "evidence-sources.csv",
+        "isolation-provenance.csv",
+        "isolation-tests.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/lazy-image-startup.md",
+      "benchmark_ids": [
+        "B-LAZY-STARTUP"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "lazy-numpy-details.csv",
+        "lazy-numpy-provenance.csv",
+        "lazy-numpy-summary.csv",
+        "lazy-startup-details.csv",
+        "lazy-startup-provenance.csv",
+        "lazy-startup-summary.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/methodology.md",
+      "benchmark_ids": [
+        "B-METHOD"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "evidence-sources.csv",
+        "methodology.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/network.md",
+      "benchmark_ids": [
+        "B-NETWORK"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "network-comparisons.csv",
+        "network-provenance.csv",
+        "network-summary.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/replay-fidelity.md",
+      "benchmark_ids": [
+        "B-REPLAY"
+      ],
+      "role": "user-facing",
+      "tables": [
+        {
+          "json": "benchmarks/replay-semspec.render.json",
+          "kind": "published",
+          "columns": [
+            "N",
+            "Median ms",
+            "Mean ms",
+            "SD ms",
+            "Min ms",
+            "Max ms"
+          ],
+          "rows": 7,
+          "options": {}
+        }
+      ],
+      "source_csv": [
+        "evidence-sources.csv",
+        "replay-fidelity.csv",
+        "replay-provenance.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/startup.md",
+      "benchmark_ids": [
+        "B-STARTUP",
+        "B-MACOS"
+      ],
+      "role": "user-facing",
+      "tables": [
+        {
+          "json": "benchmarks/startup-timing.ready.render.json",
+          "kind": "published",
+          "columns": [
+            "N",
+            "Ready median ms",
+            "Ready mean ms",
+            "Ready SD ms",
+            "Ready min ms",
+            "Ready max ms"
+          ],
+          "rows": 8,
+          "options": {}
+        },
+        {
+          "json": "benchmarks/startup-timing.exit.render.json",
+          "kind": "published",
+          "columns": [
+            "N",
+            "Exit median ms",
+            "Exit mean ms",
+            "Exit SD ms",
+            "Exit min ms",
+            "Exit max ms"
+          ],
+          "rows": 8,
+          "options": {}
+        }
+      ],
+      "source_csv": [
+        "startup-hyperfine.csv",
+        "startup-semspec.csv",
+        "startup-stock-comparisons.csv",
+        "startup-stock-provenance.csv",
+        "startup.csv",
+        "startup-ready.csv",
+        "startup-ready-exit.csv",
+        "startup-timing.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/supervision-cost.md",
+      "benchmark_ids": [
+        "B-WORKFLOW",
+        "B-SUPERVISION",
+        "B-APPLY"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "apply-comparisons.csv",
+        "apply-concurrent-conflicts.csv",
+        "apply-provenance.csv",
+        "apply-recovery.csv",
+        "apply.csv",
+        "evidence-sources.csv",
+        "supervision-comparisons.csv",
+        "supervision-cost.csv",
+        "supervision-provenance.csv",
+        "supervision-summary.csv",
+        "workflow-comparisons.csv",
+        "workflow-provenance.csv",
+        "workflow-summary.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "benchmarks/vm-memory/index.md",
+      "benchmark_ids": [
+        "B-VM-MEMORY"
+      ],
+      "role": "user-facing",
+      "tables": [],
+      "source_csv": [
+        "memory-choices-comparisons.csv",
+        "memory-choices-provenance.csv",
+        "memory-choices.csv",
+        "memory-sharing-comparisons.csv",
+        "memory-sharing-provenance.csv",
+        "memory-sharing.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "design/vm-startup-performance-analysis.md",
+      "benchmark_ids": [
+        "B-STARTUP-ENG",
+        "B-KERNEL-ENG",
+        "B-STARTUP-DIAG"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": [
+        "kernel-capabilities.csv",
+        "kernel-config-capabilities.csv",
+        "concurrency-startup-summary.csv",
+        "concurrency-retest-provenance.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "design/vm-memory-performance-analysis.md",
+      "benchmark_ids": [
+        "B-MEMORY-SCALE",
+        "B-MEMORY-DIAG",
+        "B-COLD-RUNTIME-ENG"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "en",
+      "page": "design/filesystem-performance-analysis.md",
+      "benchmark_ids": [
+        "B-FS-ENG",
+        "B-FS-DIAG"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": [
+        "apply-engineering-comparisons.csv",
+        "apply-engineering-provenance.csv",
+        "apply-engineering-summary.csv",
+        "apply-sync-counts.csv",
+        "filesystem-counters.csv",
+        "filesystem-durability-counters.csv",
+        "filesystem-exec-provenance.csv",
+        "filesystem-exec-summary.csv",
+        "filesystem-executor-scratch.csv",
+        "filesystem-fuse-counters.csv",
+        "filesystem-node-cache.csv",
+        "host-copy-up-summary.csv",
+        "host-idle-dispatch-provenance.csv",
+        "host-idle-dispatch-summary.csv",
+        "host-read-summary.csv",
+        "immutable-lower-cache-counters.csv",
+        "immutable-lower-cache-summary.csv",
+        "journal-lock-summary.csv",
+        "kernel-cache-counters.csv",
+        "kernel-cache-summary.csv",
+        "vm-completion-dispatch-provenance.csv",
+        "vm-completion-dispatch-summary.csv",
+        "concurrency-filesystem-summary.csv",
+        "concurrency-retest-provenance.csv",
+        "direct-queue-filesystem-summary.csv",
+        "direct-queue-provenance.csv",
+        "readonly-dax-summary.csv",
+        "readonly-dax-provenance.csv",
+        "writeback-filesystem-summary.csv",
+        "writeback-provenance.csv",
+        "filesystem-evidence-overview.csv",
+        "filesystem-measurement-status.csv",
+        "filesystem-optimization-n30-summary.csv",
+        "filesystem-optimization-n30-provenance.csv"
+      ]
+    },
+    {
+      "locale": "en",
+      "page": "design/agent-task-performance-analysis.md",
+      "benchmark_ids": [
+        "B-AGENT-TASK"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "en",
+      "page": "design/cluster-performance-analysis.md",
+      "benchmark_ids": [
+        "B-CLUSTER"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "en",
+      "page": "design/cluster-benchmark-plan.md",
+      "benchmark_ids": [
+        "B-CLUSTER"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    },
+    {
+      "locale": "en",
+      "page": "design/benchmark-methodology-evidence.md",
+      "benchmark_ids": [
+        "B-METHOD"
+      ],
+      "role": "engineering evidence",
+      "tables": [],
+      "source_csv": []
+    }
+  ],
+  "bindings": {
+    "replay/replay.json": {
+      "benchmark_id": "B-REPLAY",
+      "page": "benchmarks/replay-fidelity.md",
+      "table": "benchmarks/replay-semspec.render.json",
+      "csv": "replay-semspec.csv",
+      "show_batch": false
+    },
+    "startup/native_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/pvisor_host_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/pvisor_staged_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/pvisor_vm_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/docker_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/fc_system_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/qemu_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    },
+    "startup/qemu_microvm_timing.json": {
+      "kind": "startup",
+      "benchmark_id": "B-STARTUP",
+      "page": "benchmarks/startup.md",
+      "metric_scope": "same Popen launch to exact Ready line receipt and normal process exit; perf_counter_ns; preparation excluded"
+    }
+  }
+}

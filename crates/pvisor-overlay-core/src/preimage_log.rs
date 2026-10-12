@@ -368,6 +368,14 @@ impl PreimageLog {
 
     // Split the transaction so OverlayCore can also release its handle mutex
     // while capturing bytes; both halves still refresh under flock.
+    // This is only a hint. A positive result must be checked by a refreshed,
+    // binding-verified transaction: another owner may have consumed the entry.
+    pub(crate) fn may_contain(&self, path: &Path) -> bool {
+        self.state
+            .observations
+            .contains_key(path.as_os_str().as_bytes())
+    }
+
     pub(crate) fn contains_or_promote(&mut self, path: &Path, durable: bool) -> io::Result<bool> {
         validate_path(path)?;
         let key = path.as_os_str().as_bytes();

@@ -218,6 +218,8 @@ Concrete counterexamples guide experiments. Repeated, read-heavy VMs can expose 
 
 Pin tasks, inputs, output checks, versions and total budgets, then measure correct completions, CPU, memory peaks, memory-time and restoration latency separately. Supervision cost additionally needs actual review, rejection and rework data; machine runtime cannot stand in for human attention. [Research directions](research/index.md) retain these hypotheses and integration boundaries. [Benchmarks](../benchmarks/index.md) retain each dataset's measurement scope.
 
+The [Experimental features](experimental/index.md) registry records platform, profile and implementation stage. vCPU idle observation currently provides an M0 observation prototype; automatic offload still needs validation. The guest filesystem cache remains an RFC proposing local metadata operations and ordinary read-only open while preserving host stage ownership and access boundaries. Both routes require complete lifecycle and resource measurements to establish net benefit.
+
 ## 11. Returning to the whole system {#results}
 
 The example now forms a complete path. Admission fixes policy; the Session prepares VM, files and networking; the guest reads a lower through virtio-fs and opens HTTPS through controlled egress; writes copy up into the upper; completion synchronizes the stage, reclaims resources and retains facts. Finally, the developer uses preimage checks to publish selected candidate files into the target.

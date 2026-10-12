@@ -1,0 +1,3 @@
+{
+  "immutable-share-paired": "$ python3 @HARNESS@/dax_ab.py --measure @BATCH@"
+}

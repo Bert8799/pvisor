@@ -10,6 +10,12 @@
 | Use an OCI writable workspace mount | Writes reach the host directly; provide review and rollback separately |
 | Allow access to host paths | Tested host keeps host paths visible and is not a workspace file sandbox |
 
+<!-- measurement-status:start -->
+
+The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
+
 ## Motivation {#motivation}
 
 Choosing an execution mode requires knowing both the accessible paths and where writes land. A successful command alone cannot distinguish a staged write from a host modification. The boundary also determines which performance controls offer comparable semantics.

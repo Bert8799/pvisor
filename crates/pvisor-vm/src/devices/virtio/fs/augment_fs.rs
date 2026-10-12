@@ -245,6 +245,14 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         self.inner.init(capable)
     }
 
+    fn attribute_flags(&self, inode: Inode, attr: &bindings::stat64) -> u32 {
+        if self.is_virtual(inode) {
+            0
+        } else {
+            self.inner.attribute_flags(inode, attr)
+        }
+    }
+
     fn destroy(&self) {
         self.inner.destroy()
     }
@@ -730,57 +738,13 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         shm_size: u64,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
-        {
-            let inodes = self.inodes.read().unwrap();
-            if let Some(vnode) = inodes.get(&inode) {
-                let data = vnode.data().ok_or_else(linux_errno::eisdir)?;
-                #[cfg(target_os = "linux")]
-                {
-                    if (moffset + len) > shm_size {
-                        return Err(linux_errno::einval());
-                    }
-
-                    let addr = host_shm_base + moffset;
-                    let ret = unsafe {
-                        libc::mmap(
-                            addr as *mut libc::c_void,
-                            len as usize,
-                            libc::PROT_READ | libc::PROT_WRITE,
-                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
-                            -1,
-                            0,
-                        )
-                    };
-                    if std::ptr::eq(ret, libc::MAP_FAILED) {
-                        return Err(io::Error::last_os_error());
-                    }
-
-                    let foff = foffset as usize;
-                    if foff < data.len() {
-                        let available = data.len() - foff;
-                        let to_copy = (len as usize).min(available);
-                        unsafe {
-                            libc::memcpy(
-                                addr as *mut libc::c_void,
-                                data.as_ptr().add(foff) as *const _,
-                                to_copy,
-                            )
-                        };
-                    }
-
-                    return Ok(());
-                }
-
-                // TODO: implement DAX for virtual files on macOS.
-                // Needs a shared memory region manager (see setupmapping
-                // in macos/passthrough.rs for the real-file DAX path).
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = data;
-                    return Err(linux_errno::enosys());
-                }
-            }
+        // Synthetic/one-shot files are not immutable backing files and never
+        // receive a DAX hint. Reject even forged mapping requests; ordinary
+        // reads retain their existing lifecycle and ownership semantics.
+        if self.is_virtual(inode) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
+
         self.inner.setupmapping(
             ctx,
             inode,

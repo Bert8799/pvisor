@@ -73,6 +73,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build-env
+      - name: Install hyperfine for benchmark integration checks
+        run: cargo install hyperfine --version 2.0.0 --locked
       - run: just lint-py
       - run: just test-scripts
       - run: just test-py
@@ -245,9 +247,9 @@ jobs:
       - name: Record isolated core budget
         run: |
           just build release
-          # Host copy-up scheduling and VM admission, including contract tests,
-          # bring the runtime closure to ~189,544 lines; retain ~1,456 lines of headroom.
-          just check-core-budget target/release/pvisor --max-dependencies 235 --max-workspace-lines 191000 --max-core-items 301 > target/pvisor-core-budget.json
+          # Queue dispatch, read-only DAX and their contract tests bring the
+          # runtime closure to 194,578 lines; retain 1,422 lines of headroom.
+          just check-core-budget target/release/pvisor --max-dependencies 235 --max-workspace-lines 196000 --max-core-items 301 > target/pvisor-core-budget.json
       - uses: actions/upload-artifact@v4
         with:
           name: pvisor-core-budget-linux

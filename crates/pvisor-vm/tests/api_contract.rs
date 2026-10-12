@@ -6,6 +6,68 @@ use pvisor_vm::api::{
 use syn::visit::{self, Visit};
 
 #[test]
+fn immutable_dax_configuration_validates_before_attachment_and_rejects_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let mut builder = VmBuilder::new(1, 128).unwrap();
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    {
+        for size in [0, 4096, (2 << 20) + 4096, (1 << 30) + (2 << 20)] {
+            assert_eq!(
+                builder
+                    .immutable_filesystem("data", root.path(), size)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            builder
+                .immutable_filesystem("data", std::path::Path::new("relative"), 2 << 20)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        builder
+            .immutable_filesystem("data", root.path(), 2 << 20)
+            .unwrap();
+        assert!(builder
+            .immutable_filesystem("data", root.path(), 2 << 20)
+            .is_err());
+        assert_eq!(
+            builder.snapshot_profile().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        builder.filesystem("ordinary", root.path(), 0).unwrap();
+        let mut snapshots = VmBuilder::new(1, 128).unwrap();
+        snapshots.snapshot_profile().unwrap();
+        assert_eq!(
+            snapshots
+                .immutable_filesystem("data", root.path(), 2 << 20)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        snapshots.filesystem("data", root.path(), 0).unwrap();
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    )))]
+    assert_eq!(
+        builder
+            .immutable_filesystem("data", root.path(), 2 << 20)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}
+
+#[test]
 fn api_is_unconditional_and_contains_no_implementation() {
     struct Guard;
     impl<'ast> Visit<'ast> for Guard {

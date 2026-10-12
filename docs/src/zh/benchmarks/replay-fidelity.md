@@ -2,13 +2,19 @@
 
 ## 主要结论 {#conclusions}
 
-**七种固定版本轨迹格式各通过 60/60 次前缀校验，prepare-only 不执行工具、不修改工作区。多数格式出现分离的耗时簇：较低簇中位数约 6–7 ms，较高簇约 11–16 ms。适合把任务绑定到历史工具观测；真实模型继续执行的一致率尚未测量。**
+**新框架中，七个适配器的固定 task 0 各通过 60/60 次校验，完整 prepare-only CLI 时间的中位数为 5.56–5.74 ms；不执行工具，不修改工作区。下方 20 条轨迹的历史分簇结果属于不同输入集合，保留原口径；真实模型继续执行的一致率仍未测量。**
 
 | 需求 | 选型含义 |
 |---|---|
 | 准备跨 Agent 的历史工具上下文 | 使用经过校验的固定格式适配器 |
 | 恢复实际文件状态 | 单独恢复任务环境；前缀准备不重放文件修改 |
 | 比较原生 resume 或 RL 管线的速度 | 尚无同轨迹计时对照，不能据此排名 |
+
+<!-- measurement-status:start -->
+
+本页新增实验与历史数据分开发布；各表适用的计时范围和输入见实验设计与来源，不合并不同批次。
+
+<!-- measurement-status:end -->
 
 ## Motivation {#motivation}
 
@@ -39,6 +45,14 @@
 | swe-agent | swe-agent/1.1.0/replay-then-live-v1 | 60/60 (0) | 51/60 (85.0%); 6.55 | 9/60 (15.0%); 14.97 | 15.20 |
 
 Mini-SWE-Agent 未触发分簇规则，该行列出全体样本的 P50。分簇是描述性判定：两簇各至少占 10%，最大相邻间隔至少为整体中位数的 20%、且超过相邻间隔中位数的三倍，两簇中位数至少相差 1.5 倍；它不证明慢簇的成因。有效慢样本全部保留，因此不宜把准备成本概括为固定的几毫秒。
+
+### Hyperfine：直接执行 prepare-only 命令 {#hyperfine}
+
+独立批次为每个适配器固定一条合成轨迹（task 0），采样 60 次，无预热。hyperfine 使用 `--shell=none` 直接启动 `pvisor-replay`；Python 重置和一致性校验在每次计时外执行。所有执行必须保留精确参数、源摘要与历史观测，不执行工具、不改动工作区。数值表示完整命令结束时间，适用范围是这条固定轨迹；上方二十条轨迹的历史分布保留原口径。二进制摘要标识实测制品，与当前源码的构建对应关系未验证。保留宿主缓存；CPU 亲和性和制品标识见来源下载，不据此推导配对改善比例或尾延迟保证。
+
+{{ table("replay-semspec.render.json") }}
+
+[Hyperfine 数据 CSV](replay-semspec.csv) · [批次来源](../assets/benchmarks/replay-semspec.provenance.json) · [JSON benchmark 复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark.new/README.md#replay)
 
 ### 适用边界 {#acceptance}
 
