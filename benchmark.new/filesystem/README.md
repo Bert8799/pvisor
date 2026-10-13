@@ -78,3 +78,21 @@ CPU 0,1 通过继承的 taskset affinity 限定；可用时同时设置 cpuset�
 bootstrap 和所有计数见 `protocol.json`；干扰门禁是 0.5 秒的外部构建/测试扫描，
 不等于排除了全部宿主噪声。原始证据和完整逐次日志保留在批次目录，
 `summary.json`/`summary.csv` 与 `in.render.json` 从同一批数据生成。
+
+## VM 缓存逐项验证
+
+[验证报告](VM_CACHE_VALIDATION_REPORT.md)分别记录 rootfs 数据缓存、rootfs/workspace
+元数据 TTL 和独立只读 no-open 的工程结果，使用 B-FS-ENG 与 B-FS-DIAG 的注册范围。
+CLI 独立确认每臂 N30；快速筛选 N10、只读阶段 N5 与请求诊断分别保留。
+完整七工具任务未检出加速，Cargo 有明确改善；只读 no-open 的阶段收益不外推普通
+可写 workspace。之后仅将具备物理不可变声明的 rootfs 数据缓存接入默认路径，
+元数据长 TTL 和 no-open 仍是原型；用户跨后端页面不使用这些数字替换既有结果。
+接入条件和关闭控制见 [VM 合同](../../crates/pvisor-vm/README.md#rootfs-data-cache-default)。
+
+完整精度数据见 [CLI 确认](vm-cache-confirm.csv)、[CLI 筛选](vm-cache-screen.csv)和
+[只读阶段](vm-cache-readonly.csv)，来源及验收范围见
+[收据](vm-cache-validation.provenance.json)。冻结源码、二进制、输入、运行入口和失败
+尝试保留在 `.data/vm-cache-verify-20261012/`；复核使用其中的 `confirm.json`、
+`screen-retry.json`、`diagnostic-retry.json`、`ro-screen.json` 和
+`ro-diag.json`，均经 semspec bench 执行。复跑必须先为输出配置新的批次目录，
+避免覆盖原始证据，并满足报告列出的 KVM、预算和干扰门禁。

@@ -1,11 +1,11 @@
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::utils::eventfd::{EventFd, EFD_NONBLOCK};
+use crate::utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
 use crate::utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
@@ -15,14 +15,14 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
     VirtioShmRegion,
 };
+use super::ExportTable;
 use super::overlay::Config as OverlayConfig;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
-use super::ExportTable;
 use super::{defs, defs::uapi};
-use crate::devices::virtio::passthrough::PermissionSemantics;
 use crate::devices::virtio::InterruptTransport;
+use crate::devices::virtio::passthrough::PermissionSemantics;
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -80,10 +80,8 @@ impl Fs {
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = super::worker::worker_count() as u32;
-        let queue_config = vec![
-            QueueConfig::new(defs::QUEUE_SIZE);
-            config.num_request_queues as usize + 1
-        ];
+        let queue_config =
+            vec![QueueConfig::new(defs::QUEUE_SIZE); config.num_request_queues as usize + 1];
 
         let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
             // As uid/gid are context-dependent, attributes can't be cached.
@@ -298,6 +296,9 @@ impl VirtioDevice for Fs {
 
         let virtual_entries = self.virtual_entries.clone();
         let worker = FsWorker::new(super::worker::FsWorkerConfig {
+            fs_tag: String::from_utf8_lossy(&self.config.tag)
+                .trim_end_matches('\0')
+                .into(),
             queues: worker_queues,
             queue_evts,
             interrupt: interrupt.clone(),
@@ -365,14 +366,24 @@ mod tests {
     #[test]
     fn request_queue_configuration_preserves_hiprio_and_rejects_invalid_counts() {
         let mut fs = Fs::new(
-            "queue-test".into(), PermissionSemantics::LinuxComplete, None,
-            Arc::new(AtomicI32::new(0)), false, vec![], None,
-        ).unwrap();
+            "queue-test".into(),
+            PermissionSemantics::LinuxComplete,
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            vec![],
+            None,
+        )
+        .unwrap();
         fs.configure_request_queues(3).unwrap();
         let count = fs.config.num_request_queues;
         assert_eq!(count, 3);
         assert_eq!(fs.queue_config().len(), 4);
-        assert!(fs.queue_config().iter().all(|queue| queue.size == defs::QUEUE_SIZE));
+        assert!(
+            fs.queue_config()
+                .iter()
+                .all(|queue| queue.size == defs::QUEUE_SIZE)
+        );
         assert!(fs.configure_request_queues(0).is_err());
         assert!(fs.configure_request_queues(9).is_err());
         assert_eq!(fs.queue_config().len(), 4);

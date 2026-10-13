@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
+use pvisor_overlay_core::{BackingIdentity, BackingResolution, OverlayCore};
 use pvisor_overlay_core::{
     backend,
     service::{FilesystemService, OpenBacking},
 };
-use pvisor_overlay_core::{BackingIdentity, BackingResolution, OverlayCore};
 
 use super::super::linux_errno::linux_error;
 use super::bindings;
@@ -670,6 +670,10 @@ pub struct OverlayFs {
     // New INITs use the caller's current preference. Restoring an already
     // negotiated session must not silently change its saved writeback mode.
     new_session_writeback: bool,
+    // Only the root device opts in, and each OPEN still requires an explicit
+    // physical-lower stability promise. Upper and mutable data stay uncached
+    // across opens. This preference is not a persisted handle/cache object.
+    immutable_data_cache: bool,
     virtual_metadata: bool,
     snapshot_config: Config,
     roots: Vec<PathBuf>,
@@ -690,6 +694,10 @@ impl OverlayFs {
 
     pub fn open_existing(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
         Self::build(cfg, inode_alloc, true)
+    }
+
+    pub(super) fn configure_immutable_data_cache(&mut self, enabled: bool) {
+        self.immutable_data_cache = enabled;
     }
 
     fn read_operation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
@@ -848,6 +856,7 @@ impl OverlayFs {
             io_activity: Arc::new(IoActivity::default()),
             core,
             new_session_writeback,
+            immutable_data_cache: false,
             snapshot_config: cfg,
             roots,
             layers,
@@ -1482,7 +1491,7 @@ impl FileSystem for OverlayFs {
         )))
     }
     fn restore_state(&self, state: &super::snapshot::FsSnapshot) -> io::Result<()> {
-        use super::snapshot::{invalid, FsSnapshot};
+        use super::snapshot::{FsSnapshot, invalid};
         let FsSnapshot::Overlay(state) = state else {
             return Err(invalid("overlay filesystem type mismatch"));
         };
@@ -1913,22 +1922,27 @@ impl FileSystem for OverlayFs {
         };
         let path = self.path(inode)?;
         let _io = (!readonly).then(|| self.fence_paths(&[&path]));
-        let (layer, inner) = match self
+        let (layer, inner, immutable_regular) = match self
             .core
             .prepare_open_for_backing_lookup(&path, flags as i32)
             .map_err(linux_error)?
         {
-            OpenBacking::Writable(_) => (Layer(0), self.inner_inode(Layer(0), &path, ctx)?),
+            OpenBacking::Writable(_) => (Layer(0), self.inner_inode(Layer(0), &path, ctx)?, false),
             OpenBacking::ReadOnly(backing) => {
                 let layer = Layer(backing.entry.layer);
+                let immutable_regular = backing.entry.metadata.is_file()
+                    && layer.0.checked_sub(1).is_some_and(|index| {
+                        self.snapshot_config.lower_mutability.get(index)
+                            == Some(&pvisor_overlay_core::LayerMutability::Immutable)
+                    });
                 let inner = self
                     .inner_entry_with_parents(layer, &path, ctx, &backing.parents)?
                     .inode;
-                (layer, inner)
+                (layer, inner, immutable_regular)
             }
         };
         let opened = self.layers[layer.0].open(ctx, inner, kill_priv, flags);
-        let (handle, options) = match opened {
+        let (handle, mut options) = match opened {
             Ok((Some(handle), options)) => (handle, options),
             result => {
                 self.layers[layer.0].forget(ctx, inner, 1);
@@ -1938,6 +1952,12 @@ impl FileSystem for OverlayFs {
                 };
             }
         };
+        // Keep OPEN's policy, baseline observation and native descriptor
+        // checks. A writable/copy-up open must invalidate the merged inode's
+        // old lower pages rather than reusing this read-only optimization.
+        if self.immutable_data_cache && readonly && immutable_regular {
+            options |= OpenOptions::KEEP_CACHE;
+        }
         let id = self.allocate_handle(Handle::File(Arc::new(FileHandle {
             overlay_inode: inode,
             layer,
@@ -2501,7 +2521,7 @@ mod tests {
         body: &[u8],
     ) -> (vm_memory::GuestMemoryMmap, vm_memory::GuestAddress, usize) {
         use super::super::descriptor_utils::{
-            create_descriptor_chain, DescriptorType, OwnedDescriptorChain,
+            DescriptorType, OwnedDescriptorChain, create_descriptor_chain,
         };
         use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
@@ -2813,10 +2833,11 @@ mod tests {
             ..Default::default()
         };
         let fs = PassthroughFs::new(config.clone(), Arc::new(InodeAllocator::new())).unwrap();
-        assert!(fs
-            .init(FsOptions::WRITEBACK_CACHE)
-            .unwrap()
-            .contains(FsOptions::WRITEBACK_CACHE));
+        assert!(
+            fs.init(FsOptions::WRITEBACK_CACHE)
+                .unwrap()
+                .contains(FsOptions::WRITEBACK_CACHE)
+        );
         let ctx = Context {
             uid: 0,
             gid: 0,
@@ -3120,9 +3141,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(native
-            .lease_handle(lease.handle.inode, lease.handle.handle)
-            .is_err());
+        assert!(
+            native
+                .lease_handle(lease.handle.inode, lease.handle.handle)
+                .is_err()
+        );
         let mut writer = ReadWriter {
             gate: None,
             bytes: Vec::new(),
@@ -4209,9 +4232,10 @@ mod tests {
         };
         let entry = fs.lookup(ctx, fuse::ROOT_ID, c"dir").unwrap();
         for _ in 0..16 {
-            assert!(fs
-                .open(ctx, entry.inode, false, libc::O_WRONLY as u32)
-                .is_err());
+            assert!(
+                fs.open(ctx, entry.inode, false, libc::O_WRONLY as u32)
+                    .is_err()
+            );
         }
         assert!(fs.handles.lock().unwrap().is_empty());
         let super::super::snapshot::FsSnapshot::Overlay(snapshot) = fs.capture_state().unwrap()
@@ -4223,10 +4247,12 @@ mod tests {
                 panic!("expected a native layer");
             };
             assert!(native.handles.is_empty());
-            assert!(native
-                .inodes
-                .iter()
-                .all(|inode| inode.inode == fuse::ROOT_ID));
+            assert!(
+                native
+                    .inodes
+                    .iter()
+                    .all(|inode| inode.inode == fuse::ROOT_ID)
+            );
         }
     }
 
@@ -4331,21 +4357,233 @@ mod tests {
             gid: 0,
             pid: 1,
         };
-        assert!(fs
-            .lookup(ctx, fuse::ROOT_ID, &CString::new("private.key").unwrap())
-            .is_err());
+        assert!(
+            fs.lookup(ctx, fuse::ROOT_ID, &CString::new("private.key").unwrap())
+                .is_err()
+        );
         let alias = fs
             .lookup(ctx, fuse::ROOT_ID, &CString::new("alias").unwrap())
             .unwrap();
-        assert!(fs
-            .open(ctx, alias.inode, false, libc::O_RDONLY as u32)
-            .is_err());
+        assert!(
+            fs.open(ctx, alias.inode, false, libc::O_RDONLY as u32)
+                .is_err()
+        );
         let env = fs
             .lookup(ctx, fuse::ROOT_ID, &CString::new(".env").unwrap())
             .unwrap();
-        assert!(fs
-            .open(ctx, env.inode, false, libc::O_RDONLY as u32)
-            .is_ok());
+        assert!(
+            fs.open(ctx, env.inode, false, libc::O_RDONLY as u32)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn immutable_data_cache_preserves_open_checks_and_invalidates_copy_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir_all(lower.join("private")).unwrap();
+        std::fs::write(lower.join("file"), b"lower").unwrap();
+        std::fs::write(lower.join("private/key"), b"secret").unwrap();
+        let fixture = parent_cache_fixture(temp.path());
+        let super::super::snapshot::FsSnapshot::Overlay(state) = fixture.capture_state().unwrap()
+        else {
+            panic!("overlay expected")
+        };
+        let mut config = state.config;
+        config.lower_mutability = vec![pvisor_overlay_core::LayerMutability::Immutable];
+        let mut fs = OverlayFs::new(config, Arc::new(InodeAllocator::new())).unwrap();
+        fs.configure_immutable_data_cache(true);
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert_eq!(entry.entry_timeout, TTL);
+        assert_eq!(entry.attr_timeout, TTL);
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"private").is_err());
+        let denied = fs.allocate_inode(PathBuf::from("private/key"));
+        assert!(fs.open(ctx, denied, false, libc::O_RDONLY as u32).is_err());
+        let (old, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(options.contains(OpenOptions::KEEP_CACHE));
+        let old = old.unwrap();
+        fs.configure_immutable_data_cache(false);
+        let (uncached, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(!options.contains(OpenOptions::KEEP_CACHE));
+        fs.release(ctx, entry.inode, 0, uncached.unwrap(), false, false, None)
+            .unwrap();
+        fs.configure_immutable_data_cache(true);
+        let (writable, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDWR as u32)
+            .unwrap();
+        assert!(!options.contains(OpenOptions::KEEP_CACHE));
+        let writable = writable.unwrap();
+        fs.write(
+            ctx,
+            entry.inode,
+            writable,
+            WriteReader(io::Cursor::new(b"upper".to_vec())),
+            5,
+            0,
+            None,
+            false,
+            false,
+            libc::O_RDWR as u32,
+        )
+        .unwrap();
+        let (new, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(!options.contains(OpenOptions::KEEP_CACHE));
+        for (handle, expected) in [(old, b"lower"), (new.unwrap(), b"upper")] {
+            let mut writer = ReadWriter {
+                gate: None,
+                bytes: Vec::new(),
+            };
+            fs.read(ctx, entry.inode, handle, &mut writer, 5, 0, None, 0)
+                .unwrap();
+            assert_eq!(&writer.bytes, expected);
+            fs.release(ctx, entry.inode, 0, handle, false, false, None)
+                .unwrap();
+        }
+        fs.release(ctx, entry.inode, 0, writable, false, false, None)
+            .unwrap();
+        assert_eq!(std::fs::read(lower.join("file")).unwrap(), b"lower");
+        fs.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"file").is_err());
+    }
+
+    #[test]
+    fn data_cache_requires_the_selected_physical_lower_to_be_immutable() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        let mutable = temp.path().join("mutable");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::create_dir(&mutable).unwrap();
+        std::fs::write(lower.join("stable"), b"stable").unwrap();
+        std::fs::write(mutable.join("live"), b"before").unwrap();
+        let fixture = parent_cache_fixture(temp.path());
+        let super::super::snapshot::FsSnapshot::Overlay(state) = fixture.capture_state().unwrap()
+        else {
+            panic!("overlay expected")
+        };
+        let mut config = state.config;
+        config
+            .lower_dirs
+            .insert(0, mutable.to_string_lossy().into_owned());
+        config.lower_mutability = vec![
+            pvisor_overlay_core::LayerMutability::Mutable,
+            pvisor_overlay_core::LayerMutability::Immutable,
+        ];
+        let mut fs = OverlayFs::new(config, Arc::new(InodeAllocator::new())).unwrap();
+        fs.configure_immutable_data_cache(true);
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for (name, cached) in [(c"live", false), (c"stable", true)] {
+            let entry = fs.lookup(ctx, fuse::ROOT_ID, name).unwrap();
+            let (handle, options) = fs
+                .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+                .unwrap();
+            assert_eq!(options.contains(OpenOptions::KEEP_CACHE), cached);
+            fs.release(ctx, entry.inode, 0, handle.unwrap(), false, false, None)
+                .unwrap();
+        }
+        std::fs::write(mutable.join("live"), b"after!").unwrap();
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"live").unwrap();
+        let (handle, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(!options.contains(OpenOptions::KEEP_CACHE));
+        let mut writer = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        fs.read(
+            ctx,
+            entry.inode,
+            handle.unwrap(),
+            &mut writer,
+            6,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.bytes, b"after!");
+        fs.release(ctx, entry.inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn immutable_data_cache_restores_backing_without_persisting_a_new_cache_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::write(lower.join("file"), b"stable").unwrap();
+        let fixture = parent_cache_fixture(temp.path());
+        let super::super::snapshot::FsSnapshot::Overlay(state) = fixture.capture_state().unwrap()
+        else {
+            panic!("overlay expected")
+        };
+        let mut config = state.config;
+        config.lower_mutability = vec![pvisor_overlay_core::LayerMutability::Immutable];
+        let mut fs = OverlayFs::new(config.clone(), Arc::new(InodeAllocator::new())).unwrap();
+        fs.configure_immutable_data_cache(true);
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        let (handle, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(options.contains(OpenOptions::KEEP_CACHE));
+        let saved = fs.capture_state().unwrap();
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("immutable_data_cache"));
+        let saved = serde_json::from_slice(&encoded).unwrap();
+        let mut restored =
+            OverlayFs::open_existing(config, Arc::new(InodeAllocator::new())).unwrap();
+        restored.configure_immutable_data_cache(true);
+        restored.restore_state(&saved).unwrap();
+        let mut writer = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        restored
+            .read(
+                ctx,
+                entry.inode,
+                handle.unwrap(),
+                &mut writer,
+                6,
+                0,
+                None,
+                0,
+            )
+            .unwrap();
+        assert_eq!(writer.bytes, b"stable");
+        restored
+            .release(ctx, entry.inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
+        let (handle, options) = restored
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(options.contains(OpenOptions::KEEP_CACHE));
+        restored
+            .release(ctx, entry.inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
     }
 
     #[test]
@@ -4685,8 +4923,8 @@ mod tests {
         assert_eq!(entry.attr.st_gid, 2345);
         assert_eq!(entry.attr.st_mode as u32 & 0o7777, 0o755);
         fs.access(ctx, entry.inode, libc::X_OK as u32).unwrap();
-        assert!(fs
-            .access(
+        assert!(
+            fs.access(
                 Context {
                     uid: 3456,
                     gid: 3456,
@@ -4695,7 +4933,8 @@ mod tests {
                 entry.inode,
                 libc::W_OK as u32
             )
-            .is_err());
+            .is_err()
+        );
         let handle = fs
             .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
             .unwrap()

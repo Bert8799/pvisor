@@ -551,8 +551,16 @@ For same-artifact/same-input A/B keep declarations unchanged and set
 process/VM runner for the no-cache control; unset for caching. No formal CLI was
 added. `PVISOR_FS_PROFILE=1` reports `overlay-core` hit/miss/eviction `units`; see
 that crate's README for exact names and capacity. This is a metadata/path/parent
-cache only: no directory inventory/content cache, kernel TTL or KEEP_CACHE change,
-or claimed real-FUSE speedup. Upper/merged state must never be labeled immutable.
+cache only: no directory inventory/content cache or kernel TTL change. Native
+VM root devices now additionally retain guest data pages on read-only regular
+OPENs from explicitly immutable physical lowers; workspace, upper and mutable
+lowers keep their original OPEN behavior. This defaults to the `root-data`
+profile; `PVISOR_VM_CACHE_EXPERIMENT=off` in the serving runner disables it.
+This does not promote any of the mutable sources listed above or use
+`VmSettings.rootfs_immutable`'s apply restriction as a stability proof. See
+the [VM data-cache contract](../pvisor-vm/README.md#rootfs-data-cache-default).
+The conditional default has no independent real-guest performance claim.
+Upper/merged state must never be labeled immutable.
 
 ## Develop
 

@@ -1,8 +1,8 @@
 //! Queue-local execution with stealing directly from a blocked owner's ring.
 //! Only descriptor admission and used-ring publication hold the ring mutex.
 use super::*;
-use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 const STEAL_DELAY: Duration = Duration::from_millis(2);
