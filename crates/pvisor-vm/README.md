@@ -198,12 +198,47 @@ Immutable is a caller-owned lifetime guarantee of physical contents, metadata,
 namespace, parent and mount identity, including hardlink aliases, not proof from
 a read-only mount or `frozen_baseline`. Do not declare a merged upper immutable.
 The Core cache is bounded and never bypasses merged precedence, upper markers,
-policy, hardlink checks or baseline read observations. Guest TTL and KEEP_CACHE
-are unchanged. Set `PVISOR_DISABLE_IMMUTABLE_LOWER_CACHE=1` in the host runner
+policy, hardlink checks or baseline read observations. Guest TTLs are unchanged;
+root-device data-page retention is described below. Set
+`PVISOR_DISABLE_IMMUTABLE_LOWER_CACHE=1` in the host runner
 before device construction for the same-contract uncached A/B control; unset
 for caching. `PVISOR_FS_PROFILE=1` reports Core hit/miss/eviction counters; the
 shared Core README specifies bounds and exact measurement names. No real guest
 performance claim is made by these contract tests.
+
+## Rootfs data-cache default
+
+The root Overlay device (`/dev/root`) defaults to the selected `root-data`
+profile: retain guest data pages across read-only regular-file OPENs only when
+the selected physical lower has an explicit `LayerMutability::Immutable`
+declaration. The default does not promote host `/`, arbitrary prepared rootfs,
+OCI extraction, lazy physical projections or frozen baselines to immutable.
+`rootfs_immutable`'s apply restriction alone is not this lifetime guarantee.
+
+OPEN still resolves merged precedence, checks policy/aliases and permissions,
+records the baseline observation and acquires its normal native descriptor.
+Writable or privilege-changing OPENs, copy-up and reads from upper/mutable
+layers retain the original cache-invalidating OPEN behavior. Workspace devices
+retain their original data policy even if a lower is explicitly immutable.
+Metadata TTLs remain unchanged; no-open is not enabled. New VM writeback and
+DAX remain default-off; existing explicit choices and saved writeback sessions
+keep their documented behavior.
+
+Before constructing the serving host runner, set
+`PVISOR_VM_CACHE_EXPERIMENT=off` for the uncached control or `root-data` for this
+profile; unset also selects `root-data`. The old frozen experiment's metadata,
+combined and no-open values are rejected rather than silently enabled. This
+variable controls admission to the optimization, not physical immutability.
+No per-request environment lookup is added.
+
+The preference adds no serialized cache object or handle field. Restore keeps
+the existing backing identity/content checks and guest RAM pages. Future OPENs
+use the newly constructed device's preference and saved lower declarations;
+legacy mutable declarations and copies downgraded during rebinding cannot
+qualify. Unit tests cover cache flags, unchanged TTLs, denied OPENs, writable
+copy-up/old-FD ownership, live mutable reads, mixed lower order and snapshot
+round trips. Frozen engineering A/B results apply to their owned inputs; the
+new stricter default has no independent end-to-end performance measurement.
 
 ## 不可变只读文件的 DAX
 

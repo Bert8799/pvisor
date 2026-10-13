@@ -127,7 +127,7 @@ pub trait VmConfiguration: Sized {
     fn set_firmware_path(&mut self, path: PathBuf) -> io::Result<()>;
     fn ram_backing(&mut self, file: File) -> io::Result<()>;
     fn embedded_kernel(&mut self, bytes: &[u8], guest_addr: u64, entry_addr: u64)
-        -> io::Result<()>;
+    -> io::Result<()>;
     fn disable_implicit_init(&mut self) -> io::Result<()>;
     /// Configure a custom init's command; requires implicit init to be disabled.
     /// Validate atomically before replacing the previous command.
@@ -624,6 +624,10 @@ pub struct OverlayConfig {
     /// namespace, ancestors and mount identities until device teardown, including
     /// restore lifetimes. Read-only mounts and frozen baselines are not proof.
     /// This never describes upper or merged-view stability.
+    /// On the root device, read-only regular-file OPENs from an explicitly
+    /// immutable lower retain guest data pages across opens by default. OPEN
+    /// authorization and baseline observations still run; metadata TTLs stay
+    /// unchanged. Mutable lowers and upper files do not use this optimization.
     pub lower_mutability: Vec<pvisor_overlay_core::LayerMutability>,
     pub upper_dir: PathBuf,
     pub work_dir: Option<PathBuf>,

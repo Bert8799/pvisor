@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use crate::utils::eventfd::{EventFd, EFD_NONBLOCK};
+use crate::utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue;
@@ -306,11 +306,7 @@ impl RequestPool {
         // if arm wins, that worker signals the sleeping owner. Never park with
         // an already queued completion, but still poll stop/kick events first.
         self.awaiting_wake.swap(true, Ordering::AcqRel);
-        if self.completed.is_empty() {
-            -1
-        } else {
-            0
-        }
+        if self.completed.is_empty() { -1 } else { 0 }
     }
 
     fn submit(&mut self, mut request: Request) {
@@ -355,7 +351,19 @@ pub(super) fn worker_count() -> usize {
         .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get().min(4)))
 }
 
+fn root_data_cache_enabled(tag: &str, setting: Option<&str>) -> io::Result<bool> {
+    match setting {
+        None | Some("root-data") => Ok(tag == "/dev/root"),
+        Some("off") => Ok(false),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PVISOR_VM_CACHE_EXPERIMENT supports root-data or off; metadata and no-open modes are not integrated",
+        )),
+    }
+}
+
 pub(super) struct FsWorkerConfig {
+    pub fs_tag: String,
     pub queues: Vec<Queue>,
     pub queue_evts: Vec<Arc<EventFd>>,
     pub interrupt: InterruptTransport,
@@ -376,6 +384,7 @@ pub(super) struct FsWorkerConfig {
 impl FsWorker {
     pub fn new(config: FsWorkerConfig) -> Result<Self, io::Error> {
         let FsWorkerConfig {
+            fs_tag,
             queues,
             queue_evts,
             interrupt,
@@ -392,14 +401,26 @@ impl FsWorker {
             #[cfg(target_os = "macos")]
             map_sender,
         } = config;
+        let cache_setting = match std::env::var("PVISOR_VM_CACHE_EXPERIMENT") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "PVISOR_VM_CACHE_EXPERIMENT must be UTF-8",
+                ));
+            }
+        };
+        let root_data_cache = root_data_cache_enabled(&fs_tag, cache_setting.as_deref())?;
         let inode_alloc = Arc::new(InodeAllocator::new());
         let server = match (overlay_cfg, passthrough_cfg) {
             (Some(cfg), _) => {
-                let inner = if restoring {
+                let mut inner = if restoring {
                     OverlayFs::open_existing(cfg, inode_alloc.clone())?
                 } else {
                     OverlayFs::new(cfg, inode_alloc.clone())?
                 };
+                inner.configure_immutable_data_cache(root_data_cache);
                 FsServer::Overlay(Box::new(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -698,7 +719,7 @@ impl FsWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::virtio::descriptor_utils::{create_descriptor_chain, DescriptorType};
+    use crate::devices::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
     use std::time::Duration;
     use vm_memory::GuestAddress;
 
@@ -706,6 +727,7 @@ mod tests {
         use crate::devices::legacy::DummyIrqChip;
         let queue_count = queues.len();
         let mut worker = FsWorker::new(FsWorkerConfig {
+            fs_tag: "test".into(),
             queues,
             queue_evts: (0..queue_count)
                 .map(|_| Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
@@ -728,6 +750,24 @@ mod tests {
         worker.dispatch_profile =
             pvisor_overlay_core::profile::Profile::enabled("virtio-fs-dispatch");
         worker
+    }
+
+    #[test]
+    fn root_data_cache_defaults_to_root_only_and_has_an_off_control() {
+        for setting in [None, Some("root-data")] {
+            assert!(root_data_cache_enabled("/dev/root", setting).unwrap());
+            assert!(!root_data_cache_enabled("pvisor-workspace", setting).unwrap());
+            assert!(!root_data_cache_enabled("tools", setting).unwrap());
+        }
+        assert!(!root_data_cache_enabled("/dev/root", Some("off")).unwrap());
+        for unsupported in ["", "combined", "root-meta", "work-meta", "ro-noopen"] {
+            assert_eq!(
+                root_data_cache_enabled("/dev/root", Some(unsupported))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+            );
+        }
     }
 
     fn check_metadata_admission(opcodes: [Opcode; 2], limit: usize, pooled: usize, remaining: u16) {
@@ -929,12 +969,14 @@ mod tests {
             });
         }
         assert_eq!(normal.used.idx.get(), 2);
-        assert!(!worker
-            .dispatch_profile
-            .report()
-            .unwrap()
-            .measurements
-            .contains_key("notification_checks"));
+        assert!(
+            !worker
+                .dispatch_profile
+                .report()
+                .unwrap()
+                .measurements
+                .contains_key("notification_checks")
+        );
         worker.notify_completed([false, true]);
         let report = worker.dispatch_profile.report().unwrap();
         assert_eq!(report.measurements["published_completions"].units, 2);
