@@ -57,8 +57,10 @@ by `python3 benchmark.new/docs.py publish BATCH`. Links/code in dynamic JSON
 tables opt into `markdown: true`, with `row_names: false` when the first column
 is already present. Semspec validates optional alignments and displayed headers.
 
-Native `watch` entries track benchmark data files for preview rebuilds. Add table
-data stored in other directories to the locale configuration's `watch` list.
+Native `watch` entries track article-side benchmark tables for preview rebuilds.
+Both projects use `theme.custom_dir = "overrides"`; Zensical also watches that
+theme directory, covering shared benchmark CSV, SVG and provenance assets.
+Add table data outside the source and theme directories to `watch` explicitly.
 `docs-build` also uses Zensical's `--clean` to discard cached table expansions.
 
 `docs-serve` sets `PVISOR_DOCS_LIVE=1` and renders tables with semspec's
@@ -173,14 +175,27 @@ network policy guide owns the executor boundary matrix (summarized in
 observations. Other articles link to these definitions. Implementation pages
 explain mechanisms and code ownership. Benchmark and comparison pages state
 method, environment and date, and keep dated raw samples in local `.data/` directories.
-Derived Markdown tables, resolved JSON tables and same-directory CSV downloads
-are versioned. Public benchmark provenance summaries live once under
+Version the Markdown tables and only the resolved JSON projections needed by the
+build. Static tables already in articles, per-round/per-environment records,
+historical tables and engineering intermediate tables do not receive public
+downloads by default. `benchmark.new/public_assets.py` allowlists the necessary
+user-statistics CSVs; `csv_path(repo, filename, locale)` resolves their shared
+download path under `docs/overrides/assets/benchmarks/data/`. Both languages use
+one copy. Keep localized `.render.json` projections beside articles and complete
+CSV/JSON in the original batch's local publication directory or `.data/` archive.
+Public figures use SVG; PDF exports stay outside the published tree. Engineering
+experiments publish SVG only, retaining complete statistics and provenance locally.
+Only necessary user-benchmark provenance summaries live under
 `docs/overrides/assets/benchmarks/`; both languages link to their local
 `assets/benchmarks/` copies published by Zensical. Keep the batch, measurement
 scope, configuration and input/binary/evidence hashes in these summaries.
 Full manifests, per-file harness records, host paths and complete package receipts
 remain in the benchmark's ignored `.data/`. Publishers update the shared summary
-and only the JSON projections referenced by articles.
+and only the JSON projections needed by the build. Historical and engineering
+CSV/JSON and replaced provenance remain in
+`benchmark.new/.data/docs-assets-prune-20261018/`; its migration inventory preserves
+original paths, byte hashes and destinations. Reducing public files must preserve
+article tables and figures, measurement values, statistical scope and evidence hashes.
 Keep executable benchmark templates and raw `*.bench.json`
 evidence outside the published article tree; articles reference resolved JSON.
 The native `exclude` plugin excludes `.data/` at every depth, and the generated
@@ -220,6 +235,10 @@ Write for a developer who is deciding whether to adopt pVisor and then how to us
 it. The models are the uv, Ruff and Ray docs.
 
 - Lead with the outcome or the command, then explain. Short paragraphs, one idea each.
+- Lead with what pVisor does and why it is useful. Use concrete verbs and short
+  claims, supported by examples or measurements. Put comparison details in the
+  experiment and data sections. State applicable conditions once; preserve
+  unfavorable results and distinguish measured benefits from expectations.
 - Describe purpose, behavior and scope directly. Avoid rhetorical contrasts such as
   “不是……而是……” / “not X, but Y”, imagined objections and repeated disclaimers.
   Express limitations as concrete prerequisites, unsupported operations, verification
@@ -339,7 +358,7 @@ or evidence of completed research:
 
 ### Verified reference and example coverage
 
-- `reference/config`: all 100 fields in the configured serde structures, including
+- `reference/config`: all 113 fields in the configured serde structures, including
   nested mount, route, resource, and policy entries, now have names, types,
   defaults, and usage. `scripts/check-reference.py` compares names and types
   against source during `just docs-build`; Rust documentation tests compare raw

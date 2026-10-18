@@ -9,30 +9,89 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use pvisor_overlay_core::{BackingIdentity, BackingResolution, OverlayCore};
 use pvisor_overlay_core::{
     backend,
-    service::{FilesystemService, OpenBacking},
+    service::{FilesystemService, OpenBacking, UpperNamespaceMutation},
 };
+use pvisor_overlay_core::{BackingIdentity, BackingResolution, OverlayCore};
 
 use super::super::linux_errno::linux_error;
 use super::bindings;
 use super::filesystem::{
     Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply,
-    OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    LowerDataObject, OpenOptions, OpenReply, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
 use super::passthrough::{self, PassthroughFs};
+use super::write_buffer::{Target as BufferedWriteTarget, WriteBuffer, WriteBufferOptions};
 
 const TTL: Duration = Duration::from_secs(1);
-const DIRECTORY_CACHE_CAPACITY: usize = 256;
+pub(super) const DEFAULT_DIRECTORY_CACHE_CAPACITY: usize = 256;
+pub(super) const MAX_DIRECTORY_CACHE_CAPACITY: usize = 4096;
 const RENAME_NOREPLACE: u32 = 1;
 const RENAME_EXCHANGE: u32 = 2;
+
+fn buffered_request_flags(flags: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        flags & (libc::O_DIRECT | libc::O_SYNC | libc::O_DSYNC | libc::O_APPEND) as u32 == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = flags;
+        false
+    }
+}
+
+fn shared_open_qualification_enabled(setting: Option<&OsStr>) -> io::Result<bool> {
+    match setting {
+        None => Ok(false),
+        Some(value) if value == "0" => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PVISOR_VM_FS_SHARED_OPEN_QUALIFICATION must be 0 or 1",
+        )),
+    }
+}
+
+/// Stack-owned evidence crossing only OPEN's native and response assembly.
+/// It is never inserted into a handle, cache, or snapshot.
+struct NativeOpenReply {
+    reply: OpenReply,
+    #[cfg(target_os = "linux")]
+    data_identity: Option<Option<passthrough::LowerDataIdentity>>,
+}
+
+fn negative_entry_cache_local_roots(roots: &[PathBuf]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        roots.iter().all(|root| {
+            let Ok(file) = std::fs::File::open(root) else {
+                return false;
+            };
+            let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+            // SAFETY: the opened directory is pinned and output is writable.
+            if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+                return false;
+            }
+            // SAFETY: successful fstatfs initialized the output structure.
+            let magic = unsafe { stat.assume_init() }.f_type as u64 & 0xffff_ffff;
+            matches!(magic, 0xef53 | 0x5846_5342 | 0x9123_683e | 0x0102_1994)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = roots;
+        false
+    }
+}
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
@@ -192,6 +251,38 @@ impl Drop for FileIoLease {
     }
 }
 
+/// Owns native object admission and bytes without retaining a guest RAM lease.
+struct BufferedWrite {
+    lease: FileIoLease,
+    fs: Arc<PassthroughFs>,
+    kill_priv: bool,
+    profile: pvisor_overlay_core::profile::Profile,
+}
+
+impl BufferedWriteTarget for BufferedWrite {
+    fn merge_key(&self) -> (u64, bool) {
+        (self.lease.id, self.kill_priv)
+    }
+
+    fn write(&self, chunks: &[&[u8]], offset: u64) -> io::Result<usize> {
+        self.profile.add("host_writeback_backing_batches", 1);
+        let result =
+            self.fs
+                .write_buffered_leased(&self.lease.native, chunks, offset, self.kill_priv);
+        match &result {
+            Ok(bytes) => {
+                self.profile
+                    .add("host_writeback_backing_bytes", *bytes as u64);
+                if *bytes != chunks.iter().map(|chunk| chunk.len()).sum::<usize>() {
+                    self.profile.add("host_writeback_backing_errors", 1);
+                }
+            }
+            Err(_) => self.profile.add("host_writeback_backing_errors", 1),
+        }
+        result
+    }
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(
     any(target_os = "macos", target_os = "linux"),
@@ -235,6 +326,12 @@ enum Handle {
 #[derive(Default)]
 struct Nodes {
     by_inode: HashMap<u64, PathBuf>,
+    // Guest LOOKUP references differ from the single native lookup lease held
+    // for a detached writeback object. Namespace removal must not erase them.
+    lookup_refs: HashMap<u64, u64>,
+    // Old snapshots did not count guest references. Only this finite restored
+    // set conservatively retains detached identities until session teardown.
+    legacy_lookup_refs: BTreeSet<u64>,
     // Retain constant-time lookups on the hot path. The separate component-ordered
     // index makes namespace updates visit only the affected subtree.
     by_path: HashMap<PathBuf, u64>,
@@ -252,6 +349,10 @@ pub struct OverlaySnapshot {
     hard_link_origins: Vec<(u64, u64, usize, Vec<u8>)>,
     layers: Vec<super::snapshot::FsSnapshot>,
     nodes: Vec<(u64, Vec<u8>)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lookup_refs: Option<Vec<(u64, u64)>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    legacy_lookup_refs: Vec<u64>,
     handles: Vec<(u64, Handle)>,
     next_handle: u64,
 }
@@ -622,6 +723,19 @@ struct DirectoryReference {
     fs: Arc<PassthroughFs>,
     inode: u64,
 }
+
+// A successful namespace removal retires a guest identity, not its metadata.
+// Upper objects retain one native O_PATH lookup reference until guest FORGET.
+// Immutable lower objects retain only their guest metadata view: writeback of
+// unlink/rename timestamps must never modify the physical immutable lower.
+enum DetachedWritebackInode {
+    Upper {
+        reference: DirectoryReference,
+        projected: bindings::stat64,
+        virtual_mode: bool,
+    },
+    Lower(Mutex<bindings::stat64>),
+}
 impl Drop for DirectoryReference {
     fn drop(&mut self) {
         if self.inode != fuse::ROOT_ID {
@@ -660,20 +774,83 @@ struct DirectoryCache {
     clock: u64,
 }
 
+// Fields drop in declaration order. Clear/resume the Core namespace epoch
+// while the VM still owns the exclusive operation lock, including on failure.
+struct WriteOperation<'a> {
+    _upper_namespace: UpperNamespaceMutation<'a>,
+    _operation: std::sync::RwLockWriteGuard<'a, ()>,
+}
+
+const MAX_LOWER_DATA_OBJECTS: usize = 4096;
+
+/// No eviction: a guest may retain pages after the native FH is released.
+/// The layer ordinal is a generation within this fixed-root owner; the remaining
+/// fields are actual FD device/inode/mount/size evidence. No descriptor is pinned.
+#[derive(Default)]
+struct LowerDataObjects {
+    ids: HashMap<(usize, u64, u64, u64, u64), u32>,
+}
+
+impl LowerDataObjects {
+    fn register(&mut self, key: (usize, u64, u64, u64, u64)) -> Option<(LowerDataObject, bool)> {
+        if let Some(id) = self.ids.get(&key) {
+            return Some((
+                LowerDataObject {
+                    id: *id,
+                    size: key.4,
+                },
+                false,
+            ));
+        }
+        if self.ids.len() >= MAX_LOWER_DATA_OBJECTS {
+            return None;
+        }
+        let id = self.ids.len() as u32 + 1;
+        self.ids.insert(key, id);
+        Some((LowerDataObject { id, size: key.4 }, true))
+    }
+}
+
 pub struct OverlayFs {
     profile: pvisor_overlay_core::profile::Profile,
     // Namespace and metadata remain serialized. Descriptor I/O admission
     // uses the handle map and scoped fences without acquiring this guard.
     operation_lock: RwLock<()>,
     io_activity: Arc<IoActivity>,
+    // Dropped before Core/layers. The worker owns only native object leases,
+    // never guest Readers, descriptor chains, or RAM gate access.
+    host_writeback: bool,
+    host_writeback_options: WriteBufferOptions,
+    host_writeback_qualification_lock: bool,
+    host_writeback_synchronous: bool,
+    write_buffer: RwLock<Option<Arc<WriteBuffer>>>,
     core: FilesystemService,
     // New INITs use the caller's current preference. Restoring an already
     // negotiated session must not silently change its saved writeback mode.
     new_session_writeback: bool,
+    // Derived from INIT or restored native state, never a second snapshot field.
+    writeback_active: AtomicBool,
     // Only the root device opts in, and each OPEN still requires an explicit
-    // physical-lower stability promise. Upper and mutable data stay uncached
-    // across opens. This preference is not a persisted handle/cache object.
+    // physical-lower stability promise. Guest-owned writeback separately keeps
+    // upper cache pages. This preference is not a persisted handle/cache object.
     immutable_data_cache: bool,
+    readonly_flush_elision: bool,
+    readonly_flush_elision_configured: bool,
+    readonly_flush_elision_active: AtomicBool,
+    readonly_flush_elision_seen: AtomicBool,
+    lower_data_cache: bool,
+    lower_data_cache_configured: bool,
+    lower_data_cache_active: AtomicBool,
+    lower_data_cache_seen: AtomicBool,
+    lower_data_objects: Mutex<LowerDataObjects>,
+    shared_open_qualification: bool,
+    negative_entry_cache: bool,
+    negative_entry_cache_configured: bool,
+    // Standard negative dentries can survive until their TTL after a reply.
+    // Never clear this owner-lifetime snapshot fence during DESTROY/INIT.
+    negative_entry_cache_seen: AtomicBool,
+    negative_entry_cache_roots: Vec<PathBuf>,
+    negative_entry_cache_protected_prefixes: Vec<PathBuf>,
     virtual_metadata: bool,
     snapshot_config: Config,
     roots: Vec<PathBuf>,
@@ -681,8 +858,13 @@ pub struct OverlayFs {
     // Owns one lookup reference per entry, never attributes or policy results.
     // Checked against fresh Core parent identities before every use.
     directory_cache: Mutex<DirectoryCache>,
+    // Runtime preference only: references are discarded before snapshots and
+    // restored owners use their newly configured bound.
+    directory_cache_capacity: usize,
+    directory_cache_configured: bool,
     inode_alloc: Arc<InodeAllocator>,
     nodes: Mutex<Nodes>,
+    detached_writeback: Mutex<HashMap<u64, Arc<DetachedWritebackInode>>>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_handle: AtomicU64,
 }
@@ -700,24 +882,332 @@ impl OverlayFs {
         self.immutable_data_cache = enabled;
     }
 
-    fn read_operation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
-        let _wait = self.profile.span("operation_read_lock_wait");
-        self.operation_lock
-            .read()
-            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))
+    #[cfg(test)]
+    pub(super) fn configure_host_writeback(&mut self, enabled: bool, dax: bool) -> io::Result<()> {
+        self.configure_host_writeback_options(
+            enabled,
+            dax,
+            WriteBufferOptions::default(),
+            false,
+            false,
+        )
     }
 
-    fn write_operation(&self) -> io::Result<std::sync::RwLockWriteGuard<'_, ()>> {
+    pub(super) fn configure_host_writeback_options(
+        &mut self,
+        enabled: bool,
+        dax: bool,
+        options: WriteBufferOptions,
+        qualification_lock: bool,
+        synchronous: bool,
+    ) -> io::Result<()> {
+        options.validate()?;
+        if !enabled {
+            return Ok(());
+        }
+        if !cfg!(target_os = "linux") || dax || self.new_session_writeback {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "host writeback requires Linux, DAX=0 and guest writeback=0",
+            ));
+        }
+        let buffer = Arc::new(WriteBuffer::with_profile(options, self.profile.clone())?);
+        *self.write_buffer.get_mut().unwrap() = Some(buffer);
+        self.host_writeback = true;
+        self.host_writeback_options = options;
+        self.host_writeback_qualification_lock = qualification_lock;
+        self.host_writeback_synchronous = synchronous;
+        self.profile.add("host_writeback_enabled", 1);
+        for name in [
+            "host_writeback_accepted_requests",
+            "host_writeback_accepted_bytes",
+            "host_writeback_backing_batches",
+            "host_writeback_backing_bytes",
+            "host_writeback_backing_errors",
+            "host_writeback_queue_sessions",
+            "host_writeback_queue_peak_bytes_sum",
+            "host_writeback_queue_peak_jobs_sum",
+            "host_writeback_queue_batches",
+            "host_writeback_queue_jobs",
+            "host_writeback_reserve_wait_count",
+            "host_writeback_reserve_wait_ns",
+        ] {
+            self.profile.add(name, 0);
+        }
+        for (name, value) in [
+            ("host_writeback_capacity_bytes", options.budget_bytes as u64),
+            ("host_writeback_max_jobs", options.max_jobs as u64),
+            ("host_writeback_batch_bytes", options.batch_bytes as u64),
+            ("host_writeback_max_chunks", options.max_chunks as u64),
+            (
+                "host_writeback_delay_us",
+                options.max_delay.as_micros() as u64,
+            ),
+            (
+                "host_writeback_qualification_lock",
+                u64::from(qualification_lock),
+            ),
+            ("host_writeback_synchronous", u64::from(synchronous)),
+        ] {
+            self.profile.add(name, value);
+        }
+        Ok(())
+    }
+
+    fn buffered_writes(&self) -> Option<Arc<WriteBuffer>> {
+        if !self.host_writeback {
+            return None;
+        }
+        self.write_buffer.read().unwrap().clone()
+    }
+
+    /// Wait for the accepted prefix. Errors remain sticky in the queue until
+    /// FLUSH/FSYNC/SYNCFS or capture observes them; namespace cleanup still runs.
+    fn drain_buffered_writes(&self) -> io::Result<()> {
+        match self.buffered_writes() {
+            Some(buffer) => buffer.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// The explicit preference promises exclusive upper namespace ownership,
+    /// including physical roots/ancestors/mounts and directory permissions.
+    /// All mutations use this VM connection; no overlapping backend may be
+    /// attached later. Runtime-only: successful negative replies fence snapshots.
+    pub(super) fn configure_negative_entry_cache(
+        &mut self,
+        requested: bool,
+        guest_cache: bool,
+        dax: bool,
+        synthetic_names: Vec<PathBuf>,
+    ) -> io::Result<()> {
+        if self.negative_entry_cache_configured {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "negative entry cache must be configured once before requests",
+            ));
+        }
+        let mut enabled = requested
+            && cfg!(target_os = "linux")
+            && guest_cache
+            && !dax
+            && !self.new_session_writeback
+            && self.snapshot_config.semantics == passthrough::PermissionSemantics::LinuxComplete
+            && self.supports_directory_image()
+            && self
+                .snapshot_config
+                .access_policy
+                .same_rules(&Default::default());
+        let mut roots = Vec::new();
+        if enabled {
+            self.core.validate_exclusive_upper_namespace()?;
+            roots = self
+                .roots
+                .iter()
+                .map(|root| root.canonicalize())
+                .collect::<io::Result<_>>()?;
+            enabled = negative_entry_cache_local_roots(&roots);
+            for root in &roots {
+                if backend::attachment_overlaps(root)? {
+                    enabled = false;
+                    break;
+                }
+            }
+        }
+        self.negative_entry_cache = enabled;
+        self.negative_entry_cache_roots = roots;
+        // Core already validates exclusions as nonempty relative paths. Their
+        // ENOENT is a visibility decision, never a cacheable absence; protect
+        // ancestors too so a missing prefix cannot hide that distinction.
+        let mut protected_prefixes = synthetic_names;
+        protected_prefixes.extend(
+            self.snapshot_config
+                .excluded_paths
+                .iter()
+                .map(PathBuf::from),
+        );
+        protected_prefixes.sort();
+        protected_prefixes.dedup();
+        self.negative_entry_cache_protected_prefixes = protected_prefixes;
+        self.negative_entry_cache_configured = true;
+        self.profile
+            .add("negative_entry_cache_requested", u64::from(requested));
+        self.profile
+            .add("negative_entry_cache_enabled", u64::from(enabled));
+        self.profile.add("negative_entry_cache_replies", 0);
+        self.profile.add("negative_entry_cache_fallbacks", 0);
+        Ok(())
+    }
+
+    fn negative_entry_cache_path_eligible(&self, path: &Path) -> bool {
+        !self
+            .negative_entry_cache_protected_prefixes
+            .iter()
+            .any(|name| path.starts_with(name) || name.starts_with(path))
+            && self.negative_entry_cache_roots.iter().all(|root| {
+                // A late attachment violates the owner's promise. Refuse further
+                // promises anyway; this cannot invalidate prior guest dentries.
+                matches!(backend::attachment_overlaps(root), Ok(false))
+            })
+    }
+
+    /// Runtime-only preference, configured once before INIT. A negotiated
+    /// session retains all guest close barriers and skips only a qualified
+    /// native read-only lower descriptor's backend FLUSH. Snapshots of such
+    /// sessions are rejected rather than persisting a new contract implicitly.
+    pub(super) fn configure_readonly_flush_elision(
+        &mut self,
+        requested: bool,
+        guest_cache: bool,
+        dax: bool,
+    ) -> io::Result<()> {
+        if self.readonly_flush_elision_configured {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read-only flush elision must be configured once before INIT",
+            ));
+        }
+        self.readonly_flush_elision = requested
+            && cfg!(target_os = "linux")
+            && guest_cache
+            && !dax
+            && self.snapshot_config.semantics == passthrough::PermissionSemantics::LinuxComplete
+            && self
+                .snapshot_config
+                .lower_mutability
+                .contains(&pvisor_overlay_core::LayerMutability::Immutable);
+        self.readonly_flush_elision_configured = true;
+        self.profile
+            .add("readonly_flush_elision_requested", u64::from(requested));
+        self.profile.add("readonly_flush_elision_enabled", 0);
+        self.profile.add("readonly_flush_elision_open_flags", 0);
+        Ok(())
+    }
+
+    /// Configure the private independent-lower-data protocol before INIT.
+    /// The caller's immutable owner keeps physical contents, identity and mount
+    /// stable through final device teardown; IDs never provide authorization.
+    pub(super) fn configure_lower_data_cache(
+        &mut self,
+        requested: bool,
+        guest_cache: bool,
+        dax: bool,
+    ) -> io::Result<()> {
+        if self.lower_data_cache_configured {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lower data cache must be configured once before INIT",
+            ));
+        }
+        self.lower_data_cache = requested
+            && cfg!(target_os = "linux")
+            && guest_cache
+            && !dax
+            && self.snapshot_config.semantics == passthrough::PermissionSemantics::LinuxComplete
+            && self
+                .snapshot_config
+                .lower_mutability
+                .contains(&pvisor_overlay_core::LayerMutability::Immutable);
+        self.lower_data_cache_configured = true;
+        self.profile
+            .add("lower_data_cache_requested", u64::from(requested));
+        for key in [
+            "lower_data_cache_enabled",
+            "lower_data_cache_open_flags",
+            "lower_data_cache_object_registrations",
+            "lower_data_cache_object_reuses",
+            "lower_data_cache_object_rejections",
+            "lower_data_cache_capacity_rejections",
+        ] {
+            self.profile.add(key, 0);
+        }
+        Ok(())
+    }
+
+    /// Opt in before serving requests or restoring state. The separate flag
+    /// promises stable physical upper roots/ancestors/mounts, in addition to
+    /// the guest-directory contract's exclusively owned upper namespace.
+    pub(super) fn configure_exclusive_upper_absence_cache(
+        &mut self,
+        requested: bool,
+        guest_cache: bool,
+    ) -> io::Result<()> {
+        let enabled = requested
+            && guest_cache
+            && self.snapshot_config.semantics == passthrough::PermissionSemantics::LinuxComplete
+            && self.supports_directory_image();
+        self.core.configure_exclusive_upper_absence_cache(enabled)?;
+        self.profile.add(
+            "exclusive_upper_absence_cache_requested",
+            u64::from(requested),
+        );
+        Ok(())
+    }
+
+    /// Configure a fresh owner before serving requests or restoring handles.
+    /// This changes only retained native directory references, not metadata,
+    /// authority, invalidation, or the snapshot's filesystem contract.
+    pub(super) fn configure_directory_cache_capacity(&mut self, capacity: usize) -> io::Result<()> {
+        if !(1..=MAX_DIRECTORY_CACHE_CAPACITY).contains(&capacity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory reference cache capacity must be between 1 and 4096",
+            ));
+        }
+        if self.directory_cache_configured
+            || !self.directory_cache.get_mut().unwrap().entries.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory reference cache capacity must be configured once before serving requests",
+            ));
+        }
+        self.directory_cache_capacity = capacity;
+        self.directory_cache_configured = true;
+        // FsWorker calls this once per owner. The final per-instance units
+        // value proves the chosen capacity in independent diagnostics.
+        self.profile
+            .add("directory_cache_capacity", capacity as u64);
+        Ok(())
+    }
+
+    fn read_operation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
+        let _wait = self.profile.span("operation_read_lock_wait");
+        let guard = self
+            .operation_lock
+            .read()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+        // A completed WRITE reply must be reflected in subsequent metadata.
+        // Preserve cleanup operations even after a recorded asynchronous error.
+        let _ = self.drain_buffered_writes();
+        Ok(guard)
+    }
+
+    fn write_operation(&self) -> io::Result<WriteOperation<'_>> {
         let _wait = self.profile.span("operation_write_lock_wait");
         let operation = self
             .operation_lock
             .write()
             .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
-        Ok(operation)
+        let _ = self.drain_buffered_writes();
+        let upper_namespace = self.core.upper_namespace_mutation();
+        Ok(WriteOperation {
+            _upper_namespace: upper_namespace,
+            _operation: operation,
+        })
     }
 
     // Caller holds the exclusive operation guard, so admission and handle
     // mappings cannot change while selecting and draining affected objects.
+    fn fence_native_inode(&self, layer: Layer, inode: u64) -> IoFence {
+        let handles = self.handles.lock().unwrap().iter().filter_map(|(id, handle)| {
+            matches!(handle, Handle::File(file) if file.layer.0 == layer.0 && file.inode == inode).then_some(*id)
+        }).collect();
+        let fence = self.io_activity.fence(handles, false);
+        fence.drain();
+        fence
+    }
+
     fn fence_paths(&self, paths: &[&Path]) -> IoFence {
         let handles = self.handles.lock().unwrap();
         if handles.is_empty() {
@@ -774,6 +1264,9 @@ impl OverlayFs {
         restoring: bool,
         writeback_setting: Option<&str>,
     ) -> io::Result<Self> {
+        let shared_open_qualification = shared_open_qualification_enabled(
+            std::env::var_os("PVISOR_VM_FS_SHARED_OPEN_QUALIFICATION").as_deref(),
+        )? && cfg!(target_os = "linux");
         if cfg.lower_dirs.is_empty() || (cfg.baseline_lower.is_some() && cfg.apply_target.is_none())
         {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -849,20 +1342,61 @@ impl OverlayFs {
                     .is_ok()
             })
         })?;
+        let profile = pvisor_overlay_core::profile::Profile::from_env("virtio-fs-overlay");
+        profile.add(
+            "shared_open_qualification_enabled",
+            u64::from(shared_open_qualification),
+        );
+        #[cfg(target_os = "linux")]
+        for label in passthrough::OPEN_QUALIFICATION_COUNTERS {
+            profile.add(label, 0);
+        }
+        for label in [
+            "negative_entry_cache_requested",
+            "negative_entry_cache_enabled",
+            "negative_entry_cache_replies",
+            "negative_entry_cache_fallbacks",
+        ] {
+            profile.add(label, 0);
+        }
         Ok(Self {
+            lower_data_cache: false,
+            lower_data_cache_configured: false,
+            lower_data_cache_active: AtomicBool::new(false),
+            lower_data_cache_seen: AtomicBool::new(false),
+            lower_data_objects: Mutex::new(LowerDataObjects::default()),
+            shared_open_qualification,
+            negative_entry_cache: false,
+            negative_entry_cache_configured: false,
+            negative_entry_cache_seen: AtomicBool::new(false),
+            negative_entry_cache_roots: Vec::new(),
+            negative_entry_cache_protected_prefixes: Vec::new(),
             virtual_metadata,
-            profile: pvisor_overlay_core::profile::Profile::from_env("virtio-fs-overlay"),
+            profile,
             operation_lock: RwLock::new(()),
             io_activity: Arc::new(IoActivity::default()),
+            host_writeback: false,
+            host_writeback_options: WriteBufferOptions::default(),
+            host_writeback_qualification_lock: false,
+            host_writeback_synchronous: false,
+            write_buffer: RwLock::new(None),
             core,
             new_session_writeback,
+            writeback_active: AtomicBool::new(false),
             immutable_data_cache: false,
+            readonly_flush_elision: false,
+            readonly_flush_elision_configured: false,
+            readonly_flush_elision_active: AtomicBool::new(false),
+            readonly_flush_elision_seen: AtomicBool::new(false),
             snapshot_config: cfg,
             roots,
             layers,
             directory_cache: Mutex::new(DirectoryCache::default()),
+            directory_cache_capacity: DEFAULT_DIRECTORY_CACHE_CAPACITY,
+            directory_cache_configured: false,
             inode_alloc,
             nodes: Mutex::new(nodes),
+            detached_writeback: Mutex::new(HashMap::new()),
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         })
@@ -893,6 +1427,140 @@ impl OverlayFs {
         nodes.by_path.insert(path.clone(), inode);
         nodes.by_inode.insert(inode, path);
         inode
+    }
+
+    fn acquire_guest_lookup(&self, inode: u64) {
+        if !self.writeback_active.load(Ordering::Relaxed) || inode == fuse::ROOT_ID {
+            return;
+        }
+        let mut nodes = self.nodes.lock().unwrap();
+        if !nodes.legacy_lookup_refs.contains(&inode) {
+            let count = nodes.lookup_refs.entry(inode).or_default();
+            *count = count
+                .checked_add(1)
+                .expect("guest lookup reference overflow");
+        }
+    }
+
+    fn forget_guest_lookup(&self, inode: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let retired = {
+            let mut nodes = self.nodes.lock().unwrap();
+            if nodes.legacy_lookup_refs.contains(&inode) {
+                return;
+            }
+            let Some(current) = nodes.lookup_refs.get_mut(&inode) else {
+                return;
+            };
+            if count < *current {
+                *current -= count;
+                return;
+            }
+            nodes.lookup_refs.remove(&inode);
+            self.detached_writeback.lock().unwrap().remove(&inode)
+        };
+        if retired.is_some() {
+            self.profile.add("guest_writeback_detached_released", 1);
+        }
+        // A native FORGET may close an fd. Never run it under either registry.
+        drop(retired);
+    }
+
+    fn prepare_detached_writeback(
+        &self,
+        ctx: Context,
+        path: &Path,
+    ) -> io::Result<Option<(u64, Arc<DetachedWritebackInode>)>> {
+        if !self.writeback_active.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let inode = {
+            let nodes = self.nodes.lock().unwrap();
+            let Some(&inode) = nodes.by_path.get(path) else {
+                return Ok(None);
+            };
+            if !nodes.legacy_lookup_refs.contains(&inode)
+                && nodes.lookup_refs.get(&inode).copied().unwrap_or(0) == 0
+            {
+                return Ok(None);
+            }
+            inode
+        };
+        let layer = self.layer(path)?;
+        let entry = self.inner_entry(layer, path, ctx)?;
+        let reference = DirectoryReference {
+            fs: self.layers[layer.0].clone(),
+            inode: entry.inode,
+        };
+        if entry.attr.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Ok(None);
+        }
+        let mut projected = entry.attr;
+        self.backing_attributes(&self.roots[layer.0].join(path), &mut projected)?;
+        let object = if layer.0 == 0 {
+            DetachedWritebackInode::Upper {
+                reference,
+                projected,
+                virtual_mode: projected.st_mode != entry.attr.st_mode,
+            }
+        } else {
+            let mut attr = projected;
+            attr.st_ino = inode as _;
+            attr.st_nlink = attr.st_nlink.saturating_sub(1);
+            drop(reference);
+            DetachedWritebackInode::Lower(Mutex::new(attr))
+        };
+        Ok(Some((inode, Arc::new(object))))
+    }
+
+    fn commit_detached_writeback(&self, candidate: Option<(u64, Arc<DetachedWritebackInode>)>) {
+        let Some((inode, object)) = candidate else {
+            return;
+        };
+        // FORGET can run while the namespace mutation is in progress. Check
+        // its final count atomically with publishing the retained identity.
+        let nodes = self.nodes.lock().unwrap();
+        if nodes.legacy_lookup_refs.contains(&inode)
+            || nodes.lookup_refs.get(&inode).copied().unwrap_or(0) != 0
+        {
+            self.detached_writeback
+                .lock()
+                .unwrap()
+                .insert(inode, object);
+            self.profile.add("guest_writeback_detached_retained", 1);
+        }
+    }
+
+    fn detached_attributes(
+        &self,
+        ctx: Context,
+        inode: u64,
+    ) -> io::Result<Option<(bindings::stat64, Duration)>> {
+        let object = self.detached_writeback.lock().unwrap().get(&inode).cloned();
+        let Some(object) = object else {
+            return Ok(None);
+        };
+        let (mut attr, timeout) = match &*object {
+            DetachedWritebackInode::Upper {
+                reference,
+                projected,
+                virtual_mode,
+            } => {
+                let (mut attr, timeout) = reference.fs.getattr(ctx, reference.inode, None)?;
+                if *virtual_mode {
+                    attr.st_mode = projected.st_mode;
+                }
+                attr.st_uid = projected.st_uid;
+                attr.st_gid = projected.st_gid;
+                attr.st_rdev = projected.st_rdev;
+                (attr, timeout)
+            }
+            DetachedWritebackInode::Lower(attr) => (*attr.lock().unwrap(), TTL),
+        };
+        attr.st_ino = inode as _;
+        Ok(Some((attr, timeout)))
     }
 
     fn remove_path(&self, prefix: &Path) {
@@ -1007,7 +1675,7 @@ impl OverlayFs {
                     used,
                 },
             );
-            let evicted = if cache.entries.len() > DIRECTORY_CACHE_CAPACITY {
+            let evicted = if cache.entries.len() > self.directory_cache_capacity {
                 let oldest = cache
                     .entries
                     .iter()
@@ -1369,13 +2037,272 @@ impl OverlayFs {
         // POSIX file type occupies bits 12..15; FUSE d_type uses bits 0..3.
         (mode >> 12) & 0xf
     }
+    fn open_native_for_reply(
+        &self,
+        ctx: Context,
+        inode: u64,
+        kill_priv: bool,
+        flags: u32,
+        share_data: bool,
+    ) -> io::Result<NativeOpenReply> {
+        let _span = self.profile.span("open");
+        let writing = FilesystemService::is_write_open(flags as i32);
+        // Read-only opens observe a stable namespace and insert handles under
+        // their own mutex; they need not exclude independent backing reads.
+        // Privilege changes, copy-up and every writable open remain exclusive.
+        let readonly = !writing && !kill_priv;
+        let _read_operation = if readonly {
+            Some(self.read_operation()?)
+        } else {
+            None
+        };
+        let _write_operation = if readonly {
+            None
+        } else {
+            Some(self.write_operation()?)
+        };
+        let path = self.path(inode)?;
+        let _io = (!readonly).then(|| self.fence_paths(&[&path]));
+        let (layer, inner, immutable_regular) = match self
+            .core
+            .prepare_open_for_backing_lookup(&path, flags as i32)
+            .map_err(linux_error)?
+        {
+            OpenBacking::Writable(_) => (Layer(0), self.inner_inode(Layer(0), &path, ctx)?, false),
+            OpenBacking::ReadOnly(backing) => {
+                let layer = Layer(backing.entry.layer);
+                let immutable_regular = backing.entry.metadata.is_file()
+                    && layer.0.checked_sub(1).is_some_and(|index| {
+                        self.snapshot_config.lower_mutability.get(index)
+                            == Some(&pvisor_overlay_core::LayerMutability::Immutable)
+                    });
+                let inner = self
+                    .inner_entry_with_parents(layer, &path, ctx, &backing.parents)?
+                    .inode;
+                (layer, inner, immutable_regular)
+            }
+        };
+        let opened = self.layers[layer.0].open(ctx, inner, kill_priv, flags);
+        let (handle, mut options) = match opened {
+            Ok((Some(handle), options)) => (handle, options),
+            result => {
+                self.layers[layer.0].forget(ctx, inner, 1);
+                return match result {
+                    Err(error) => Err(error),
+                    _ => Err(io::Error::from_raw_os_error(libc::EIO)),
+                };
+            }
+        };
+        // Keep OPEN's policy, baseline observation and native descriptor
+        // checks. A writable/copy-up open must invalidate the merged inode's
+        // old lower pages rather than reusing this read-only optimization.
+        if self.immutable_data_cache && readonly && immutable_regular {
+            options |= OpenOptions::KEEP_CACHE;
+        }
+        // The guest owns upper writes; reopening must not launder its dirty
+        // pages one at a time through cache invalidation.
+        if layer.0 == 0 && self.writeback_active.load(Ordering::Relaxed) {
+            options |= OpenOptions::KEEP_CACHE;
+        }
+        if layer.0 != 0 && readonly && self.writeback_active.load(Ordering::Relaxed) {
+            options |= OpenOptions::PVISOR_LOWER;
+        }
+        #[cfg(target_os = "linux")]
+        let want_flush = self.readonly_flush_elision_active.load(Ordering::Relaxed)
+            && readonly
+            && immutable_regular;
+        #[cfg(target_os = "linux")]
+        if !share_data
+            && want_flush
+            && self.layers[layer.0].readonly_local_flush_eligible_profiled(
+                inner,
+                handle,
+                &self.profile,
+            )
+        {
+            options |= OpenOptions::PVISOR_LOCAL_FLUSH;
+            self.profile.add("readonly_flush_elision_open_flags", 1);
+        }
+        if self.lower_data_cache_active.load(Ordering::Relaxed)
+            && readonly
+            && immutable_regular
+            && !options.contains(OpenOptions::DIRECT_IO)
+            && matches!(
+                backend::attributes(&self.roots[layer.0].join(&path)),
+                Ok(None)
+            )
+        {
+            options |= OpenOptions::PVISOR_DATA_OBJECT;
+        }
+        let id = self.allocate_handle(Handle::File(Arc::new(FileHandle {
+            overlay_inode: inode,
+            layer,
+            inode: inner,
+            handle,
+            relative_path: path.as_os_str().as_bytes().to_vec(),
+        })));
+        let reply = OpenReply::new(Some(id), options);
+        #[cfg(target_os = "linux")]
+        let mut reply = reply;
+        #[cfg(target_os = "linux")]
+        let mut data_identity = None;
+        #[cfg(target_os = "linux")]
+        if share_data {
+            let local_flush = if reply.allows_data_object(true) {
+                let qualification = self.layers[layer.0].qualify_readonly_open(
+                    inner,
+                    handle,
+                    want_flush,
+                    &self.profile,
+                );
+                data_identity = Some(qualification.data_identity);
+                qualification.local_flush
+            } else {
+                want_flush
+                    && self.layers[layer.0].readonly_local_flush_eligible_profiled(
+                        inner,
+                        handle,
+                        &self.profile,
+                    )
+            };
+            if local_flush {
+                reply.options |= OpenOptions::PVISOR_LOCAL_FLUSH;
+                self.profile.add("readonly_flush_elision_open_flags", 1);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = share_data;
+        Ok(NativeOpenReply {
+            reply,
+            #[cfg(target_os = "linux")]
+            data_identity,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lower_data_object_with_identity(
+        &self,
+        inode: u64,
+        handle: u64,
+        qualification: Option<Option<passthrough::LowerDataIdentity>>,
+    ) -> Option<LowerDataObject> {
+        if !self.lower_data_cache_active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let receipt = (|| {
+            let lease = self.file_io_lease(handle).ok()?;
+            let h = &lease.handle;
+            if h.overlay_inode != inode
+                || h.layer
+                    .0
+                    .checked_sub(1)
+                    .and_then(|i| self.snapshot_config.lower_mutability.get(i))
+                    != Some(&pvisor_overlay_core::LayerMutability::Immutable)
+            {
+                return None;
+            }
+            // Remote-content projections are not identified by the native
+            // placeholder's physical inode. Unrelated virtual files do not
+            // affect this selected entry's qualification.
+            let physical = self.roots[h.layer.0].join(OsStr::from_bytes(&h.relative_path));
+            if !matches!(backend::attributes(&physical), Ok(None)) {
+                return None;
+            }
+            let identity = match qualification {
+                Some(identity) => {
+                    self.profile.add("open_qualification_receipt_hits", 1);
+                    identity?
+                }
+                None => {
+                    self.profile.add("open_qualification_receipt_misses", 1);
+                    self.layers[h.layer.0].lower_data_identity_profiled(
+                        h.inode,
+                        h.handle,
+                        &self.profile,
+                    )?
+                }
+            };
+            let key = (
+                h.layer.0,
+                identity.dev,
+                identity.ino,
+                identity.mount_id,
+                identity.size,
+            );
+            match self.lower_data_objects.lock().unwrap().register(key) {
+                Some((receipt, registered)) => {
+                    self.profile.add(
+                        if registered {
+                            "lower_data_cache_object_registrations"
+                        } else {
+                            "lower_data_cache_object_reuses"
+                        },
+                        1,
+                    );
+                    Some(receipt)
+                }
+                None => {
+                    self.profile.add("lower_data_cache_capacity_rejections", 1);
+                    None
+                }
+            }
+        })();
+        if receipt.is_none() {
+            self.profile.add("lower_data_cache_object_rejections", 1);
+        } else {
+            self.profile.add("lower_data_cache_open_flags", 1);
+        }
+        receipt
+    }
 }
 
 impl FileSystem for OverlayFs {
+    fn diagnostic_profiles(&self) -> Vec<pvisor_overlay_core::profile::ProfileReport> {
+        self.profile
+            .report()
+            .into_iter()
+            .chain(self.core.profile_report())
+            .collect()
+    }
+
+    fn supports_directory_image(&self) -> bool {
+        !self.snapshot_config.lower_mutability.is_empty()
+            && self
+                .snapshot_config
+                .lower_mutability
+                .iter()
+                .all(|mutability| *mutability == pvisor_overlay_core::LayerMutability::Immutable)
+    }
+
     fn capture_state(&self) -> io::Result<super::snapshot::FsSnapshot> {
+        if self.lower_data_cache_seen.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snapshots of owners that negotiated lower-data-object sessions are unsupported",
+            ));
+        }
+
+        if self.readonly_flush_elision_active.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snapshots of negotiated read-only flush-elision sessions are unsupported",
+            ));
+        }
         let _operation = self.write_operation().unwrap();
+        if self.negative_entry_cache_seen.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snapshots after cacheable negative-entry replies are unsupported",
+            ));
+        }
         let _io = self.io_activity.fence(Vec::new(), true);
         _io.drain();
+        self.drain_buffered_writes()?;
+        if !self.detached_writeback.lock().unwrap().is_empty() {
+            return Err(super::snapshot::unsupported(
+                "detached guest-writeback identities must reach FORGET before snapshot",
+            ));
+        }
         self.core.sync_preimages()?;
         for root in self.roots.iter().skip(1) {
             backend::materialize_tree(root)?;
@@ -1461,6 +2388,34 @@ impl FileSystem for OverlayFs {
                 "overlay hard-link source is no longer owned",
             ));
         }
+        let (saved_nodes, lookup_refs, legacy_lookup_refs) = {
+            let nodes = self.nodes.lock().unwrap();
+            if nodes
+                .lookup_refs
+                .keys()
+                .chain(nodes.legacy_lookup_refs.iter())
+                .any(|inode| !nodes.by_inode.contains_key(inode))
+            {
+                return Err(super::snapshot::unsupported(
+                    "unlinked guest lookup identities must reach FORGET before snapshot",
+                ));
+            }
+            (
+                nodes
+                    .by_inode
+                    .iter()
+                    .map(|(inode, path)| (*inode, path.as_os_str().as_bytes().to_vec()))
+                    .collect(),
+                self.writeback_active.load(Ordering::Relaxed).then(|| {
+                    nodes
+                        .lookup_refs
+                        .iter()
+                        .map(|(inode, count)| (*inode, *count))
+                        .collect()
+                }),
+                nodes.legacy_lookup_refs.iter().copied().collect(),
+            )
+        };
         Ok(super::snapshot::FsSnapshot::Overlay(Box::new(
             OverlaySnapshot {
                 config: self.snapshot_config.clone(),
@@ -1471,14 +2426,9 @@ impl FileSystem for OverlayFs {
                     .iter()
                     .map(|layer| layer.capture_state())
                     .collect::<io::Result<_>>()?,
-                nodes: self
-                    .nodes
-                    .lock()
-                    .unwrap()
-                    .by_inode
-                    .iter()
-                    .map(|(inode, path)| (*inode, path.as_os_str().as_bytes().to_vec()))
-                    .collect(),
+                nodes: saved_nodes,
+                lookup_refs,
+                legacy_lookup_refs,
                 handles: self
                     .handles
                     .lock()
@@ -1491,13 +2441,60 @@ impl FileSystem for OverlayFs {
         )))
     }
     fn restore_state(&self, state: &super::snapshot::FsSnapshot) -> io::Result<()> {
-        use super::snapshot::{FsSnapshot, invalid};
+        if !self.detached_writeback.lock().unwrap().is_empty() {
+            return Err(super::snapshot::unsupported(
+                "cannot replace a session with retained detached writeback identities",
+            ));
+        }
+        if self.lower_data_cache_seen.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snapshots of owners that negotiated lower-data-object sessions are unsupported",
+            ));
+        }
+
+        if self.readonly_flush_elision_active.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot replace a negotiated read-only flush-elision session by restoring state",
+            ));
+        }
+        use super::snapshot::{invalid, FsSnapshot};
         let FsSnapshot::Overlay(state) = state else {
             return Err(invalid("overlay filesystem type mismatch"));
         };
         let _operation = self.write_operation().unwrap();
+        if self.negative_entry_cache_seen.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot restore an owner after cacheable negative-entry replies",
+            ));
+        }
+        if self.negative_entry_cache
+            && state
+                .layers
+                .iter()
+                .any(|saved| matches!(saved, FsSnapshot::Passthrough(layer) if layer.writeback))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "negative entry cache cannot restore a writeback-enabled session",
+            ));
+        }
+        if self.host_writeback
+            && state
+                .layers
+                .iter()
+                .any(|saved| matches!(saved, FsSnapshot::Passthrough(layer) if layer.writeback))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "host writeback cannot restore a guest-writeback session",
+            ));
+        }
         let _io = self.io_activity.fence(Vec::new(), true);
         _io.drain();
+        self.drain_buffered_writes()?;
         if state.config != self.snapshot_config
             || state.layers.len() != self.layers.len()
             || state.next_handle == 0
@@ -1518,6 +2515,31 @@ impl FileSystem for OverlayFs {
             {
                 return Err(invalid("invalid overlay inode paths"));
             }
+        }
+        if let Some(refs) = &state.lookup_refs {
+            for &(inode, count) in refs {
+                if count == 0
+                    || !nodes.by_inode.contains_key(&inode)
+                    || nodes.lookup_refs.insert(inode, count).is_some()
+                {
+                    return Err(invalid("invalid guest lookup references"));
+                }
+            }
+            for &inode in &state.legacy_lookup_refs {
+                if !nodes.by_inode.contains_key(&inode)
+                    || nodes.lookup_refs.contains_key(&inode)
+                    || !nodes.legacy_lookup_refs.insert(inode)
+                {
+                    return Err(invalid("invalid legacy guest lookup references"));
+                }
+            }
+        } else if matches!(state.layers.first(), Some(FsSnapshot::Passthrough(layer)) if layer.writeback)
+        {
+            // Legacy snapshots did not save guest nlookup. Their finite inode
+            // set remains conservative; newly created nodes are counted exactly.
+            nodes
+                .legacy_lookup_refs
+                .extend(nodes.by_inode.keys().copied());
         }
         let mut handles = HashMap::new();
         for (id, handle) in &state.handles {
@@ -1577,6 +2599,10 @@ impl FileSystem for OverlayFs {
         for (layer, saved) in self.layers.iter().zip(&state.layers) {
             layer.restore_state(saved)?;
         }
+        self.writeback_active.store(
+            matches!(state.layers.first(), Some(FsSnapshot::Passthrough(layer)) if layer.writeback),
+            Ordering::Relaxed,
+        );
         self.core.restore_hard_links(&state.hard_links)?;
         let sources = state
             .hard_link_origins
@@ -1602,6 +2628,15 @@ impl FileSystem for OverlayFs {
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         let _operation = self.write_operation()?;
+        if self.host_writeback {
+            let mut buffer = self.write_buffer.write().unwrap();
+            if buffer.is_none() {
+                *buffer = Some(Arc::new(WriteBuffer::with_profile(
+                    self.host_writeback_options,
+                    self.profile.clone(),
+                )?));
+            }
+        }
         let mut capable = capable;
         if !self.new_session_writeback {
             capable.remove(FsOptions::WRITEBACK_CACHE);
@@ -1619,6 +2654,69 @@ impl FileSystem for OverlayFs {
         if capable.contains(FsOptions::DO_READDIRPLUS) {
             options |= capable & directory_options;
         }
+        if options.contains(FsOptions::WRITEBACK_CACHE) {
+            options |= capable & FsOptions::PVISOR_WRITEBACK;
+        }
+        let local_flush = self.readonly_flush_elision
+            && capable.contains(FsOptions::PVISOR_LOCAL_FLUSH)
+            && !options.intersects(
+                FsOptions::WRITEBACK_CACHE
+                    | FsOptions::POSIX_LOCKS
+                    | FsOptions::FLOCK_LOCKS
+                    | FsOptions::HAS_INODE_DAX
+                    | FsOptions::MAP_ALIGNMENT,
+            );
+        if self.readonly_flush_elision_active.load(Ordering::Relaxed) && !local_flush {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot remove a negotiated read-only flush contract from a live session",
+            ));
+        }
+        if local_flush {
+            options |= FsOptions::PVISOR_LOCAL_FLUSH;
+            self.readonly_flush_elision_active
+                .store(true, Ordering::Relaxed);
+            if !self
+                .readonly_flush_elision_seen
+                .swap(true, Ordering::Relaxed)
+            {
+                self.profile.add("readonly_flush_elision_enabled", 1);
+            }
+        }
+        let data_objects = self.lower_data_cache
+            && capable.contains(FsOptions::PVISOR_DATA_OBJECT)
+            && !options.intersects(
+                FsOptions::WRITEBACK_CACHE
+                    | FsOptions::POSIX_LOCKS
+                    | FsOptions::FLOCK_LOCKS
+                    | FsOptions::HAS_INODE_DAX
+                    | FsOptions::MAP_ALIGNMENT,
+            );
+        if self.lower_data_cache_active.load(Ordering::Relaxed) && !data_objects {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot remove a negotiated lower-data-object contract from a live session",
+            ));
+        }
+        if data_objects {
+            options |= FsOptions::PVISOR_DATA_OBJECT;
+            self.lower_data_cache_active.store(true, Ordering::Relaxed);
+            if !self.lower_data_cache_seen.swap(true, Ordering::Relaxed) {
+                self.profile.add("lower_data_cache_enabled", 1);
+            }
+        }
+        self.profile.add(
+            "guest_writeback_enabled",
+            u64::from(options.contains(FsOptions::WRITEBACK_CACHE)),
+        );
+        self.profile.add(
+            "guest_batched_writeback_enabled",
+            u64::from(options.contains(FsOptions::PVISOR_WRITEBACK)),
+        );
+        self.writeback_active.store(
+            options.contains(FsOptions::WRITEBACK_CACHE),
+            Ordering::Relaxed,
+        );
         Ok(options)
     }
 
@@ -1626,23 +2724,72 @@ impl FileSystem for OverlayFs {
         let _operation = self.write_operation().unwrap();
         let _io = self.io_activity.fence(Vec::new(), true);
         _io.drain();
+        if let Some(buffer) = self.write_buffer.write().unwrap().take() {
+            if let Err(error) = buffer.stop() {
+                log::error!("host writeback teardown failed: {error}");
+            }
+        }
         self.clear_directory_cache();
         self.handles.lock().unwrap().clear();
+        self.detached_writeback.lock().unwrap().clear();
+        {
+            let mut nodes = self.nodes.lock().unwrap();
+            nodes.lookup_refs.clear();
+            nodes.legacy_lookup_refs.clear();
+        }
         for layer in &self.layers {
             layer.destroy();
         }
+        self.readonly_flush_elision_active
+            .store(false, Ordering::Relaxed);
+        self.lower_data_cache_active.store(false, Ordering::Relaxed);
     }
 
     fn lookup(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<Entry> {
         let _span = self.profile.span("lookup");
         let _operation = self.read_operation()?;
         let path = self.child(parent, name)?;
-        let backing = self
-            .core
-            .metadata_for_backing_lookup(&path)
-            .map_err(linux_error)?;
+        let backing = if self.negative_entry_cache && self.negative_entry_cache_path_eligible(&path)
+        {
+            match self
+                .core
+                .metadata_for_backing_lookup_optional(&path)
+                .map_err(linux_error)?
+            {
+                Some(backing) => backing,
+                None => {
+                    self.negative_entry_cache_seen
+                        .store(true, Ordering::Relaxed);
+                    self.profile.add("negative_entry_cache_replies", 1);
+                    return Ok(Entry {
+                        inode: 0,
+                        generation: 0,
+                        // No inode or lookup reference belongs to this name.
+                        // SAFETY: stat64 is scalar POD; negative replies do
+                        // not instantiate or consume these zero attributes.
+                        attr: unsafe { std::mem::zeroed() },
+                        attr_flags: 0,
+                        attr_timeout: Duration::ZERO,
+                        entry_timeout: TTL,
+                    });
+                }
+            }
+        } else {
+            if self.negative_entry_cache {
+                self.profile.add("negative_entry_cache_fallbacks", 1);
+            }
+            self.core
+                .metadata_for_backing_lookup(&path)
+                .map_err(linux_error)?
+        };
         let inode = self.allocate_inode(path.clone());
-        self.entry_on_backing(ctx, &path, inode, &backing)
+        let entry = self.entry_on_backing(ctx, &path, inode, &backing)?;
+        self.acquire_guest_lookup(inode);
+        Ok(entry)
+    }
+
+    fn forget(&self, _ctx: Context, inode: u64, count: u64) {
+        self.forget_guest_lookup(inode, count);
     }
 
     fn getattr(
@@ -1660,6 +2807,9 @@ impl FileSystem for OverlayFs {
             None => match self.path(inode) {
                 Ok(path) => (None, Some(path)),
                 Err(error) => {
+                    if let Some(attributes) = self.detached_attributes(ctx, inode)? {
+                        return Ok(attributes);
+                    }
                     // Only detached inodes require a linear scan of open handles.
                     let handle = self.handles.lock().unwrap().iter().find_map(|(id, h)| {
                         matches!(h, Handle::File(h) if h.overlay_inode == inode).then_some(*id)
@@ -1711,24 +2861,96 @@ impl FileSystem for OverlayFs {
             valid.contains(SetattrValid::SIZE)
                 && !valid.intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID)
         }) {
-            return self.with_file_handle(handle, |fs, h| {
-                if h.overlay_inode != inode || h.layer.0 != 0 {
-                    return Err(io::Error::from_raw_os_error(libc::EBADF));
-                }
-                let (mut attr, timeout) = fs.setattr(ctx, h.inode, attr, Some(h.handle), valid)?;
-                let path = self.roots[0].join(OsStr::from_bytes(&h.relative_path));
-                #[allow(clippy::unnecessary_cast)] // native dev_t differs by platform
-                let same_object = std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
-                    metadata.ino() == attr.st_ino as u64 && metadata.dev() == attr.st_dev as u64
-                });
-                if same_object {
-                    self.backing_attributes(&path, &mut attr)?;
-                }
-                attr.st_ino = inode as _;
-                Ok((attr, timeout))
+            let h = match self.handles.lock().unwrap().get(&handle) {
+                Some(Handle::File(h)) if h.overlay_inode == inode && h.layer.0 == 0 => h.clone(),
+                _ => return Err(io::Error::from_raw_os_error(libc::EBADF)),
+            };
+            // Drain every open alias of this native object before changing size.
+            // The exclusive operation guard keeps its mapping alive through setattr.
+            let _io = self.fence_native_inode(h.layer, h.inode);
+            let fs = &self.layers[h.layer.0];
+            let (mut attr, timeout) = fs.setattr(ctx, h.inode, attr, Some(h.handle), valid)?;
+            let path = self.roots[0].join(OsStr::from_bytes(&h.relative_path));
+            #[allow(clippy::unnecessary_cast)] // native dev_t differs by platform
+            let same_object = std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.ino() == attr.st_ino as u64 && metadata.dev() == attr.st_dev as u64
             });
+            if same_object {
+                self.backing_attributes(&path, &mut attr)?;
+            }
+            attr.st_ino = inode as _;
+            return Ok((attr, timeout));
         }
-        let path = self.path(inode)?;
+        let path = match self.path(inode) {
+            Ok(path) => path,
+            Err(error) => {
+                // Writeback ctime/mtime may follow unlink or replacement. Never
+                // resolve its former name, which could now name a different file.
+                if valid.is_empty() || !(SetattrValid::MTIME | SetattrValid::CTIME).contains(valid)
+                {
+                    return Err(error);
+                }
+                let object = self.detached_writeback.lock().unwrap().get(&inode).cloned();
+                if handle.is_none() {
+                    if let Some(object) = object {
+                        let (mut updated, timeout) = match &*object {
+                            DetachedWritebackInode::Upper {
+                                reference,
+                                projected,
+                                virtual_mode,
+                            } => {
+                                let _io = self.fence_native_inode(Layer(0), reference.inode);
+                                let (mut updated, timeout) = reference.fs.setattr(
+                                    ctx,
+                                    reference.inode,
+                                    attr,
+                                    None,
+                                    valid,
+                                )?;
+                                if *virtual_mode {
+                                    updated.st_mode = projected.st_mode;
+                                }
+                                updated.st_uid = projected.st_uid;
+                                updated.st_gid = projected.st_gid;
+                                updated.st_rdev = projected.st_rdev;
+                                (updated, timeout)
+                            }
+                            DetachedWritebackInode::Lower(view) => {
+                                let mut view = view.lock().unwrap();
+                                if valid.contains(SetattrValid::MTIME) {
+                                    view.st_mtime = attr.st_mtime;
+                                    view.st_mtime_nsec = attr.st_mtime_nsec;
+                                }
+                                if valid.contains(SetattrValid::CTIME) {
+                                    view.st_ctime = attr.st_ctime;
+                                    view.st_ctime_nsec = attr.st_ctime_nsec;
+                                }
+                                (*view, TTL)
+                            }
+                        };
+                        updated.st_ino = inode as _;
+                        return Ok((updated, timeout));
+                    }
+                }
+                let handles = self.handles.lock().unwrap();
+                let id = handle.or_else(|| handles.iter().find_map(|(id, h)| {
+                    matches!(h, Handle::File(h) if h.overlay_inode == inode && h.layer.0 == 0).then_some(*id)
+                })).ok_or(error)?;
+                let h = match handles.get(&id) {
+                    Some(Handle::File(h)) if h.overlay_inode == inode && h.layer.0 == 0 => {
+                        h.clone()
+                    }
+                    _ => return Err(io::Error::from_raw_os_error(libc::EBADF)),
+                };
+                drop(handles);
+                let _io = self.io_activity.fence(vec![id], false);
+                _io.drain();
+                let (mut attr, timeout) =
+                    self.layers[0].setattr(ctx, h.inode, attr, Some(h.handle), valid)?;
+                attr.st_ino = inode as _;
+                return Ok((attr, timeout));
+            }
+        };
         let _io = self.fence_paths(&[&path]);
         self.core
             .prepare_metadata_change(&path)
@@ -1801,12 +3023,16 @@ impl FileSystem for OverlayFs {
         let _operation = self.write_operation()?;
         let path = self.child(parent, name)?;
         let (upper_parent, upper_name) = self.upper_parent(ctx, &path)?;
-        self.layers[0].symlink(ctx, linkname, upper_parent, &upper_name, extensions)?;
+        let created = self.layers[0].symlink(ctx, linkname, upper_parent, &upper_name, extensions);
         if upper_parent != fuse::ROOT_ID {
             self.layers[0].forget(ctx, upper_parent, 1);
         }
+        let created = created?;
+        self.layers[0].forget(ctx, created.inode, 1);
         let inode = self.allocate_inode(path.clone());
-        self.entry(ctx, &path, inode)
+        let entry = self.entry(ctx, &path, inode)?;
+        self.acquire_guest_lookup(inode);
+        Ok(entry)
     }
 
     fn mknod(
@@ -1822,7 +3048,7 @@ impl FileSystem for OverlayFs {
         let _operation = self.write_operation()?;
         let path = self.child(parent, name)?;
         let (upper_parent, upper_name) = self.upper_parent(ctx, &path)?;
-        self.layers[0].mknod(
+        let created = self.layers[0].mknod(
             ctx,
             upper_parent,
             &upper_name,
@@ -1830,12 +3056,16 @@ impl FileSystem for OverlayFs {
             rdev,
             umask,
             extensions,
-        )?;
+        );
         if upper_parent != fuse::ROOT_ID {
             self.layers[0].forget(ctx, upper_parent, 1);
         }
+        let created = created?;
+        self.layers[0].forget(ctx, created.inode, 1);
         let inode = self.allocate_inode(path.clone());
-        self.entry(ctx, &path, inode)
+        let entry = self.entry(ctx, &path, inode)?;
+        self.acquire_guest_lookup(inode);
+        Ok(entry)
     }
 
     fn mkdir(
@@ -1858,7 +3088,12 @@ impl FileSystem for OverlayFs {
         let (upper_parent, upper_name) = self.upper_parent(ctx, &path)?;
         let created = self.layers[0]
             .mkdir(ctx, upper_parent, &upper_name, mode, umask, extensions)
-            .inspect_err(|error| log::error!("overlay native mkdir failed: {error}"))?;
+            .inspect_err(|error| log::error!("overlay native mkdir failed: {error}"));
+        if upper_parent != fuse::ROOT_ID {
+            self.layers[0].forget(ctx, upper_parent, 1);
+        }
+        let created = created?;
+        self.layers[0].forget(ctx, created.inode, 1);
         #[cfg(target_os = "linux")]
         if let Some(parent_attr) = virtual_parent {
             // Rootless OCI ownership is virtual: native mkdir may use the host
@@ -1879,20 +3114,19 @@ impl FileSystem for OverlayFs {
             )
             .map_err(linux_error)?;
         }
-        #[cfg(target_os = "macos")]
-        let _ = created;
-        if upper_parent != fuse::ROOT_ID {
-            self.layers[0].forget(ctx, upper_parent, 1);
-        }
         let inode = self.allocate_inode(path.clone());
-        self.entry(ctx, &path, inode)
+        let entry = self.entry(ctx, &path, inode)?;
+        self.acquire_guest_lookup(inode);
+        Ok(entry)
     }
 
     fn unlink(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         let _operation = self.write_operation()?;
         let path = self.child(parent, name)?;
         let _io = self.fence_paths(&[&path]);
+        let retired = self.prepare_detached_writeback(_ctx, &path)?;
         self.core.remove(&path, false).map_err(linux_error)?;
+        self.commit_detached_writeback(retired);
         self.remove_path(&path);
         Ok(())
     }
@@ -1919,12 +3153,18 @@ impl FileSystem for OverlayFs {
         let old = self.child(olddir, oldname)?;
         let new = self.child(newdir, newname)?;
         let _io = self.fence_paths(&[&old, &new]);
+        let retired = if flags == 0 && old != new && self.core.resolve(&new).is_some() {
+            self.prepare_detached_writeback(_ctx, &new)?
+        } else {
+            None
+        };
         match flags {
             0 => self.core.rename(&old, &new, false).map_err(linux_error)?,
             RENAME_NOREPLACE => self.core.rename(&old, &new, true).map_err(linux_error)?,
             RENAME_EXCHANGE => self.core.exchange(&old, &new).map_err(linux_error)?,
             _ => return Err(linux_error(io::Error::from_raw_os_error(libc::ENOTSUP))),
         }
+        self.commit_detached_writeback(retired);
         if flags == RENAME_EXCHANGE {
             let marker = PathBuf::from(format!(".pvisor-exchange-{}", self.inode_alloc.next()));
             self.remap_path(&old, &marker);
@@ -1946,7 +3186,9 @@ impl FileSystem for OverlayFs {
             .hard_link(&source, &destination)
             .map_err(linux_error)?;
         let new_inode = self.allocate_inode(destination.clone());
-        self.entry(ctx, &destination, new_inode)
+        let entry = self.entry(ctx, &destination, new_inode)?;
+        self.acquire_guest_lookup(new_inode);
+        Ok(entry)
     }
 
     fn open(
@@ -1956,68 +3198,51 @@ impl FileSystem for OverlayFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<u64>, OpenOptions)> {
-        let _span = self.profile.span("open");
-        let writing = FilesystemService::is_write_open(flags as i32);
-        // Read-only opens observe a stable namespace and insert handles under
-        // their own mutex; they need not exclude independent backing reads.
-        // Privilege changes, copy-up and every writable open remain exclusive.
-        let readonly = !writing && !kill_priv;
-        let _read_operation = if readonly {
-            Some(self.read_operation()?)
-        } else {
-            None
-        };
-        let _write_operation = if readonly {
-            None
-        } else {
-            Some(self.write_operation()?)
-        };
-        let path = self.path(inode)?;
-        let _io = (!readonly).then(|| self.fence_paths(&[&path]));
-        let (layer, inner, immutable_regular) = match self
-            .core
-            .prepare_open_for_backing_lookup(&path, flags as i32)
-            .map_err(linux_error)?
-        {
-            OpenBacking::Writable(_) => (Layer(0), self.inner_inode(Layer(0), &path, ctx)?, false),
-            OpenBacking::ReadOnly(backing) => {
-                let layer = Layer(backing.entry.layer);
-                let immutable_regular = backing.entry.metadata.is_file()
-                    && layer.0.checked_sub(1).is_some_and(|index| {
-                        self.snapshot_config.lower_mutability.get(index)
-                            == Some(&pvisor_overlay_core::LayerMutability::Immutable)
-                    });
-                let inner = self
-                    .inner_entry_with_parents(layer, &path, ctx, &backing.parents)?
-                    .inode;
-                (layer, inner, immutable_regular)
+        let opened = self.open_native_for_reply(ctx, inode, kill_priv, flags, false)?;
+        Ok((opened.reply.handle, opened.reply.options))
+    }
+
+    fn open_for_reply(
+        &self,
+        ctx: Context,
+        inode: u64,
+        kill_priv: bool,
+        flags: u32,
+        request_eligible: bool,
+    ) -> io::Result<OpenReply> {
+        let opened = self.open_native_for_reply(
+            ctx,
+            inode,
+            kill_priv,
+            flags,
+            self.shared_open_qualification && request_eligible,
+        )?;
+        let mut reply = opened.reply;
+        #[cfg(target_os = "linux")]
+        if let Some(identity) = opened.data_identity {
+            if reply.allows_data_object(request_eligible) {
+                reply.data_object = self.lower_data_object_with_identity(
+                    inode,
+                    reply.handle.unwrap(),
+                    Some(identity),
+                );
             }
-        };
-        let opened = self.layers[layer.0].open(ctx, inner, kill_priv, flags);
-        let (handle, mut options) = match opened {
-            Ok((Some(handle), options)) => (handle, options),
-            result => {
-                self.layers[layer.0].forget(ctx, inner, 1);
-                return match result {
-                    Err(error) => Err(error),
-                    _ => Err(io::Error::from_raw_os_error(libc::EIO)),
-                };
-            }
-        };
-        // Keep OPEN's policy, baseline observation and native descriptor
-        // checks. A writable/copy-up open must invalidate the merged inode's
-        // old lower pages rather than reusing this read-only optimization.
-        if self.immutable_data_cache && readonly && immutable_regular {
-            options |= OpenOptions::KEEP_CACHE;
+            return Ok(reply);
         }
-        let id = self.allocate_handle(Handle::File(Arc::new(FileHandle {
-            overlay_inode: inode,
-            layer,
-            inode: inner,
-            handle,
-            relative_path: path.as_os_str().as_bytes().to_vec(),
-        })));
-        Ok((Some(id), options))
+        reply.complete_legacy(self, inode, request_eligible);
+        Ok(reply)
+    }
+
+    fn lower_data_object(&self, inode: u64, handle: u64) -> Option<LowerDataObject> {
+        #[cfg(target_os = "linux")]
+        {
+            self.lower_data_object_with_identity(inode, handle, None)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (inode, handle);
+            None
+        }
     }
 
     fn create(
@@ -2060,6 +3285,7 @@ impl FileSystem for OverlayFs {
             handle,
             relative_path: path.as_os_str().as_bytes().to_vec(),
         })));
+        self.acquire_guest_lookup(inode);
         Ok((entry, Some(id), options))
     }
 
@@ -2076,6 +3302,7 @@ impl FileSystem for OverlayFs {
     ) -> io::Result<usize> {
         let _span = self.profile.span("read");
         let lease = self.file_io_lease(handle)?;
+        self.drain_buffered_writes()?;
         let h = &lease.handle;
         let backing = self.roots[h.layer.0].join(OsStr::from_bytes(&h.relative_path));
         if let Some(bytes) = self
@@ -2095,16 +3322,57 @@ impl FileSystem for OverlayFs {
         ctx: Context,
         _inode: u64,
         handle: u64,
-        r: R,
+        mut r: R,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
         kill_priv: bool,
-        _flags: u32,
+        flags: u32,
     ) -> io::Result<usize> {
         let _span = self.profile.span("write");
         let lease = self.file_io_lease(handle)?;
+        if let Some(buffer) = self.buffered_writes() {
+            if lease.handle.layer.0 == 0
+                && buffered_request_flags(flags)
+                && if self.host_writeback_qualification_lock {
+                    self.layers[0].buffered_write_eligible(&lease.native)?
+                } else {
+                    self.layers[0].buffered_write_eligible_unlocked(&lease.native)?
+                }
+                && size != 0
+            {
+                if offset
+                    .checked_add(u64::from(size))
+                    .is_none_or(|end| end > i64::MAX as u64)
+                {
+                    return Err(io::Error::from_raw_os_error(libc::EFBIG));
+                }
+                // Reserve before allocation or copying. The permit also covers
+                // the in-flight backend write, not just the pending FIFO.
+                let permit = buffer.reserve(size as usize)?;
+                let mut bytes = vec![0; size as usize];
+                r.read_exact(&mut bytes)?;
+                let target = BufferedWrite {
+                    fs: self.layers[0].clone(),
+                    lease,
+                    kill_priv,
+                    profile: self.profile.clone(),
+                };
+                permit.submit(Box::new(target), bytes, offset)?;
+                self.profile.add("host_writeback_accepted_requests", 1);
+                self.profile
+                    .add("host_writeback_accepted_bytes", u64::from(size));
+                if self.host_writeback_synchronous {
+                    // Engineering control: identical owned-copy and worker path,
+                    // but wait for its accepted prefix before replying to WRITE.
+                    buffer.flush()?;
+                }
+                return Ok(size as usize);
+            }
+            // Synchronous/direct/append paths cannot overtake accepted writes.
+            buffer.flush()?;
+        }
         self.layers[lease.handle.layer.0].write_leased(
             ctx,
             &lease.native,
@@ -2117,17 +3385,46 @@ impl FileSystem for OverlayFs {
 
     fn flush(&self, _ctx: Context, _inode: u64, handle: u64, _lock_owner: u64) -> io::Result<()> {
         let lease = self.file_io_lease(handle)?;
+        self.drain_buffered_writes()?;
         self.layers[lease.handle.layer.0].flush_leased(&lease.native)
     }
 
     fn fsync(&self, _ctx: Context, _inode: u64, datasync: bool, handle: u64) -> io::Result<()> {
         let lease = self.file_io_lease(handle)?;
+        self.drain_buffered_writes()?;
         self.core.sync_preimages()?;
         self.layers[lease.handle.layer.0].sync_leased(&lease.native, datasync)
     }
 
+    fn syncfs(&self, _ctx: Context) -> io::Result<()> {
+        // Legacy sessions retain their existing ENOSYS behavior. For the new
+        // cache this is also the supervisor's final asynchronous-error fence.
+        if !self.host_writeback {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        let _operation = self.write_operation()?;
+        let _io = self.io_activity.fence(Vec::new(), true);
+        _io.drain();
+        self.drain_buffered_writes()?;
+        self.core.sync_preimages().map_err(linux_error)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let upper = std::fs::File::open(&self.roots[0]).map_err(linux_error)?;
+            // SAFETY: the opened upper root pins the target filesystem until
+            // syncfs completes, including files closed before this request.
+            if unsafe { libc::syncfs(upper.as_raw_fd()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     fn fsyncdir(&self, _ctx: Context, inode: u64, _datasync: bool, _handle: u64) -> io::Result<()> {
         let _operation = self.write_operation()?;
+        self.drain_buffered_writes()?;
         self.core.sync_preimages().map_err(linux_error)?;
         let entry = self
             .core
@@ -2170,7 +3467,7 @@ impl FileSystem for OverlayFs {
                     lock_owner,
                 );
                 self.layers[h.layer.0].forget(ctx, h.inode, 1);
-                result
+                result.and_then(|()| self.drain_buffered_writes())
             }
             _ => Err(io::Error::from_raw_os_error(libc::EBADF)),
         }
@@ -2370,7 +3667,8 @@ impl FileSystem for OverlayFs {
                 };
                 let inode = self.allocate_inode(path.clone());
                 let entry = self.entry_on_backing(ctx, &path, inode, &backing)?;
-                if add_entry(
+                self.acquire_guest_lookup(inode);
+                let added = add_entry(
                     DirEntry {
                         ino: inode,
                         offset: (index + 1) as u64,
@@ -2378,9 +3676,17 @@ impl FileSystem for OverlayFs {
                         name,
                     },
                     entry,
-                )? == 0
-                {
-                    break;
+                );
+                match added {
+                    Ok(0) => {
+                        self.forget_guest_lookup(inode, 1);
+                        break;
+                    }
+                    Err(error) => {
+                        self.forget_guest_lookup(inode, 1);
+                        return Err(error);
+                    }
+                    Ok(_) => {}
                 }
             }
             return Ok(());
@@ -2392,7 +3698,8 @@ impl FileSystem for OverlayFs {
         for (index, item) in items.iter().enumerate().skip(offset as usize) {
             let path = self.path(item.ino)?;
             let entry = self.entry(ctx, &path, item.ino)?;
-            if add_entry(
+            self.acquire_guest_lookup(item.ino);
+            let added = add_entry(
                 DirEntry {
                     ino: item.ino as _,
                     offset: (index + 1) as u64,
@@ -2400,9 +3707,17 @@ impl FileSystem for OverlayFs {
                     name: &item.name,
                 },
                 entry,
-            )? == 0
-            {
-                break;
+            );
+            match added {
+                Ok(0) => {
+                    self.forget_guest_lookup(item.ino, 1);
+                    break;
+                }
+                Err(error) => {
+                    self.forget_guest_lookup(item.ino, 1);
+                    return Err(error);
+                }
+                Ok(_) => {}
             }
         }
         Ok(())
@@ -2569,6 +3884,90 @@ mod tests {
         #[test]
         fn truncate_replacement() {
             truncate_detached(true);
+        }
+
+        #[test]
+        fn truncate_detached_waits_for_io_on_another_open_handle() {
+            use std::sync::mpsc::channel;
+            use std::time::Instant;
+
+            let (temp, fs, ctx) = fixture(None);
+            let (entry, handle, _) = fs
+                .create(
+                    ctx,
+                    fuse::ROOT_ID,
+                    c"file",
+                    libc::S_IFREG | 0o600,
+                    false,
+                    libc::O_RDWR as u32,
+                    0,
+                    Extensions::default(),
+                )
+                .unwrap();
+            let handle = handle.unwrap();
+            std::fs::write(temp.path().join("upper/file"), b"original").unwrap();
+            let alias = fs
+                .open(ctx, entry.inode, false, libc::O_RDWR as u32)
+                .unwrap()
+                .0
+                .unwrap();
+            fs.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+            let mut attr = fs.getattr(ctx, entry.inode, Some(handle)).unwrap().0;
+            attr.st_size = 2;
+            let lease = fs.file_io_lease(alias).unwrap();
+            let (sent, received) = channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    sent.send(fs.setattr(ctx, entry.inode, attr, Some(handle), SetattrValid::SIZE))
+                        .unwrap();
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let fenced = loop {
+                    if fs
+                        .io_activity
+                        .state
+                        .lock()
+                        .unwrap()
+                        .blocked
+                        .contains_key(&alias)
+                    {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                let premature = received.try_recv();
+                drop(lease);
+                let result = received.recv_timeout(Duration::from_secs(2));
+                assert!(fenced, "truncate must fence I/O through every open alias");
+                assert!(
+                    premature.is_err(),
+                    "truncate completed before admitted I/O drained"
+                );
+                assert_eq!(
+                    result.expect("truncate did not resume").unwrap().0.st_size,
+                    2
+                );
+            });
+            assert_eq!(
+                fs.getattr(ctx, entry.inode, Some(alias)).unwrap().0.st_size,
+                2
+            );
+            assert!(!temp.path().join("upper/file").exists());
+            for id in [handle, alias] {
+                fs.release(
+                    ctx,
+                    entry.inode,
+                    libc::O_RDWR as u32,
+                    id,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap();
+            }
         }
 
         #[test]
@@ -2775,6 +4174,711 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    mod host_writeback {
+        use super::*;
+        include!("overlay_host_writeback_tests.rs");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn negative_entry_fixture(root: &Path) -> OverlayFs {
+        negative_entry_fixture_with_exclusions(root, Vec::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn negative_entry_fixture_with_exclusions(
+        root: &Path,
+        excluded_paths: Vec<String>,
+    ) -> OverlayFs {
+        std::fs::create_dir_all(root.join("lower/dir")).unwrap();
+        std::fs::write(root.join("lower/existing"), b"lower").unwrap();
+        let mut fs = OverlayFs::build_with_writeback(
+            Config {
+                lower_dirs: vec![root.join("lower").to_string_lossy().into_owned()],
+                lower_mutability: vec![pvisor_overlay_core::LayerMutability::Immutable],
+                apply_target: None,
+                baseline_lower: None,
+                baseline_content_index: None,
+                upper_dir: root.join("upper").to_string_lossy().into_owned(),
+                work_dir: None,
+                preimage_dir: None,
+                excluded_paths,
+                access_policy: Default::default(),
+                semantics: passthrough::PermissionSemantics::LinuxComplete,
+            },
+            Arc::new(InodeAllocator::new()),
+            false,
+            Some("0"),
+        )
+        .unwrap();
+        fs.profile = pvisor_overlay_core::profile::Profile::enabled("negative-entry-test");
+        fs.init(FsOptions::empty()).unwrap();
+        fs
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entries_require_owned_default_local_views_and_keep_explicit_profiles() {
+        for case in 0..8 {
+            let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+            let mut fs = negative_entry_fixture(temp.path());
+            let requested = case != 0;
+            let guest_cache = case != 1;
+            let dax = case == 2;
+            match case {
+                3 => fs.new_session_writeback = true,
+                4 => fs.snapshot_config.lower_mutability.clear(),
+                5 => {
+                    fs.snapshot_config.lower_mutability[0] =
+                        pvisor_overlay_core::LayerMutability::Mutable
+                }
+                6 => {
+                    fs.snapshot_config.semantics = passthrough::PermissionSemantics::LinuxSimplified
+                }
+                7 => {
+                    fs.snapshot_config.access_policy =
+                        pvisor_overlay_core::FileAccessPolicy::new(vec!["denied".into()], vec![])
+                            .unwrap()
+                }
+                _ => {}
+            }
+            fs.configure_negative_entry_cache(requested, guest_cache, dax, vec![])
+                .unwrap();
+            let profile = fs.profile.report().unwrap();
+            assert_eq!(
+                profile.measurements["negative_entry_cache_requested"].units,
+                u64::from(requested)
+            );
+            assert_eq!(
+                profile.measurements["negative_entry_cache_enabled"].units,
+                0
+            );
+            assert_eq!(
+                profile.measurements["negative_entry_cache_replies"].units,
+                0
+            );
+            assert_eq!(
+                fs.lookup(
+                    Context {
+                        uid: 0,
+                        gid: 0,
+                        pid: 1
+                    },
+                    fuse::ROOT_ID,
+                    c"missing"
+                )
+                .err()
+                .expect("operation must fail")
+                .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            assert_eq!(
+                fs.configure_negative_entry_cache(true, true, false, vec![])
+                    .expect_err("operation must fail")
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entry_exclusions_protect_ancestors_and_subtrees_without_disabling_siblings() {
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for enabled in [false, true] {
+            let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+            std::fs::create_dir_all(temp.path().join("lower/tmp/pvisor-host-0")).unwrap();
+            std::fs::write(
+                temp.path().join("lower/tmp/pvisor-host-0/secret"),
+                b"host authority",
+            )
+            .unwrap();
+            let mut fs = negative_entry_fixture_with_exclusions(
+                temp.path(),
+                vec!["tmp/pvisor-host-0".into(), "absent/protected".into()],
+            );
+            fs.configure_negative_entry_cache(enabled, true, false, vec![PathBuf::from("once")])
+                .unwrap();
+            let initial_nodes = fs.nodes.lock().unwrap().by_inode.len();
+            // This missing ancestor must use ordinary ENOENT, just like the
+            // existing excluded object and the worker's synthetic name.
+            for name in [c"absent", c"once"] {
+                assert_eq!(
+                    fs.lookup(ctx, fuse::ROOT_ID, name)
+                        .err()
+                        .expect("protected names retain ordinary lookup")
+                        .raw_os_error(),
+                    Some(libc::ENOENT)
+                );
+            }
+            assert_eq!(fs.nodes.lock().unwrap().by_inode.len(), initial_nodes);
+            let tmp = fs.lookup(ctx, fuse::ROOT_ID, c"tmp").unwrap();
+            assert_ne!(tmp.inode, 0);
+            assert_eq!((tmp.attr_timeout, tmp.entry_timeout), (TTL, TTL));
+            assert_eq!(
+                fs.lookup(ctx, tmp.inode, c"pvisor-host-0")
+                    .err()
+                    .expect("physically present host authority stays excluded")
+                    .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            // Even a retained protocol inode must not turn an excluded
+            // descendant into a successful nodeid=0 response.
+            let protected = fs.allocate_inode(PathBuf::from("tmp/pvisor-host-0"));
+            assert_eq!(
+                fs.lookup(ctx, protected, c"secret")
+                    .err()
+                    .expect("excluded descendants retain Core's visibility error")
+                    .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            let before = fs.profile.report().unwrap();
+            assert_eq!(
+                before.measurements["negative_entry_cache_enabled"].units,
+                u64::from(enabled)
+            );
+            assert_eq!(before.measurements["negative_entry_cache_replies"].units, 0);
+            assert_eq!(
+                before.measurements["negative_entry_cache_fallbacks"].units,
+                if enabled { 5 } else { 0 }
+            );
+            for (parent, name) in [
+                (fuse::ROOT_ID, c"unrelated"),
+                (fuse::ROOT_ID, c"tmp-other"),
+                (tmp.inode, c"pvisor-host-01"),
+                (tmp.inode, c"unrelated"),
+            ] {
+                let result = fs.lookup(ctx, parent, name);
+                if enabled {
+                    let negative = result.unwrap();
+                    assert_eq!(
+                        (
+                            negative.inode,
+                            negative.attr_timeout,
+                            negative.entry_timeout
+                        ),
+                        (0, Duration::ZERO, TTL)
+                    );
+                } else {
+                    assert_eq!(
+                        result
+                            .err()
+                            .expect("feature-off absence remains an error")
+                            .raw_os_error(),
+                        Some(libc::ENOENT)
+                    );
+                }
+            }
+            let after = fs.profile.report().unwrap();
+            assert_eq!(
+                after.measurements["negative_entry_cache_replies"].units,
+                if enabled { 4 } else { 0 }
+            );
+            assert_eq!(
+                after.measurements["negative_entry_cache_fallbacks"].units,
+                before.measurements["negative_entry_cache_fallbacks"].units
+            );
+            // Neither a forbidden object nor cacheable absence materializes
+            // a host-authority inode or changes the native file.
+            assert_eq!(
+                std::fs::read(temp.path().join("lower/tmp/pvisor-host-0/secret")).unwrap(),
+                b"host authority"
+            );
+            assert!(!fs
+                .nodes
+                .lock()
+                .unwrap()
+                .by_path
+                .contains_key(Path::new("tmp/pvisor-host-0/secret")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entries_allocate_no_inode_preserve_errors_and_never_extend_positive_ttls() {
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let mut fs = negative_entry_fixture(temp.path());
+        fs.snapshot_config
+            .access_policy
+            .bind_session("run", "attempt", "workspace");
+        fs.snapshot_config.access_policy = fs.snapshot_config.access_policy.for_view("rootfs");
+        fs.configure_negative_entry_cache(true, true, false, vec![PathBuf::from("once")])
+            .unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let count = fs.nodes.lock().unwrap().by_inode.len();
+        let missing = fs.lookup(ctx, fuse::ROOT_ID, c"missing").unwrap();
+        assert_eq!(
+            (
+                missing.inode,
+                missing.generation,
+                missing.attr_timeout,
+                missing.entry_timeout
+            ),
+            (0, 0, Duration::ZERO, TTL)
+        );
+        assert_eq!(fs.nodes.lock().unwrap().by_inode.len(), count);
+        assert!(!fs
+            .nodes
+            .lock()
+            .unwrap()
+            .by_path
+            .contains_key(Path::new("missing")));
+        let wire = super::super::fuse::EntryOut::from(missing);
+        assert_eq!((wire.nodeid, wire.entry_valid, wire.attr_valid), (0, 1, 0));
+        let existing = fs.lookup(ctx, fuse::ROOT_ID, c"existing").unwrap();
+        assert_ne!(existing.inode, 0);
+        assert_eq!((existing.attr_timeout, existing.entry_timeout), (TTL, TTL));
+        assert_eq!(
+            fs.lookup(ctx, existing.inode, c"child")
+                .err()
+                .expect("operation must fail")
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"once")
+                .err()
+                .expect("operation must fail")
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        let profile = fs.profile.report().unwrap();
+        assert_eq!(
+            profile.measurements["negative_entry_cache_enabled"].units,
+            1
+        );
+        assert_eq!(
+            profile.measurements["negative_entry_cache_replies"].units,
+            1
+        );
+        assert_eq!(
+            profile.measurements["negative_entry_cache_fallbacks"].units,
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entry_replies_do_not_hide_native_create_rename_link_or_unlink_results() {
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let mut fs = negative_entry_fixture(temp.path());
+        fs.configure_negative_entry_cache(true, true, false, vec![])
+            .unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for name in [c"created", c"renamed", c"linked", c"directory", c"symlink"] {
+            assert_eq!(fs.lookup(ctx, fuse::ROOT_ID, name).unwrap().inode, 0);
+        }
+        let (created, handle, _) = fs
+            .create(
+                ctx,
+                fuse::ROOT_ID,
+                c"created",
+                libc::S_IFREG | 0o640,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        fs.release(
+            ctx,
+            created.inode,
+            libc::O_RDWR as u32,
+            handle.unwrap(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_ne!(fs.lookup(ctx, fuse::ROOT_ID, c"created").unwrap().inode, 0);
+        fs.rename(ctx, fuse::ROOT_ID, c"created", fuse::ROOT_ID, c"renamed", 0)
+            .unwrap();
+        assert_eq!(fs.lookup(ctx, fuse::ROOT_ID, c"created").unwrap().inode, 0);
+        let renamed = fs.lookup(ctx, fuse::ROOT_ID, c"renamed").unwrap();
+        assert_ne!(renamed.inode, 0);
+        fs.link(ctx, renamed.inode, fuse::ROOT_ID, c"linked")
+            .unwrap();
+        assert_ne!(fs.lookup(ctx, fuse::ROOT_ID, c"linked").unwrap().inode, 0);
+        fs.unlink(ctx, fuse::ROOT_ID, c"linked").unwrap();
+        assert_eq!(fs.lookup(ctx, fuse::ROOT_ID, c"linked").unwrap().inode, 0);
+        fs.mkdir(
+            ctx,
+            fuse::ROOT_ID,
+            c"directory",
+            0o755,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"directory").unwrap().inode,
+            0
+        );
+        fs.symlink(
+            ctx,
+            c"renamed",
+            fuse::ROOT_ID,
+            c"symlink",
+            Extensions::default(),
+        )
+        .unwrap();
+        assert_ne!(fs.lookup(ctx, fuse::ROOT_ID, c"symlink").unwrap().inode, 0);
+        assert_eq!(
+            fs.rename(
+                ctx,
+                fuse::ROOT_ID,
+                c"absent-source",
+                fuse::ROOT_ID,
+                c"failed",
+                0
+            )
+            .expect_err("operation must fail")
+            .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(fs.lookup(ctx, fuse::ROOT_ID, c"failed").unwrap().inode, 0);
+        assert_eq!(
+            std::fs::read(temp.path().join("lower/existing")).unwrap(),
+            b"lower"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entry_snapshot_fence_is_not_serialized_and_survives_destroy() {
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let mut fs = negative_entry_fixture(temp.path());
+        fs.configure_negative_entry_cache(true, true, false, vec![])
+            .unwrap();
+        let before = fs.capture_state().unwrap();
+        assert!(!serde_json::to_string(&before)
+            .unwrap()
+            .contains("negative_entry_cache"));
+        fs.restore_state(&before).unwrap();
+        fs.lookup(
+            Context {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+            },
+            fuse::ROOT_ID,
+            c"missing",
+        )
+        .unwrap();
+        assert_eq!(
+            fs.capture_state()
+                .expect_err("operation must fail")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            fs.restore_state(&before)
+                .expect_err("operation must fail")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        fs.destroy();
+        fs.init(FsOptions::empty()).unwrap();
+        assert_eq!(
+            fs.capture_state()
+                .expect_err("operation must fail")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            fs.restore_state(&before)
+                .expect_err("operation must fail")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        let mut restored =
+            OverlayFs::open_existing(fs.snapshot_config.clone(), Arc::new(InodeAllocator::new()))
+                .unwrap();
+        assert!(!restored.negative_entry_cache);
+        assert!(!restored.negative_entry_cache_seen.load(Ordering::Relaxed));
+        restored
+            .configure_negative_entry_cache(false, true, false, vec![])
+            .unwrap();
+        restored.restore_state(&before).unwrap();
+        assert_eq!(
+            restored
+                .lookup(
+                    Context {
+                        uid: 0,
+                        gid: 0,
+                        pid: 1
+                    },
+                    fuse::ROOT_ID,
+                    c"missing"
+                )
+                .err()
+                .expect("operation must fail")
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entries_reject_existing_projections_and_fall_back_after_late_attachment() {
+        use pvisor_overlay_core::backend::{BackendAttachment, FileAttr, ReadOnlyBackend};
+        struct Projection;
+        impl ReadOnlyBackend for Projection {
+            fn prepare_metadata(&self, _: &Path) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            fn prepare_directory(&self, path: &Path) -> io::Result<()> {
+                self.prepare_metadata(path)
+            }
+            fn attributes(&self, _: &Path) -> io::Result<FileAttr> {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            fn read_at(&self, _: &Path, _: u64, _: u32) -> io::Result<Vec<u8>> {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            fn materialize_file(&self, path: &Path) -> io::Result<()> {
+                self.prepare_metadata(path)
+            }
+            fn materialize_tree(&self, path: &Path) -> io::Result<()> {
+                self.prepare_metadata(path)
+            }
+        }
+        for late in [false, true] {
+            let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+            let mut fs = negative_entry_fixture(temp.path());
+            if late {
+                fs.configure_negative_entry_cache(true, true, false, vec![])
+                    .unwrap();
+            }
+            let _attachment =
+                BackendAttachment::new(&temp.path().join("lower"), Arc::new(Projection)).unwrap();
+            if !late {
+                fs.configure_negative_entry_cache(true, true, false, vec![])
+                    .unwrap();
+            }
+            assert_eq!(
+                fs.lookup(
+                    Context {
+                        uid: 0,
+                        gid: 0,
+                        pid: 1
+                    },
+                    fuse::ROOT_ID,
+                    c"missing"
+                )
+                .err()
+                .expect("operation must fail")
+                .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            let profile = fs.profile.report().unwrap();
+            assert_eq!(
+                profile.measurements["negative_entry_cache_enabled"].units,
+                u64::from(late)
+            );
+            assert_eq!(
+                profile.measurements["negative_entry_cache_replies"].units,
+                0
+            );
+            assert!(!fs.negative_entry_cache_seen.load(Ordering::Relaxed));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entry_configuration_rejects_journal_overlap_without_enabling_core_caches() {
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let mut config = negative_entry_fixture(temp.path()).snapshot_config.clone();
+        config.preimage_dir = Some(
+            temp.path()
+                .join("upper/journal")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        // Legacy layouts permit this journal position. Initialize one through
+        // its real constructor so open_existing reaches preference validation.
+        let legacy = OverlayCore::new_with_exclusions_and_preimages(
+            vec![PathBuf::from(&config.lower_dirs[0])],
+            PathBuf::from(&config.upper_dir),
+            None,
+            vec![],
+            config.preimage_dir.as_ref().map(PathBuf::from),
+        )
+        .unwrap();
+        drop(legacy);
+        let mut fs = OverlayFs::build_with_writeback(
+            config,
+            Arc::new(InodeAllocator::new()),
+            true,
+            Some("0"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.configure_negative_entry_cache(true, true, false, vec![])
+                .expect_err("operation must fail")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!fs.negative_entry_cache_configured);
+        assert!(!fs.core.exclusive_upper_absence_cache_enabled());
+        fs.configure_negative_entry_cache(false, true, false, vec![])
+            .unwrap();
+        assert!(!fs.negative_entry_cache);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negative_entry_restore_preserves_unset_writeback_compatibility_only_when_disabled() {
+        for (saved_writeback, negative, accepted) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+            let config = negative_entry_fixture(temp.path()).snapshot_config.clone();
+            let source = OverlayFs::build_with_writeback(
+                config.clone(),
+                Arc::new(InodeAllocator::new()),
+                false,
+                Some(if saved_writeback { "1" } else { "0" }),
+            )
+            .unwrap();
+            let options = source.init(FsOptions::WRITEBACK_CACHE).unwrap();
+            assert_eq!(
+                options.contains(FsOptions::WRITEBACK_CACHE),
+                saved_writeback
+            );
+            let ctx = Context {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+            };
+            let existing = source.lookup(ctx, fuse::ROOT_ID, c"existing").unwrap();
+            let saved = source.capture_state().unwrap();
+            drop(source);
+
+            // Unset preserves native restoration support for historical WB1,
+            // while the preference for a future INIT remains writeback-off.
+            let mut restored = OverlayFs::build_with_writeback(
+                config,
+                Arc::new(InodeAllocator::new()),
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(!restored.new_session_writeback);
+            assert!(!restored.writeback_active.load(Ordering::Relaxed));
+            restored.profile =
+                pvisor_overlay_core::profile::Profile::enabled("negative-restore-test");
+            restored
+                .configure_negative_entry_cache(negative, true, false, vec![])
+                .unwrap();
+            assert_eq!(
+                restored.profile.report().unwrap().measurements["negative_entry_cache_enabled"]
+                    .units,
+                u64::from(negative)
+            );
+            if accepted {
+                restored.restore_state(&saved).unwrap();
+                assert_eq!(
+                    restored.writeback_active.load(Ordering::Relaxed),
+                    saved_writeback
+                );
+                assert_eq!(
+                    restored
+                        .getattr(ctx, existing.inode, None)
+                        .unwrap()
+                        .0
+                        .st_size,
+                    5
+                );
+                if negative {
+                    assert_eq!(
+                        restored
+                            .lookup(ctx, fuse::ROOT_ID, c"missing")
+                            .unwrap()
+                            .inode,
+                        0
+                    );
+                    assert_eq!(
+                        restored.profile.report().unwrap().measurements
+                            ["negative_entry_cache_replies"]
+                            .units,
+                        1
+                    );
+                }
+            } else {
+                assert_eq!(
+                    restored
+                        .restore_state(&saved)
+                        .expect_err("WB1 must be refused")
+                        .kind(),
+                    io::ErrorKind::Unsupported
+                );
+                assert!(!restored.writeback_active.load(Ordering::Relaxed));
+                assert_eq!(restored.nodes.lock().unwrap().by_inode.len(), 1);
+                assert!(!restored.negative_entry_cache_seen.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    #[test]
+    fn directory_images_require_every_physical_lower_to_be_immutable() {
+        use pvisor_overlay_core::LayerMutability::{Immutable, Mutable};
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        for (i, (mutability, allowed)) in [
+            (vec![], false),
+            (vec![Mutable, Mutable], false),
+            (vec![Immutable, Mutable], false),
+            (vec![Immutable, Immutable], true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fs = OverlayFs::new(
+                Config {
+                    lower_dirs: vec![
+                        lower.to_string_lossy().into(),
+                        other.to_string_lossy().into(),
+                    ],
+                    lower_mutability: mutability,
+                    upper_dir: temp
+                        .path()
+                        .join(format!("upper-{i}"))
+                        .to_string_lossy()
+                        .into(),
+                    work_dir: None,
+                    preimage_dir: None,
+                    apply_target: None,
+                    baseline_lower: None,
+                    baseline_content_index: None,
+                    excluded_paths: vec![],
+                    access_policy: Default::default(),
+                    semantics: passthrough::PermissionSemantics::LinuxComplete,
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            assert_eq!(fs.supports_directory_image(), allowed);
+        }
+    }
+
     struct ReadWriter {
         gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
         bytes: Vec<u8>,
@@ -2870,7 +4974,7 @@ mod tests {
         body: &[u8],
     ) -> (vm_memory::GuestMemoryMmap, vm_memory::GuestAddress, usize) {
         use super::super::descriptor_utils::{
-            DescriptorType, OwnedDescriptorChain, create_descriptor_chain,
+            create_descriptor_chain, DescriptorType, OwnedDescriptorChain,
         };
         use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
@@ -2949,7 +5053,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             std::fs::create_dir(temp.path().join("lower")).unwrap();
             let fs = writeback_test_overlay(temp.path(), false, setting);
-            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
             let options = negotiate_writeback_test_session(&server, capable);
             assert_eq!(options.contains(FsOptions::WRITEBACK_CACHE), expected);
             let state = server
@@ -2968,7 +5072,7 @@ mod tests {
         std::fs::create_dir(temp.path().join("lower")).unwrap();
         std::fs::write(temp.path().join("lower/file"), b"abcd").unwrap();
         let fs = writeback_test_overlay(temp.path(), false, Some("1"));
-        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
         let options = negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
         let ctx = Context {
             uid: 0,
@@ -2986,7 +5090,7 @@ mod tests {
         drop((server, fs));
 
         let fs = writeback_test_overlay(temp.path(), true, None);
-        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
         server.restore_state(&saved).unwrap();
         fs.inode_alloc.restore_next(saved.next_inode).unwrap();
         let recaptured = server
@@ -3066,7 +5170,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             std::fs::create_dir(temp.path().join("lower")).unwrap();
             let fs = writeback_test_overlay(temp.path(), false, None);
-            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
             let saved = server
                 .capture_state(fs.inode_alloc.snapshot_next())
                 .unwrap();
@@ -3075,7 +5179,7 @@ mod tests {
             drop((server, fs));
 
             let fs = writeback_test_overlay(temp.path(), true, setting);
-            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
             server.restore_state(&saved).unwrap();
             fs.inode_alloc.restore_next(saved.next_inode).unwrap();
             assert_eq!(
@@ -3102,7 +5206,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             std::fs::create_dir(temp.path().join("lower")).unwrap();
             let fs = writeback_test_overlay(temp.path(), false, Some("1"));
-            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
             negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
             let saved = server
                 .capture_state(fs.inode_alloc.snapshot_next())
@@ -3110,7 +5214,7 @@ mod tests {
             drop((server, fs));
 
             let fs = writeback_test_overlay(temp.path(), true, setting);
-            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+            let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
             server.restore_state(&saved).unwrap();
             fs.inode_alloc.restore_next(saved.next_inode).unwrap();
             server
@@ -3139,7 +5243,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("lower")).unwrap();
         let fs = writeback_test_overlay(temp.path(), false, Some("1"));
-        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
         negotiate_writeback_test_session(&server, FsOptions::WRITEBACK_CACHE);
         let saved = server
             .capture_state(fs.inode_alloc.snapshot_next())
@@ -3147,7 +5251,7 @@ mod tests {
         drop((server, fs));
 
         let fs = writeback_test_overlay(temp.path(), true, Some("0"));
-        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
         assert!(server.restore_state(&saved).is_err());
         assert_eq!(
             server
@@ -3159,7 +5263,7 @@ mod tests {
         drop((server, fs));
 
         let fs = writeback_test_overlay(temp.path(), true, None);
-        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()));
+        let server = super::super::server::Server::new(WritebackTestFs(fs.clone()), true);
         let mut mismatched = saved.clone();
         mismatched.options &= !FsOptions::WRITEBACK_CACHE.bits();
         assert!(server.restore_state(&mismatched).is_err());
@@ -3182,11 +5286,10 @@ mod tests {
             ..Default::default()
         };
         let fs = PassthroughFs::new(config.clone(), Arc::new(InodeAllocator::new())).unwrap();
-        assert!(
-            fs.init(FsOptions::WRITEBACK_CACHE)
-                .unwrap()
-                .contains(FsOptions::WRITEBACK_CACHE)
-        );
+        assert!(fs
+            .init(FsOptions::WRITEBACK_CACHE)
+            .unwrap()
+            .contains(FsOptions::WRITEBACK_CACHE));
         let ctx = Context {
             uid: 0,
             gid: 0,
@@ -3251,6 +5354,402 @@ mod tests {
             let count = io::Read::read(&mut self.0, &mut bytes)?;
             file.write_at(&bytes[..count], offset)
         }
+    }
+
+    #[test]
+    fn detached_writeback_times_use_the_open_object_after_name_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/file"), b"original").unwrap();
+        let fs = parent_cache_fixture(temp.path());
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let handle = fs
+            .open(ctx, inode, false, libc::O_RDWR as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let mut attrs = fs.getattr(ctx, inode, Some(handle)).unwrap().0;
+        fs.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+        let (replacement, replacement_handle, _) = fs
+            .create(
+                ctx,
+                fuse::ROOT_ID,
+                c"file",
+                0o600,
+                false,
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        attrs.st_mtime = 12345;
+        attrs.st_mtime_nsec = 0;
+        let (updated, _) = fs
+            .setattr(
+                ctx,
+                inode,
+                attrs,
+                Some(handle),
+                SetattrValid::MTIME | SetattrValid::CTIME,
+            )
+            .unwrap();
+        assert_eq!(updated.st_mtime, 12345);
+        assert_ne!(
+            fs.getattr(ctx, replacement.inode, replacement_handle)
+                .unwrap()
+                .0
+                .st_mtime,
+            12345
+        );
+        attrs.st_size = 2;
+        let (truncated, _) = fs
+            .setattr(ctx, inode, attrs, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+        assert_eq!(truncated.st_size, 2);
+        assert_eq!(fs.getattr(ctx, inode, Some(handle)).unwrap().0.st_size, 2);
+        assert_eq!(
+            fs.getattr(ctx, replacement.inode, replacement_handle)
+                .unwrap()
+                .0
+                .st_size,
+            0
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("lower/file")).unwrap(),
+            b"original"
+        );
+        assert!(
+            fs.setattr(ctx, inode, attrs, replacement_handle, SetattrValid::MTIME)
+                .is_err()
+        );
+        fs.release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+        fs.release(
+            ctx,
+            replacement.inode,
+            0,
+            replacement_handle.unwrap(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_writeback_after_release_keeps_identity_until_last_forget() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        fs.init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap();
+        std::fs::write(temp.path().join("upper/file"), b"old").unwrap();
+        std::fs::hard_link(
+            temp.path().join("upper/file"),
+            temp.path().join("upper/alias"),
+        )
+        .unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        assert_eq!(fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode, inode);
+        let mut attrs = fs.getattr(ctx, inode, None).unwrap().0;
+        let handle = fs
+            .open(ctx, inode, false, libc::O_RDWR as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        fs.release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+        fs.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+        std::fs::write(temp.path().join("upper/file"), b"replacement").unwrap();
+        attrs.st_mtime = 12345;
+        attrs.st_mtime_nsec = 0;
+        fs.setattr(
+            ctx,
+            inode,
+            attrs,
+            None,
+            SetattrValid::MTIME | SetattrValid::CTIME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(temp.path().join("upper/alias"))
+                .unwrap()
+                .mtime(),
+            12345
+        );
+        assert_ne!(
+            std::fs::metadata(temp.path().join("upper/file"))
+                .unwrap()
+                .mtime(),
+            12345
+        );
+        assert_eq!(
+            fs.capture_state().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        fs.forget(ctx, inode, 1);
+        assert_eq!(fs.getattr(ctx, inode, None).unwrap().0.st_mtime, 12345);
+        fs.forget(ctx, inode, 1);
+        assert_eq!(
+            fs.setattr(ctx, inode, attrs, None, SetattrValid::MTIME)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert!(fs.capture_state().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_writeback_lower_times_are_logical_and_never_touch_backing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        let lower = temp.path().join("lower/file");
+        std::fs::write(&lower, b"immutable").unwrap();
+        pvisor_overlay_core::sys::set_xattr(
+            &lower,
+            OsStr::new("user.containers.override_stat"),
+            b"77:88:0100640",
+            0,
+        )
+        .unwrap();
+        pvisor_overlay_core::sys::set_xattr(
+            &temp.path().join("lower"),
+            OsStr::new("user.containers.override_stat"),
+            b"0:0:040755",
+            0,
+        )
+        .unwrap();
+        let before = std::fs::metadata(&lower).unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        fs.init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let mut attrs = fs.getattr(ctx, inode, None).unwrap().0;
+        fs.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+        attrs.st_mtime = 12345;
+        attrs.st_mtime_nsec = 0;
+        attrs.st_ctime = 12346;
+        let updated = fs
+            .setattr(
+                ctx,
+                inode,
+                attrs,
+                None,
+                SetattrValid::MTIME | SetattrValid::CTIME,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            (updated.st_uid, updated.st_gid, updated.st_mtime),
+            (77, 88, 12345)
+        );
+        let after = std::fs::metadata(&lower).unwrap();
+        assert_eq!(
+            (
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            ),
+            (
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            )
+        );
+        assert_eq!(std::fs::read(&lower).unwrap(), b"immutable");
+        assert!(fs
+            .setattr(ctx, inode, attrs, None, SetattrValid::SIZE)
+            .is_err());
+        assert!(fs
+            .setattr(ctx, inode + 9999, attrs, None, SetattrValid::MTIME)
+            .is_err());
+        fs.forget(ctx, inode, 1);
+        assert!(fs.getattr(ctx, inode, None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_writeback_rename_victim_survives_closed_handle_and_failed_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        fs.init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap();
+        std::fs::write(temp.path().join("upper/victim"), b"victim").unwrap();
+        std::fs::write(temp.path().join("upper/source"), b"source").unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"victim").unwrap().inode;
+        let mut attrs = fs.getattr(ctx, inode, None).unwrap().0;
+        assert!(fs
+            .rename(ctx, fuse::ROOT_ID, c"missing", fuse::ROOT_ID, c"victim", 0)
+            .is_err());
+        assert!(fs.detached_writeback.lock().unwrap().is_empty());
+        assert!(fs.capture_state().is_ok());
+        fs.rename(ctx, fuse::ROOT_ID, c"source", fuse::ROOT_ID, c"victim", 0)
+            .unwrap();
+        attrs.st_mtime = 12345;
+        attrs.st_mtime_nsec = 0;
+        fs.setattr(ctx, inode, attrs, None, SetattrValid::MTIME)
+            .unwrap();
+        assert_eq!(fs.getattr(ctx, inode, None).unwrap().0.st_mtime, 12345);
+        assert_ne!(
+            std::fs::metadata(temp.path().join("upper/victim"))
+                .unwrap()
+                .mtime(),
+            12345
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("upper/victim")).unwrap(),
+            b"source"
+        );
+        fs.forget(ctx, inode, 1);
+        assert!(fs.capture_state().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_writeback_orphaned_directory_lookup_cannot_emit_invalid_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        fs.init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs
+            .mkdir(ctx, fuse::ROOT_ID, c"dir", 0o755, 0, Extensions::default())
+            .unwrap()
+            .inode;
+        fs.rmdir(ctx, fuse::ROOT_ID, c"dir").unwrap();
+        assert_eq!(
+            fs.capture_state().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        fs.forget(ctx, inode, 1);
+        assert!(fs.capture_state().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_writeback_lookup_counts_roundtrip_and_legacy_retirement_is_conservative() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/file"), b"original").unwrap();
+        let fs = writeback_test_overlay(temp.path(), false, Some("1"));
+        fs.init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        let snapshot = fs.capture_state().unwrap();
+        let restored = writeback_test_overlay(temp.path(), true, None);
+        restored.init(FsOptions::empty()).unwrap();
+        restored.restore_state(&snapshot).unwrap();
+        restored.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+        fs.forget(ctx, inode, 1); // independent original owner cannot retire restored refs
+        restored.forget(ctx, inode, 1);
+        assert!(restored.getattr(ctx, inode, None).is_ok());
+        restored.forget(ctx, inode, 1);
+        assert!(restored.getattr(ctx, inode, None).is_err());
+        // Independent unchanged backing for a legacy snapshot without nlookup.
+        let legacy_temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(legacy_temp.path().join("lower")).unwrap();
+        std::fs::write(legacy_temp.path().join("lower/file"), b"original").unwrap();
+        let original = writeback_test_overlay(legacy_temp.path(), false, Some("1"));
+        original
+            .init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap();
+        let legacy_inode = original.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let super::super::snapshot::FsSnapshot::Overlay(mut state) =
+            original.capture_state().unwrap()
+        else {
+            unreachable!()
+        };
+        state.lookup_refs = None;
+        state.legacy_lookup_refs.clear();
+        let legacy = writeback_test_overlay(legacy_temp.path(), true, None);
+        legacy.init(FsOptions::empty()).unwrap();
+        legacy
+            .restore_state(&super::super::snapshot::FsSnapshot::Overlay(state))
+            .unwrap();
+        legacy.unlink(ctx, fuse::ROOT_ID, c"file").unwrap();
+        legacy.forget(ctx, legacy_inode, u64::MAX);
+        assert!(legacy.getattr(ctx, legacy_inode, None).is_ok());
+        legacy.destroy();
+        assert!(legacy.detached_writeback.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn writeback_keeps_owned_upper_pages_after_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/file"), b"original").unwrap();
+        let config = parent_cache_fixture(temp.path()).snapshot_config.clone();
+        let fs = OverlayFs::build_with_writeback(
+            config.clone(),
+            Arc::new(InodeAllocator::new()),
+            false,
+            Some("1"),
+        )
+        .unwrap();
+        assert!(fs
+            .init(FsOptions::WRITEBACK_CACHE | FsOptions::PVISOR_WRITEBACK)
+            .unwrap()
+            .contains(FsOptions::PVISOR_WRITEBACK));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let (handle, flags) = fs.open(ctx, inode, false, libc::O_RDWR as u32).unwrap();
+        assert!(flags.contains(OpenOptions::KEEP_CACHE));
+        fs.release(ctx, inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
+        let snapshot = fs.capture_state().unwrap();
+        drop(fs);
+        let restored =
+            OverlayFs::build_with_writeback(config, Arc::new(InodeAllocator::new()), true, None)
+                .unwrap();
+        restored.init(FsOptions::empty()).unwrap();
+        restored.restore_state(&snapshot).unwrap();
+        let (handle, flags) = restored
+            .open(ctx, inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(flags.contains(OpenOptions::KEEP_CACHE));
+        restored
+            .release(ctx, inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
     }
 
     #[test]
@@ -3490,11 +5989,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(
-            native
-                .lease_handle(lease.handle.inode, lease.handle.handle)
-                .is_err()
-        );
+        assert!(native
+            .lease_handle(lease.handle.inode, lease.handle.handle)
+            .is_err());
         let mut writer = ReadWriter {
             gate: None,
             bytes: Vec::new(),
@@ -3922,6 +6419,797 @@ mod tests {
         .unwrap();
         fs.init(FsOptions::empty()).unwrap();
         fs
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_flush_fixture(root: &Path, immutable: bool, writeback: bool) -> OverlayFs {
+        let mut config = parent_cache_fixture(root).snapshot_config.clone();
+        config.lower_mutability = vec![if immutable {
+            pvisor_overlay_core::LayerMutability::Immutable
+        } else {
+            pvisor_overlay_core::LayerMutability::Mutable
+        }];
+        let mut fs = OverlayFs::build_with_writeback(
+            config,
+            Arc::new(InodeAllocator::new()),
+            false,
+            Some(if writeback { "1" } else { "0" }),
+        )
+        .unwrap();
+        fs.profile = pvisor_overlay_core::profile::Profile::enabled("local-flush-test");
+        fs
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shared_qualification_fixture(
+        root: &Path,
+        shared: bool,
+        data: bool,
+        flush: bool,
+    ) -> OverlayFs {
+        let mut fs = negative_entry_fixture(root);
+        fs.shared_open_qualification = shared;
+        fs.profile
+            .add("shared_open_qualification_enabled", u64::from(shared));
+        for label in passthrough::OPEN_QUALIFICATION_COUNTERS {
+            fs.profile.add(label, 0);
+        }
+        fs.configure_lower_data_cache(true, true, false).unwrap();
+        fs.configure_readonly_flush_elision(true, true, false)
+            .unwrap();
+        let caps = if data {
+            FsOptions::PVISOR_DATA_OBJECT
+        } else {
+            FsOptions::empty()
+        } | if flush {
+            FsOptions::PVISOR_LOCAL_FLUSH
+        } else {
+            FsOptions::empty()
+        };
+        let negotiated = fs.init(caps).unwrap();
+        assert_eq!(negotiated.contains(FsOptions::PVISOR_DATA_OBJECT), data);
+        assert_eq!(negotiated.contains(FsOptions::PVISOR_LOCAL_FLUSH), flush);
+        fs
+    }
+
+    #[test]
+    fn shared_open_qualification_setting_is_strict_and_defaults_off() {
+        assert!(!shared_open_qualification_enabled(None).unwrap());
+        assert!(!shared_open_qualification_enabled(Some(OsStr::new("0"))).unwrap());
+        assert!(shared_open_qualification_enabled(Some(OsStr::new("1"))).unwrap());
+        for value in [b"".as_slice(), b"true", b"2", b" 1", b"\xff"] {
+            assert_eq!(
+                shared_open_qualification_enabled(Some(OsStr::from_bytes(value)))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_open_qualification_preserves_ids_fixed_eof_copyup_and_fresh_fd_checks() {
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for shared in [false, true] {
+            let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+            let fs = shared_qualification_fixture(temp.path(), shared, true, true);
+            let inode = fs.lookup(ctx, fuse::ROOT_ID, c"existing").unwrap().inode;
+            let first = fs
+                .open_for_reply(ctx, inode, false, libc::O_RDONLY as u32, true)
+                .unwrap();
+            let second = fs
+                .open_for_reply(ctx, inode, false, libc::O_RDONLY as u32, true)
+                .unwrap();
+            assert!(first.options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+            assert!(second.options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+            let receipt = first.data_object.unwrap();
+            assert_eq!(receipt.size, 5);
+            assert_eq!(second.data_object, Some(receipt));
+            assert_ne!(first.handle, second.handle);
+            let profile = fs.profile.report().unwrap();
+            for (label, legacy, combined) in [
+                ("open_qualification_fgetfl_attempts", 4, 2),
+                ("open_qualification_fstat_attempts", 4, 0),
+                ("open_qualification_statx_attempts", 2, 2),
+                ("open_qualification_fstatfs_attempts", 4, 2),
+                ("open_qualification_shared_attempts", 0, 2),
+                ("open_qualification_receipt_hits", 0, 2),
+            ] {
+                assert_eq!(
+                    profile.measurements[label].units,
+                    if shared { combined } else { legacy }
+                );
+            }
+            assert_eq!(
+                profile.measurements["lower_data_cache_object_registrations"].units,
+                1
+            );
+            assert_eq!(
+                profile.measurements["lower_data_cache_object_reuses"].units,
+                1
+            );
+            // The old receipt API has no saved evidence: a later call must
+            // perform fresh native qualification even when sharing is enabled.
+            assert_eq!(
+                fs.lower_data_object(inode, first.handle.unwrap()),
+                Some(receipt)
+            );
+            let after = fs.profile.report().unwrap();
+            for label in [
+                "open_qualification_fgetfl_attempts",
+                "open_qualification_fstat_attempts",
+                "open_qualification_statx_attempts",
+                "open_qualification_fstatfs_attempts",
+            ] {
+                assert_eq!(
+                    after.measurements[label].units,
+                    profile.measurements[label].units + 1
+                );
+            }
+            let writer = fs
+                .open_for_reply(ctx, inode, false, libc::O_RDWR as u32, false)
+                .unwrap();
+            assert!(writer.data_object.is_none());
+            assert!(!writer.options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+            std::fs::write(temp.path().join("upper/existing"), b"longer upper bytes").unwrap();
+            let upper = fs
+                .open_for_reply(ctx, inode, false, libc::O_RDONLY as u32, true)
+                .unwrap();
+            assert!(upper.data_object.is_none());
+            assert!(!upper.options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+            let mut bytes = ReadWriter {
+                gate: None,
+                bytes: vec![],
+            };
+            fs.read(
+                ctx,
+                inode,
+                first.handle.unwrap(),
+                &mut bytes,
+                64,
+                0,
+                None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(bytes.bytes, b"lower");
+            for opened in [first, second, writer, upper] {
+                let handle = opened.handle.unwrap();
+                fs.release(ctx, inode, 0, handle, false, false, None)
+                    .unwrap();
+                assert!(fs.lower_data_object(inode, handle).is_none());
+            }
+            assert!(fs.handles.lock().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_open_qualification_preserves_feature_independence_and_snapshot_schema() {
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for (data, flush) in [(false, false), (false, true), (true, false), (true, true)] {
+            let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            std::fs::write(temp.path().join("lower/linked"), b"aliased").unwrap();
+            std::fs::hard_link(
+                temp.path().join("lower/linked"),
+                temp.path().join("lower/alias"),
+            )
+            .unwrap();
+            let fs = shared_qualification_fixture(temp.path(), true, data, flush);
+            let inode = fs.lookup(ctx, fuse::ROOT_ID, c"existing").unwrap().inode;
+            let reply = fs
+                .open_for_reply(ctx, inode, false, libc::O_RDONLY as u32, data)
+                .unwrap();
+            assert_eq!(reply.data_object.is_some(), data);
+            assert_eq!(
+                reply.options.contains(OpenOptions::PVISOR_LOCAL_FLUSH),
+                flush
+            );
+            let profile = fs.profile.report().unwrap();
+            assert_eq!(
+                profile.measurements["open_qualification_fgetfl_attempts"].units,
+                u64::from(data || flush)
+            );
+            assert_eq!(
+                profile.measurements["open_qualification_fstat_attempts"].units,
+                u64::from(!data && flush)
+            );
+            assert_eq!(
+                profile.measurements["open_qualification_statx_attempts"].units,
+                u64::from(data)
+            );
+            assert_eq!(
+                profile.measurements["open_qualification_fstatfs_attempts"].units,
+                u64::from(data || flush)
+            );
+            let linked = fs.lookup(ctx, fuse::ROOT_ID, c"linked").unwrap().inode;
+            let linked_reply = fs
+                .open_for_reply(ctx, linked, false, libc::O_RDONLY as u32, data)
+                .unwrap();
+            assert!(linked_reply.data_object.is_none());
+            assert_eq!(
+                linked_reply
+                    .options
+                    .contains(OpenOptions::PVISOR_LOCAL_FLUSH),
+                flush
+            );
+            let mut bytes = ReadWriter {
+                gate: None,
+                bytes: vec![],
+            };
+            fs.read(
+                ctx,
+                linked,
+                linked_reply.handle.unwrap(),
+                &mut bytes,
+                32,
+                0,
+                None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(bytes.bytes, b"aliased");
+            fs.release(
+                ctx,
+                linked,
+                0,
+                linked_reply.handle.unwrap(),
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+            if !data && !flush {
+                let state = fs.capture_state().unwrap();
+                let serialized = serde_json::to_value(&state).unwrap();
+                assert!(!serialized.to_string().contains("qualification"));
+                let mut restored = OverlayFs::open_existing(
+                    fs.snapshot_config.clone(),
+                    Arc::new(InodeAllocator::new()),
+                )
+                .unwrap();
+                restored.shared_open_qualification = false;
+                restored.restore_state(&state).unwrap();
+                assert!(!restored.shared_open_qualification);
+                let restored_reply = restored
+                    .open_for_reply(ctx, inode, false, libc::O_RDONLY as u32, false)
+                    .unwrap();
+                assert!(restored_reply.data_object.is_none());
+                restored
+                    .release(
+                        ctx,
+                        inode,
+                        0,
+                        restored_reply.handle.unwrap(),
+                        false,
+                        false,
+                        None,
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    fs.capture_state().unwrap_err().kind(),
+                    io::ErrorKind::Unsupported
+                );
+            }
+            fs.release(ctx, inode, 0, reply.handle.unwrap(), false, false, None)
+                .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_open_qualification_keeps_core_denials_and_live_mutable_reopens() {
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir_all(lower.join("private")).unwrap();
+        std::fs::write(lower.join("file"), b"before").unwrap();
+        std::fs::write(lower.join("private/key"), b"denied").unwrap();
+        let mut fs = parent_cache_fixture(temp.path());
+        fs.shared_open_qualification = true;
+        fs.configure_lower_data_cache(true, true, false).unwrap();
+        fs.configure_readonly_flush_elision(true, true, false)
+            .unwrap();
+        let negotiated = fs
+            .init(FsOptions::PVISOR_DATA_OBJECT | FsOptions::PVISOR_LOCAL_FLUSH)
+            .unwrap();
+        assert!(
+            !negotiated.intersects(FsOptions::PVISOR_DATA_OBJECT | FsOptions::PVISOR_LOCAL_FLUSH)
+        );
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let denied = fs.allocate_inode(PathBuf::from("private/key"));
+        assert_eq!(
+            fs.open_for_reply(ctx, denied, false, libc::O_RDONLY as u32, true)
+                .err()
+                .expect("Core denial must precede native qualification")
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        for expected in [b"before".as_slice(), b"after external change".as_slice()] {
+            std::fs::write(lower.join("file"), expected).unwrap();
+            let reply = fs
+                .open_for_reply(ctx, inode, false, libc::O_RDONLY as u32, true)
+                .unwrap();
+            assert!(reply.data_object.is_none());
+            assert!(!reply.options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+            let mut bytes = ReadWriter {
+                gate: None,
+                bytes: vec![],
+            };
+            fs.read(
+                ctx,
+                inode,
+                reply.handle.unwrap(),
+                &mut bytes,
+                64,
+                0,
+                None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(bytes.bytes, expected);
+            fs.release(ctx, inode, 0, reply.handle.unwrap(), false, false, None)
+                .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_open_qualification_keeps_second_backend_check_and_no_reusable_evidence() {
+        use pvisor_overlay_core::backend::{BackendAttachment, FileAttr, ReadOnlyBackend};
+        struct UnavailableProjection;
+        impl ReadOnlyBackend for UnavailableProjection {
+            fn prepare_metadata(&self, _: &Path) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+            fn prepare_directory(&self, path: &Path) -> io::Result<()> {
+                self.prepare_metadata(path)
+            }
+            fn attributes(&self, _: &Path) -> io::Result<FileAttr> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+            fn read_at(&self, _: &Path, _: u64, _: u32) -> io::Result<Vec<u8>> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+            fn materialize_file(&self, path: &Path) -> io::Result<()> {
+                self.prepare_metadata(path)
+            }
+            fn materialize_tree(&self, path: &Path) -> io::Result<()> {
+                self.prepare_metadata(path)
+            }
+        }
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let fs = shared_qualification_fixture(temp.path(), true, true, true);
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"existing").unwrap().inode;
+        let opened = fs
+            .open_native_for_reply(ctx, inode, false, libc::O_RDONLY as u32, true)
+            .unwrap();
+        assert!(opened.data_identity.as_ref().unwrap().is_some());
+        let handle = opened.reply.handle.unwrap();
+        let attachment =
+            BackendAttachment::new(&temp.path().join("lower"), Arc::new(UnavailableProjection))
+                .unwrap();
+        assert!(fs
+            .lower_data_object_with_identity(inode, handle, opened.data_identity)
+            .is_none());
+        assert!(fs.lower_data_objects.lock().unwrap().ids.is_empty());
+        let before = fs.profile.report().unwrap();
+        assert_eq!(
+            before.measurements["open_qualification_receipt_hits"].units,
+            0
+        );
+        drop(attachment);
+        assert!(fs.lower_data_object(inode, handle).is_some());
+        let after = fs.profile.report().unwrap();
+        assert_eq!(
+            after.measurements["open_qualification_legacy_data_attempts"].units,
+            1
+        );
+        fs.release(ctx, inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_open_qualification_flows_through_augmentation_without_marking_virtual_files() {
+        use super::super::augment_fs::AugmentFs;
+        use super::super::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let inner = shared_qualification_fixture(temp.path(), true, true, true);
+        let allocator = inner.inode_alloc.clone();
+        let fs = AugmentFs::new(
+            inner,
+            &allocator,
+            vec![VirtualDirEntry {
+                name: CString::new("synthetic").unwrap(),
+                entry: VirtualEntry {
+                    mode: 0o444,
+                    one_shot: false,
+                    content: VirtualEntryContent::File {
+                        data: Arc::from(b"virtual".as_slice()),
+                    },
+                },
+            }],
+        );
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let ordinary = fs.lookup(ctx, fuse::ROOT_ID, c"existing").unwrap().inode;
+        let ordinary_reply = fs
+            .open_for_reply(ctx, ordinary, false, libc::O_RDONLY as u32, true)
+            .unwrap();
+        assert!(ordinary_reply.data_object.is_some());
+        assert!(ordinary_reply
+            .options
+            .contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+        let virtual_inode = fs.lookup(ctx, fuse::ROOT_ID, c"synthetic").unwrap().inode;
+        let virtual_reply = fs
+            .open_for_reply(ctx, virtual_inode, false, libc::O_RDONLY as u32, true)
+            .unwrap();
+        assert!(virtual_reply.data_object.is_none());
+        assert_eq!(virtual_reply.handle, Some(0));
+        assert!(!virtual_reply
+            .options
+            .contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+        let profile = fs
+            .diagnostic_profiles()
+            .into_iter()
+            .find(|p| {
+                p.measurements
+                    .contains_key("open_qualification_shared_attempts")
+            })
+            .unwrap();
+        assert_eq!(
+            profile.measurements["open_qualification_shared_attempts"].units,
+            1
+        );
+        for (inode, reply, expected) in [
+            (ordinary, ordinary_reply, b"lower".as_slice()),
+            (virtual_inode, virtual_reply, b"virtual".as_slice()),
+        ] {
+            let mut bytes = ReadWriter {
+                gate: None,
+                bytes: vec![],
+            };
+            fs.read(
+                ctx,
+                inode,
+                reply.handle.unwrap(),
+                &mut bytes,
+                32,
+                0,
+                None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(bytes.bytes, expected);
+            fs.release(ctx, inode, 0, reply.handle.unwrap(), false, false, None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn lower_data_object_ids_are_bounded_never_recycled_and_layer_specific() {
+        let mut table = LowerDataObjects::default();
+        let first = (1, 2, 3, 4, 5);
+        let (a, fresh) = table.register(first).unwrap();
+        assert!(fresh);
+        assert_eq!(a, LowerDataObject { id: 1, size: 5 });
+        assert_eq!(table.register(first), Some((a, false)));
+        for index in 1..MAX_LOWER_DATA_OBJECTS {
+            let key = (1, 2, index as u64 + 3, 4, 5);
+            assert_eq!(table.register(key).unwrap().0.id, index as u32 + 1);
+        }
+        assert!(table.register((2, 2, 3, 4, 5)).is_none());
+        assert_eq!(table.register(first), Some((a, false))); // hit still works at limit
+        assert_eq!(table.ids.len(), MAX_LOWER_DATA_OBJECTS);
+        let mut layers = LowerDataObjects::default();
+        assert_ne!(
+            layers.register(first).unwrap().0.id,
+            layers.register((2, 2, 3, 4, 5)).unwrap().0.id
+        );
+        assert_ne!(
+            layers.register(first).unwrap().0.id,
+            layers.register((1, 2, 3, 4, 6)).unwrap().0.id
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lower_data_objects_preserve_open_checks_fixed_eof_and_old_lower_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir_all(lower.join("private")).unwrap();
+        std::fs::write(lower.join("file"), b"lower").unwrap();
+        std::fs::write(lower.join("private/key"), b"denied").unwrap();
+        std::fs::write(lower.join("linked"), b"linked").unwrap();
+        std::fs::hard_link(lower.join("linked"), lower.join("alias")).unwrap();
+        let mut fs = local_flush_fixture(temp.path(), true, false);
+        fs.configure_lower_data_cache(true, true, false).unwrap();
+        assert!(fs
+            .init(FsOptions::PVISOR_DATA_OBJECT)
+            .unwrap()
+            .contains(FsOptions::PVISOR_DATA_OBJECT));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let inode = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap().inode;
+        let (h1, opts) = fs.open(ctx, inode, false, libc::O_RDONLY as u32).unwrap();
+        assert!(opts.contains(OpenOptions::PVISOR_DATA_OBJECT));
+        let h1 = h1.unwrap();
+        let receipt = fs.lower_data_object(inode, h1);
+        if let Some(receipt) = receipt {
+            assert_ne!(receipt.id, 0);
+            assert_eq!(receipt.size, 5);
+        }
+        assert!(fs.lower_data_object(inode + 100, h1).is_none());
+        let (h2, _) = fs.open(ctx, inode, false, libc::O_RDONLY as u32).unwrap();
+        let h2 = h2.unwrap();
+        assert_eq!(fs.lower_data_object(inode, h2), receipt);
+        fs.release(ctx, inode, 0, h2, false, false, None).unwrap();
+        let (writer, opts) = fs.open(ctx, inode, false, libc::O_RDWR as u32).unwrap();
+        assert!(!opts.contains(OpenOptions::PVISOR_DATA_OBJECT));
+        assert!(fs.lower_data_object(inode, writer.unwrap()).is_none());
+        std::fs::write(temp.path().join("upper/file"), b"upper grew substantially").unwrap();
+        assert_eq!(fs.lower_data_object(inode, h1), receipt); // fixed lower EOF
+        let mut bytes = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        fs.read(ctx, inode, h1, &mut bytes, 64, 0, None, 0).unwrap();
+        assert_eq!(bytes.bytes, b"lower");
+        let (upper, opts) = fs.open(ctx, inode, false, libc::O_RDONLY as u32).unwrap();
+        assert!(!opts.contains(OpenOptions::PVISOR_DATA_OBJECT));
+        assert!(fs.lower_data_object(inode, upper.unwrap()).is_none());
+        // This fixture denies private/**. Core conservatively rejects every
+        // multi-link regular file when any denial exists, before native OPEN.
+        // The native descriptor test independently covers nlink qualification.
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"linked")
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let denied = fs.allocate_inode(PathBuf::from("private/key"));
+        assert!(fs.open(ctx, denied, false, libc::O_RDONLY as u32).is_err());
+        for (node, handle) in [
+            (inode, h1),
+            (inode, writer.unwrap()),
+            (inode, upper.unwrap()),
+        ] {
+            fs.release(ctx, node, 0, handle, false, false, None)
+                .unwrap();
+        }
+        assert!(fs.handles.lock().unwrap().is_empty());
+        if receipt.is_some() {
+            assert_eq!(fs.lower_data_objects.lock().unwrap().ids.len(), 1);
+        }
+        assert_eq!(std::fs::read(lower.join("file")).unwrap(), b"lower");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lower_data_configuration_fallback_snapshot_and_destroy_lifetime() {
+        for (requested, guest_cache, dax, immutable, wb, guest, expected) in [
+            (false, true, false, true, false, true, false),
+            (true, false, false, true, false, true, false),
+            (true, true, true, true, false, true, false),
+            (true, true, false, false, false, true, false),
+            (true, true, false, true, true, true, false),
+            (true, true, false, true, false, false, false),
+            (true, true, false, true, false, true, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            let mut fs = local_flush_fixture(temp.path(), immutable, wb);
+            fs.configure_lower_data_cache(requested, guest_cache, dax)
+                .unwrap();
+            assert_eq!(
+                fs.configure_lower_data_cache(requested, guest_cache, dax)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            let old_state = fs.capture_state().unwrap();
+            let caps = FsOptions::WRITEBACK_CACHE
+                | if guest {
+                    FsOptions::PVISOR_DATA_OBJECT
+                } else {
+                    FsOptions::empty()
+                };
+            assert_eq!(
+                fs.init(caps)
+                    .unwrap()
+                    .contains(FsOptions::PVISOR_DATA_OBJECT),
+                expected
+            );
+            assert_eq!(
+                fs.profile.report().unwrap().measurements["lower_data_cache_enabled"].units,
+                u64::from(expected)
+            );
+            if expected {
+                assert_eq!(
+                    fs.capture_state().unwrap_err().kind(),
+                    io::ErrorKind::Unsupported
+                );
+                assert_eq!(
+                    fs.restore_state(&old_state).unwrap_err().kind(),
+                    io::ErrorKind::Unsupported
+                );
+                fs.lower_data_objects
+                    .lock()
+                    .unwrap()
+                    .register((1, 2, 3, 4, 5))
+                    .unwrap();
+            } else {
+                fs.capture_state().unwrap();
+            }
+            fs.destroy();
+            assert!(!fs.lower_data_cache_active.load(Ordering::Relaxed));
+            if expected {
+                assert_eq!(fs.lower_data_objects.lock().unwrap().ids.len(), 1);
+            }
+            fs.init(FsOptions::empty()).unwrap();
+            if expected {
+                assert_eq!(
+                    fs.capture_state().unwrap_err().kind(),
+                    io::ErrorKind::Unsupported
+                );
+            } else {
+                fs.capture_state().unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_flush_negotiation_requires_explicit_compatible_configuration() {
+        for (requested, guest_cache, dax, immutable, complete, writeback, guest, expected) in [
+            (false, true, false, true, true, false, true, false),
+            (true, false, false, true, true, false, true, false),
+            (true, true, true, true, true, false, true, false),
+            (true, true, false, false, true, false, true, false),
+            (true, true, false, true, false, false, true, false),
+            (true, true, false, true, true, true, true, false),
+            (true, true, false, true, true, false, false, false),
+            (true, true, false, true, true, false, true, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            let mut fs = local_flush_fixture(temp.path(), immutable, writeback);
+            if !complete {
+                fs.snapshot_config.semantics = passthrough::PermissionSemantics::LinuxSimplified;
+            }
+            fs.configure_readonly_flush_elision(requested, guest_cache, dax)
+                .unwrap();
+            assert_eq!(
+                fs.configure_readonly_flush_elision(requested, guest_cache, dax)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            let capable = FsOptions::WRITEBACK_CACHE
+                | if guest {
+                    FsOptions::PVISOR_LOCAL_FLUSH
+                } else {
+                    FsOptions::empty()
+                };
+            let options = fs.init(capable).unwrap();
+            assert_eq!(options.contains(FsOptions::PVISOR_LOCAL_FLUSH), expected);
+            let profile = fs.profile.report().unwrap();
+            assert_eq!(
+                profile.measurements["readonly_flush_elision_requested"].units,
+                u64::from(requested)
+            );
+            assert_eq!(
+                profile.measurements["readonly_flush_elision_enabled"].units,
+                u64::from(expected)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_flush_open_flags_preserve_native_binding_and_exclude_upper_writes_and_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir_all(lower.join("private")).unwrap();
+        std::fs::write(lower.join("file"), b"lower").unwrap();
+        std::fs::write(lower.join("private/key"), b"denied").unwrap();
+        let mut fs = local_flush_fixture(temp.path(), true, false);
+        std::fs::write(temp.path().join("upper/upper"), b"upper").unwrap();
+        fs.configure_readonly_flush_elision(true, true, false)
+            .unwrap();
+        fs.init(FsOptions::PVISOR_LOCAL_FLUSH).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        let (handle, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        let handle = handle.unwrap();
+        let native = fs.handles.lock().unwrap().get(&handle).cloned().unwrap();
+        let Handle::File(native) = native else {
+            panic!("expected native file")
+        };
+        let qualified =
+            fs.layers[native.layer.0].readonly_local_flush_eligible(native.inode, native.handle);
+        assert_eq!(options.contains(OpenOptions::PVISOR_LOCAL_FLUSH), qualified);
+        assert_eq!(native.layer.0, 1);
+        assert!(!options.contains(OpenOptions::KEEP_CACHE)); // workspace data policy is unchanged
+        let (writable, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDWR as u32)
+            .unwrap();
+        assert!(!options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+        let (upper, options) = fs
+            .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(!options.contains(OpenOptions::PVISOR_LOCAL_FLUSH));
+        let denied = fs.allocate_inode(PathBuf::from("private/key"));
+        assert!(fs.open(ctx, denied, false, libc::O_RDONLY as u32).is_err());
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"private").is_err());
+        for handle in [Some(handle), writable, upper].into_iter().flatten() {
+            fs.release(ctx, entry.inode, 0, handle, false, false, None)
+                .unwrap();
+        }
+        assert_eq!(std::fs::read(lower.join("file")).unwrap(), b"lower");
+        assert!(fs.handles.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_flush_snapshot_boundary_and_destroy_reset_keep_old_sessions_compatible() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        let mut fs = local_flush_fixture(temp.path(), true, false);
+        fs.configure_readonly_flush_elision(true, true, false)
+            .unwrap();
+        fs.init(FsOptions::empty()).unwrap(); // old firmware never negotiates
+        fs.capture_state().unwrap();
+        fs.init(FsOptions::PVISOR_LOCAL_FLUSH).unwrap();
+        assert_eq!(
+            fs.capture_state().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        fs.destroy();
+        assert!(!fs.readonly_flush_elision_active.load(Ordering::Relaxed));
+        fs.init(FsOptions::empty()).unwrap();
+        fs.capture_state().unwrap();
+        fs.destroy();
+        fs.init(FsOptions::PVISOR_LOCAL_FLUSH).unwrap();
+        assert!(fs.readonly_flush_elision_active.load(Ordering::Relaxed));
+        assert_eq!(
+            fs.profile.report().unwrap().measurements["readonly_flush_elision_enabled"].units,
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4530,6 +7818,102 @@ mod tests {
     }
 
     #[test]
+    fn larger_directory_capacity_retains_a_reused_working_set_without_caching_attributes() {
+        // The same 288-parent demand exceeds the default but fits the candidate.
+        // Check actual native-lookup reuse and fresh attributes, rather than just
+        // asserting the configured field or the cache container's length.
+        for capacity in [256, 1024] {
+            let temp = tempfile::tempdir().unwrap();
+            let lower = temp.path().join("lower");
+            let working_set = 288;
+            for index in 0..working_set {
+                let directory = lower.join(format!("d{index}"));
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("file"), b"data").unwrap();
+            }
+            let mut fs = parent_cache_fixture(temp.path());
+            fs.profile = pvisor_overlay_core::profile::Profile::enabled("directory-capacity");
+            fs.configure_directory_cache_capacity(capacity).unwrap();
+            let ctx = Context {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+            };
+            let visit = |fs: &OverlayFs| {
+                for index in 0..working_set {
+                    let path = PathBuf::from(format!("d{index}/file"));
+                    let inode = fs.allocate_inode(path.clone());
+                    assert_eq!(fs.entry(ctx, &path, inode).unwrap().attr.st_size, 4);
+                }
+            };
+            visit(&fs);
+            let before = fs.profile.report().unwrap();
+            visit(&fs);
+            let after = fs.profile.report().unwrap();
+            let units = |report: &pvisor_overlay_core::profile::ProfileReport, label: &str| {
+                report
+                    .measurements
+                    .get(label)
+                    .map_or(0, |value| value.units)
+            };
+            let repeated_misses =
+                units(&after, "directory_cache_misses") - units(&before, "directory_cache_misses");
+            let repeated_evictions = units(&after, "directory_cache_evictions")
+                - units(&before, "directory_cache_evictions");
+            if capacity == 256 {
+                assert!(repeated_misses > 0);
+                assert!(repeated_evictions > 0);
+            } else {
+                assert_eq!(repeated_misses, 0);
+                assert_eq!(repeated_evictions, 0);
+            }
+            assert_eq!(units(&after, "directory_cache_capacity"), capacity as u64);
+            std::fs::write(lower.join("d287/file"), b"updated contents").unwrap();
+            let path = Path::new("d287/file");
+            let inode = fs.allocate_inode(path.to_path_buf());
+            assert_eq!(fs.entry(ctx, path, inode).unwrap().attr.st_size, 16);
+        }
+    }
+
+    #[test]
+    fn directory_capacity_configuration_is_once_per_owner_and_not_snapshot_state() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("lower")).unwrap();
+        let mut fs = parent_cache_fixture(temp.path());
+        assert_eq!(
+            fs.directory_cache_capacity,
+            DEFAULT_DIRECTORY_CACHE_CAPACITY
+        );
+        for invalid in [0, MAX_DIRECTORY_CACHE_CAPACITY + 1] {
+            assert_eq!(
+                fs.configure_directory_cache_capacity(invalid)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        fs.configure_directory_cache_capacity(1024).unwrap();
+        assert_eq!(
+            fs.configure_directory_cache_capacity(256)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let snapshot = fs.capture_state().unwrap();
+        let mut restored =
+            OverlayFs::open_existing(fs.snapshot_config.clone(), Arc::new(InodeAllocator::new()))
+                .unwrap();
+        assert_eq!(
+            restored.directory_cache_capacity,
+            DEFAULT_DIRECTORY_CACHE_CAPACITY
+        );
+        restored.configure_directory_cache_capacity(1).unwrap();
+        restored.init(FsOptions::empty()).unwrap();
+        restored.restore_state(&snapshot).unwrap();
+        assert_eq!(restored.directory_cache_capacity, 1);
+    }
+
+    #[test]
     fn cached_parents_are_bounded_and_released_before_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let lower = temp.path().join("lower");
@@ -4540,7 +7924,7 @@ mod tests {
             gid: 0,
             pid: 1,
         };
-        for i in 0..DIRECTORY_CACHE_CAPACITY + 4 {
+        for i in 0..DEFAULT_DIRECTORY_CACHE_CAPACITY + 4 {
             let name = format!("d{i}");
             std::fs::create_dir(lower.join(&name)).unwrap();
             std::fs::write(lower.join(&name).join("file"), b"data").unwrap();
@@ -4548,7 +7932,9 @@ mod tests {
                 .lookup(ctx, fuse::ROOT_ID, &CString::new(name).unwrap())
                 .unwrap();
             fs.lookup(ctx, parent.inode, c"file").unwrap();
-            assert!(fs.directory_cache.lock().unwrap().entries.len() <= DIRECTORY_CACHE_CAPACITY);
+            assert!(
+                fs.directory_cache.lock().unwrap().entries.len() <= fs.directory_cache_capacity
+            );
         }
         let snapshot = fs.capture_state().unwrap();
         assert!(fs.directory_cache.lock().unwrap().entries.is_empty());
@@ -4581,10 +7967,9 @@ mod tests {
         };
         let entry = fs.lookup(ctx, fuse::ROOT_ID, c"dir").unwrap();
         for _ in 0..16 {
-            assert!(
-                fs.open(ctx, entry.inode, false, libc::O_WRONLY as u32)
-                    .is_err()
-            );
+            assert!(fs
+                .open(ctx, entry.inode, false, libc::O_WRONLY as u32)
+                .is_err());
         }
         assert!(fs.handles.lock().unwrap().is_empty());
         let super::super::snapshot::FsSnapshot::Overlay(snapshot) = fs.capture_state().unwrap()
@@ -4596,12 +7981,10 @@ mod tests {
                 panic!("expected a native layer");
             };
             assert!(native.handles.is_empty());
-            assert!(
-                native
-                    .inodes
-                    .iter()
-                    .all(|inode| inode.inode == fuse::ROOT_ID)
-            );
+            assert!(native
+                .inodes
+                .iter()
+                .all(|inode| inode.inode == fuse::ROOT_ID));
         }
     }
 
@@ -4625,6 +8008,8 @@ mod tests {
             hard_link_origins: vec![],
             layers: vec![],
             nodes: vec![(1, b"/".to_vec())],
+            lookup_refs: None,
+            legacy_lookup_refs: vec![],
             handles: vec![(
                 1,
                 Handle::File(Arc::new(FileHandle {
@@ -4706,23 +8091,403 @@ mod tests {
             gid: 0,
             pid: 1,
         };
-        assert!(
-            fs.lookup(ctx, fuse::ROOT_ID, &CString::new("private.key").unwrap())
-                .is_err()
-        );
+        assert!(fs
+            .lookup(ctx, fuse::ROOT_ID, &CString::new("private.key").unwrap())
+            .is_err());
         let alias = fs
             .lookup(ctx, fuse::ROOT_ID, &CString::new("alias").unwrap())
             .unwrap();
-        assert!(
-            fs.open(ctx, alias.inode, false, libc::O_RDONLY as u32)
-                .is_err()
-        );
+        assert!(fs
+            .open(ctx, alias.inode, false, libc::O_RDONLY as u32)
+            .is_err());
         let env = fs
             .lookup(ctx, fuse::ROOT_ID, &CString::new(".env").unwrap())
             .unwrap();
+        assert!(fs
+            .open(ctx, env.inode, false, libc::O_RDONLY as u32)
+            .is_ok());
+    }
+
+    fn exclusive_upper_config(root: &Path) -> Config {
+        let fixture = parent_cache_fixture(root);
+        let mut config = fixture.snapshot_config.clone();
+        config.lower_mutability = vec![pvisor_overlay_core::LayerMutability::Immutable];
+        config.excluded_paths.clear();
+        config.access_policy = Default::default();
+        config
+    }
+
+    fn exclusive_upper_owner(config: Config, preference: Option<(bool, bool)>) -> OverlayFs {
+        let mut fs = OverlayFs::build_with_writeback(
+            config,
+            Arc::new(InodeAllocator::new()),
+            false,
+            Some("0"),
+        )
+        .unwrap();
+        fs.core = fs
+            .core
+            .with_profile(pvisor_overlay_core::profile::Profile::enabled(
+                "upper-epoch",
+            ));
+        if let Some((requested, guest_cache)) = preference {
+            fs.configure_exclusive_upper_absence_cache(requested, guest_cache)
+                .unwrap();
+        }
+        fs.init(FsOptions::empty()).unwrap();
+        fs
+    }
+
+    fn upper_absence_units(fs: &OverlayFs, label: &str) -> u64 {
+        fs.core
+            .profile_report()
+            .unwrap()
+            .measurements
+            .get(label)
+            .map_or(0, |measurement| measurement.units)
+    }
+
+    #[test]
+    fn exclusive_upper_absence_requires_vm_ownership_and_complete_permissions() {
+        use pvisor_overlay_core::LayerMutability::{Immutable, Mutable};
+        for (mutability, semantics, preference, expected) in [
+            (
+                vec![Immutable],
+                passthrough::PermissionSemantics::LinuxComplete,
+                None,
+                false,
+            ),
+            (
+                vec![Immutable],
+                passthrough::PermissionSemantics::LinuxComplete,
+                Some((false, true)),
+                false,
+            ),
+            (
+                vec![Immutable],
+                passthrough::PermissionSemantics::LinuxComplete,
+                Some((true, false)),
+                false,
+            ),
+            (
+                vec![],
+                passthrough::PermissionSemantics::LinuxComplete,
+                Some((true, true)),
+                false,
+            ),
+            (
+                vec![Mutable],
+                passthrough::PermissionSemantics::LinuxComplete,
+                Some((true, true)),
+                false,
+            ),
+            (
+                vec![Mutable, Immutable],
+                passthrough::PermissionSemantics::LinuxComplete,
+                Some((true, true)),
+                false,
+            ),
+            (
+                vec![Immutable],
+                passthrough::PermissionSemantics::LinuxSimplified,
+                Some((true, true)),
+                false,
+            ),
+            (
+                vec![Immutable],
+                passthrough::PermissionSemantics::LinuxComplete,
+                Some((true, true)),
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("lower")).unwrap();
+            std::fs::write(temp.path().join("lower/file"), b"lower").unwrap();
+            let mut config = exclusive_upper_config(temp.path());
+            if mutability.len() == 2 {
+                let other = temp.path().join("other");
+                std::fs::create_dir(&other).unwrap();
+                config
+                    .lower_dirs
+                    .insert(0, other.to_string_lossy().into_owned());
+            }
+            config.lower_mutability = mutability;
+            config.semantics = semantics;
+            let fs = exclusive_upper_owner(config, preference);
+            assert_eq!(fs.core.exclusive_upper_absence_cache_enabled(), expected);
+            let ctx = Context {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+            };
+            let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+            assert_eq!(entry.attr.st_size, 5);
+            assert_eq!(entry.entry_timeout, TTL);
+            if semantics == passthrough::PermissionSemantics::LinuxComplete {
+                assert_eq!(entry.attr_timeout, TTL);
+            }
+        }
+    }
+
+    #[test]
+    fn exclusive_upper_write_epoch_bypasses_cache_and_clears_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("lower/directory")).unwrap();
+        std::fs::write(temp.path().join("lower/directory/file"), b"lower").unwrap();
+        let fs = exclusive_upper_owner(exclusive_upper_config(temp.path()), Some((true, true)));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let directory = fs.lookup(ctx, fuse::ROOT_ID, c"directory").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                fs.lookup(ctx, directory.inode, c"file")
+                    .unwrap()
+                    .attr
+                    .st_size,
+                5
+            );
+        }
+        let hits = upper_absence_units(&fs, "exclusive_upper_absence_cache_hits");
+        assert!(hits > 0);
         assert!(
-            fs.open(ctx, env.inode, false, libc::O_RDONLY as u32)
-                .is_ok()
+            upper_absence_units(&fs, "exclusive_upper_absence_cache_hits_unavailable_parent") > 0
+        );
+        let failed = (|| -> io::Result<()> {
+            let _operation = fs.write_operation()?;
+            for _ in 0..2 {
+                assert_eq!(fs.core.metadata(Path::new("directory/file"))?.len(), 5);
+            }
+            assert_eq!(
+                upper_absence_units(&fs, "exclusive_upper_absence_cache_hits"),
+                hits
+            );
+            // Model a native upper publication followed by an operation error.
+            // Its earlier missing result must not survive either side of Drop.
+            std::fs::create_dir(temp.path().join("upper/directory"))?;
+            std::fs::write(temp.path().join("upper/directory/file"), b"new upper")?;
+            assert_eq!(fs.core.metadata(Path::new("directory/file"))?.len(), 9);
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })();
+        assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::EIO));
+        let entry = fs.lookup(ctx, directory.inode, c"file").unwrap();
+        assert_eq!(entry.attr.st_size, 9);
+        assert_eq!(entry.attr_timeout, TTL);
+        assert_eq!(entry.entry_timeout, TTL);
+    }
+
+    #[test]
+    fn exclusive_upper_absence_keeps_policy_and_hardlink_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir_all(lower.join("private")).unwrap();
+        std::fs::write(lower.join("file"), b"allowed").unwrap();
+        std::fs::write(lower.join("private/key"), b"secret").unwrap();
+        std::fs::write(lower.join("linked"), b"shared").unwrap();
+        std::fs::hard_link(lower.join("linked"), lower.join("alias")).unwrap();
+        let mut config = exclusive_upper_config(temp.path());
+        config.access_policy = pvisor_overlay_core::FileAccessPolicy::new(
+            vec!["private".into(), "private/**".into()],
+            vec![],
+        )
+        .unwrap();
+        let fs = exclusive_upper_owner(config, Some((true, true)));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for _ in 0..2 {
+            let allowed = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+            assert_eq!((allowed.attr.st_size, allowed.attr_timeout), (7, TTL));
+            for name in [c"private", c"linked", c"alias"] {
+                assert_eq!(
+                    fs.lookup(ctx, fuse::ROOT_ID, name)
+                        .err()
+                        .expect("policy must deny this name")
+                        .raw_os_error(),
+                    Some(libc::EACCES)
+                );
+            }
+            let denied = fs.allocate_inode(PathBuf::from("private/key"));
+            assert!(fs.getattr(ctx, denied, None).is_err());
+            assert!(fs.open(ctx, denied, false, libc::O_RDONLY as u32).is_err());
+        }
+        assert!(upper_absence_units(&fs, "exclusive_upper_absence_cache_hits") > 0);
+    }
+
+    #[test]
+    fn exclusive_upper_absence_preserves_copyup_native_creation_and_alias_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::write(lower.join("file"), b"lower").unwrap();
+        let fs = exclusive_upper_owner(exclusive_upper_config(temp.path()), Some((true, true)));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let file = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert_eq!(fs.getattr(ctx, file.inode, None).unwrap().0.st_size, 5);
+        let old = fs
+            .open(ctx, file.inode, false, libc::O_RDONLY as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        let writable = fs
+            .open(ctx, file.inode, false, libc::O_RDWR as u32)
+            .unwrap()
+            .0
+            .unwrap();
+        fs.write(
+            ctx,
+            file.inode,
+            writable,
+            WriteReader(io::Cursor::new(b"changed upper".to_vec())),
+            13,
+            0,
+            None,
+            false,
+            false,
+            libc::O_RDWR as u32,
+        )
+        .unwrap();
+        assert_eq!(fs.getattr(ctx, file.inode, None).unwrap().0.st_size, 13);
+        let mut output = ReadWriter {
+            gate: None,
+            bytes: Vec::new(),
+        };
+        fs.read(ctx, file.inode, old, &mut output, 64, 0, None, 0)
+            .unwrap();
+        assert_eq!(output.bytes, b"lower");
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"newdir").is_err());
+        let directory = fs
+            .mkdir(
+                ctx,
+                fuse::ROOT_ID,
+                c"newdir",
+                0o755,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"newdir").unwrap().inode,
+            directory.inode
+        );
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"newlink").is_err());
+        let link = fs
+            .symlink(
+                ctx,
+                c"file",
+                fuse::ROOT_ID,
+                c"newlink",
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(fs.readlink(ctx, link.inode).unwrap(), b"file");
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"newlink").unwrap().inode,
+            link.inode
+        );
+        assert!(fs
+            .symlink(
+                ctx,
+                c"file",
+                fuse::ROOT_ID,
+                c"newlink",
+                Extensions::default()
+            )
+            .is_err());
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"newlink").unwrap().inode,
+            link.inode
+        );
+        let alias = fs.link(ctx, file.inode, fuse::ROOT_ID, c"alias").unwrap();
+        assert_eq!(alias.attr.st_nlink, 2);
+        assert_eq!(fs.getattr(ctx, file.inode, None).unwrap().0.st_nlink, 2);
+        fs.rename(ctx, fuse::ROOT_ID, c"alias", fuse::ROOT_ID, c"renamed", 0)
+            .unwrap();
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"alias").is_err());
+        assert_eq!(
+            fs.lookup(ctx, fuse::ROOT_ID, c"renamed")
+                .unwrap()
+                .attr
+                .st_nlink,
+            2
+        );
+        fs.unlink(ctx, fuse::ROOT_ID, c"renamed").unwrap();
+        assert!(fs.lookup(ctx, fuse::ROOT_ID, c"renamed").is_err());
+        assert_eq!(fs.getattr(ctx, file.inode, None).unwrap().0.st_nlink, 1);
+        for handle in [old, writable] {
+            fs.release(ctx, file.inode, 0, handle, false, false, None)
+                .unwrap();
+        }
+        assert_eq!(std::fs::read(lower.join("file")).unwrap(), b"lower");
+    }
+
+    #[test]
+    fn exclusive_upper_epoch_clears_at_capture_restore_and_teardown_without_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("lower")).unwrap();
+        std::fs::write(temp.path().join("lower/file"), b"lower").unwrap();
+        let config = exclusive_upper_config(temp.path());
+        let fs = exclusive_upper_owner(config.clone(), Some((true, true)));
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let file = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        let hits = upper_absence_units(&fs, "exclusive_upper_absence_cache_hits");
+        assert!(hits > 0);
+        let saved = fs.capture_state().unwrap();
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("exclusive_upper_absence_cache"));
+        fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert_eq!(
+            upper_absence_units(&fs, "exclusive_upper_absence_cache_hits"),
+            hits
+        );
+        fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert!(upper_absence_units(&fs, "exclusive_upper_absence_cache_hits") > hits);
+        for enabled in [false, true] {
+            let mut restored = OverlayFs::build_with_writeback(
+                config.clone(),
+                Arc::new(InodeAllocator::new()),
+                true,
+                Some("0"),
+            )
+            .unwrap();
+            restored
+                .configure_exclusive_upper_absence_cache(enabled, true)
+                .unwrap();
+            restored.restore_state(&saved).unwrap();
+            assert_eq!(
+                restored.core.exclusive_upper_absence_cache_enabled(),
+                enabled
+            );
+            assert_eq!(
+                restored.getattr(ctx, file.inode, None).unwrap().0.st_size,
+                5
+            );
+            assert_eq!(restored.getattr(ctx, file.inode, None).unwrap().1, TTL);
+        }
+        let invalidations = upper_absence_units(&fs, "exclusive_upper_absence_cache_invalidations");
+        fs.destroy();
+        assert!(
+            upper_absence_units(&fs, "exclusive_upper_absence_cache_invalidations") > invalidations
+        );
+        fs.init(FsOptions::empty()).unwrap();
+        let hits = upper_absence_units(&fs, "exclusive_upper_absence_cache_hits");
+        fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert_eq!(
+            upper_absence_units(&fs, "exclusive_upper_absence_cache_hits"),
+            hits
         );
     }
 
@@ -5272,8 +9037,8 @@ mod tests {
         assert_eq!(entry.attr.st_gid, 2345);
         assert_eq!(entry.attr.st_mode as u32 & 0o7777, 0o755);
         fs.access(ctx, entry.inode, libc::X_OK as u32).unwrap();
-        assert!(
-            fs.access(
+        assert!(fs
+            .access(
                 Context {
                     uid: 3456,
                     gid: 3456,
@@ -5282,8 +9047,7 @@ mod tests {
                 entry.inode,
                 libc::W_OK as u32
             )
-            .is_err()
-        );
+            .is_err());
         let handle = fs
             .open(ctx, entry.inode, false, libc::O_RDONLY as u32)
             .unwrap()

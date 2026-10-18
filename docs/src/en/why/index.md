@@ -20,6 +20,8 @@ To let go, every execution needs three things at once:
 
 pVisor is the execution layer that gives every execution these three properties.
 
+Scaling also calls for controlling environment preparation, tool execution, model waiting, and repeated work after failures. [Agent task lifecycle cost](agent-lifecycle-cost.md) connects these costs to pVisor's execution paths, choice of isolation mechanisms, and the core insight and engineering challenge of letting the host take over I/O while the guest is offloaded during waits.
+
 ## Responsibilities of the execution layer
 
 pVisor is the **semantic layer for each execution**: it defines boundaries, installs controls, and leaves evidence.

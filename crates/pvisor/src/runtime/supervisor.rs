@@ -121,6 +121,8 @@ pub struct RuntimeSupervisorBuilder {
     gateway_enabled: bool,
     #[cfg(feature = "gateway")]
     model_wait: Option<Arc<dyn pvisor_gateway::model_wait::ModelWaitLifecycle>>,
+    #[cfg(feature = "gateway")]
+    native_model_wait: Option<crate::NativeModelWait>,
     storage: Option<PathBuf>,
     #[cfg(feature = "gateway")]
     #[cfg(feature = "gateway")]
@@ -193,6 +195,12 @@ impl pvisor_gateway::sink::CaptureEventObserver for SharedJournalObserver {
 }
 
 impl RuntimeSupervisorBuilder {
+    pub(crate) fn workspace_target(mut self, target: &std::path::Path) -> Self {
+        if self.overlay.lower_dirs.is_empty() {
+            self.overlay.lower_dirs.push(target.to_owned());
+        }
+        self
+    }
     #[cfg(feature = "gateway")]
     pub(crate) fn live_events(mut self, sink: Arc<super::event::NoopEventSink>) -> Self {
         self.sink = Some(Arc::new(LiveEventObserver {
@@ -220,6 +228,7 @@ impl RuntimeSupervisorBuilder {
         self.gateway_output_dir = Some(gateway.output_dir);
         self.gateway_enabled = gateway.gateway_enabled;
         self.model_wait = gateway.model_wait;
+        self.native_model_wait = gateway.native_model_wait;
         self
     }
 
@@ -259,6 +268,8 @@ impl RuntimeSupervisorBuilder {
             gateway_enabled: self.gateway_enabled,
             #[cfg(feature = "gateway")]
             model_wait: self.model_wait,
+            #[cfg(feature = "gateway")]
+            native_model_wait: self.native_model_wait,
             storage: self.storage,
             #[cfg(feature = "gateway")]
             #[cfg(feature = "gateway")]
@@ -283,6 +294,8 @@ pub struct RuntimeSupervisor {
     gateway_enabled: bool,
     #[cfg(feature = "gateway")]
     model_wait: Option<Arc<dyn pvisor_gateway::model_wait::ModelWaitLifecycle>>,
+    #[cfg(feature = "gateway")]
+    native_model_wait: Option<crate::NativeModelWait>,
     storage: Option<PathBuf>,
     #[cfg(feature = "gateway")]
     #[cfg(feature = "gateway")]
@@ -299,6 +312,46 @@ impl Default for RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
+    #[cfg(feature = "gateway")]
+    pub(crate) fn bind_model_wait(
+        &self,
+        controls: crate::RunControlHandle,
+    ) -> anyhow::Result<Self> {
+        let mut bound = self.clone();
+        if let Some(mode) = self.native_model_wait {
+            anyhow::ensure!(
+                cfg!(all(target_os = "linux", target_arch = "x86_64")),
+                "native model waits require Linux x86_64"
+            );
+            anyhow::ensure!(
+                self.proxy.is_some() && self.gateway_enabled,
+                "native model waits require an enabled Gateway"
+            );
+            anyhow::ensure!(
+                self.model_wait.is_none(),
+                "native model waits conflict with a custom model-wait lifecycle"
+            );
+            anyhow::ensure!(
+                controls.status().attempt.executor.kind
+                    == pvisor_core::ExecutorKind::VirtualMachine,
+                "native model waits require a VM executor"
+            );
+            bound.model_wait = Some(Arc::new(super::run::model_wait::NativeLifecycle::new(
+                controls, mode,
+            )));
+        }
+        Ok(bound)
+    }
+
+    pub(crate) fn storage_path(&self) -> Option<&std::path::Path> {
+        self.storage.as_deref()
+    }
+    pub(crate) fn write_paths(&self) -> Vec<&std::path::Path> {
+        let paths = self.storage.iter().map(PathBuf::as_path);
+        #[cfg(feature = "gateway")]
+        let paths = paths.chain(self.gateway_output_dir.iter().map(PathBuf::as_path));
+        paths.collect()
+    }
     pub(crate) fn overlay_hint(&self) -> &OverlayHint {
         &self.overlay
     }

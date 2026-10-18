@@ -5,6 +5,7 @@ mod device;
 #[allow(dead_code)]
 mod filesystem;
 pub mod fuse;
+mod guest_index;
 mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
@@ -15,6 +16,7 @@ mod server;
 pub mod snapshot;
 pub mod virtual_entry;
 mod worker;
+mod write_buffer;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

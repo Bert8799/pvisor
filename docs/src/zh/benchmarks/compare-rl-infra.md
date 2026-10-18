@@ -62,8 +62,8 @@ Lazy 冷客户端 Ready 排除镜像服务首次准备；镜像已缓存时，Do
 
 训练吞吐、有效样本成功率、reward、重试和端到端资源成本仍未测。OpenHands、SWE-Gym 与 verl 集成需要独立验收，适配器前缀保真不足以证明集成成立。
 
-### 数据下载与复现 {#run}
+### 来源与复现 {#run}
 
-[场景证据 CSV](compare-rl-infra.csv)保留主题、来源、批次、统计量、样本数、数值与限制。来源摘要：[密度](density-summary.csv)、[修复/CLI](agent-tasks.csv)、[启动](startup.csv)、[回放](replay-fidelity.csv)、[lazy 启动/内容](lazy-startup-summary.csv)、[隔离](isolation-tests.csv)、[VM 内存](vm-memory/memory-choices.csv)。制品摘要与完整控制条件保留在所属主题的 provenance 下载中；原始证据保留在本地 `.data/`。
+各主题的完整 CSV/JSON、制品摘要、控制条件与原始记录保存在对应本地批次或文档数据归档，保留来源与统计口径。
 
 [比较方法](methodology.md) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

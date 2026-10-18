@@ -60,7 +60,7 @@ export SEMSPEC_BIN="$PWD/target/semspec/debug/semspec"
 batch=$(python3 benchmark.new/process/prepare.py benchmark.new/process/smoke.json --binary target/release/pvisor)
 "$SEMSPEC_BIN" bench --cwd "$batch/workspace" "$batch/in.json"
 python3 benchmark.new/update.py "$batch"
-"$SEMSPEC_BIN" render benchmark.new/process/results/smoke.semspec.md
+"$SEMSPEC_BIN" render benchmark.new/process/.data/results/smoke.semspec.md
 ```
 
 独立 filesystem 原生负载使用 Python 行命令，见 [filesystem/README.md](filesystem/README.md)。
@@ -94,12 +94,19 @@ python3 benchmark.new/update.py "$batch"
 - `manifest.json`、`harness/`：版本、CPU 亲和性、制品和冻结代码摘要、状态。
 
 `update.py` 检查全部正式样本零退出、条件和提取值与原始导出一致、输入与代码来源未变，
-再追加 `results/<entry>.semspec.csv`（启动和文件系统表使用 `.data/results/`），在模板旁生成
+再追加 `.data/results/<entry>.semspec.csv`，在模板旁生成
 `<entry>.render.json` 和引用它的结果 Markdown。
 CSV 保留完整精度及批次来源；展示 JSON 将毫秒格式化为两位小数。重复发布同批次不重复追加；
 不同 CSV schema 拒绝混合。可以通过 `--csv` / `--markdown` 指定新目标。
-Markdown 单独一行写 `{{ table("../tools.render.json") }}`；文档构建只读取已生成 JSON，
-不会运行实验。历史 results 文件和包装器计时 CSV 保留原口径，不混入新批次。
+Markdown 单独一行写 `{{ table("../../tools.render.json") }}`；文档构建只读取已生成 JSON，
+不会运行实验。CSV 和结果 Markdown 均写入入口目录下的 `.data/results/`；模板旁的
+`.render.json` 是被 Git 忽略的本地预览，文档发布仍使用独立的公开资产目录。
+历史 results 报告的表格直接保留在 Markdown 中，CSV/JSON 保留原字节归档，不混入新批次。
+
+历史派生表位于各主题的 `.data/derived-tables-20261018/`，重复预览表位于
+`.data/generated-tables-20261018/`。此次迁移的完整路径、字节数、SHA-256 和修改前的
+报告保存在本目录 `.data/generated-tables-prune-20261018/`；配置、实验入口、
+测试夹具、文档构建用表格和必要公开下载继续跟踪。
 
 `--prepare` / `--conclude` 重置并验证每次输入输出；失败不发布。构建、rootfs、镜像和服务
 预先准备，不能将旧多样本 campaign 当成单次被测命令。hyperfine 按条件顺序独立采样，
@@ -120,8 +127,13 @@ Markdown 单独一行写 `{{ table("../tools.render.json") }}`；文档构建只
 ## 文档表格
 
 [docs.json](docs.json) 登记中英文 benchmark 用户页及相关分析页的 benchmark ID、角色、
-来源 CSV，以及动态表格的 JSON 引用和发布绑定。固定历史表格直接写在 Markdown 中，
+必要公开 CSV，以及构建所需动态表格的 JSON 引用和发布绑定。固定历史表格直接写在 Markdown 中，
 保留原来的数字、统计口径、链接和对齐；构建时不再依赖逐张历史 JSON。
+公开 CSV 由 [public_assets.py](public_assets.py) 白名单控制，只保留必要用户统计；
+`csv_path(repo, filename, locale)` 定位共享下载，中英文共用一份。
+正文已有的静态表、逐轮逐环境记录、历史和工程中间表不默认另行导出。
+完整 CSV/JSON 留在原批次的本地 publication 目录或 `.data/` 归档，动态 JSON 只保留构建所需投影。
+本地化展示 JSON 留在文章旁。
 复测发布的结果与自动生成的覆盖范围表继续通过 `semspec render` 读取 JSON。
 重复表头可使用 `headers`，链接、代码和对齐通过显式渲染选项保留。
 
@@ -135,17 +147,21 @@ python3 benchmark.new/docs.py publish "$batch"
 `check` 检查文章覆盖、动态 JSON 引用、表结构、未执行命令与 CSV 来源。
 公开的新表还必须逐格等于各条件最新 CSV 的展示值，样本数和计时范围不匹配会阻止构建。
 `publish` 仅接受 `docs.json` 的 live binding，校验对应时钟的原始样本与正确性 hooks，
-追加两种语言同字节的完整精度 CSV，更新展示 JSON 与批次 provenance，原 MD 无需改写。
-provenance 摘要统一保存在 `docs/overrides/assets/benchmarks/`，中英文共用一份；
+仅向共享位置发布白名单内的完整精度 CSV，更新构建所需展示 JSON 与必要用户实验的 provenance，原 MD 无需改写。
+必要 provenance 摘要统一保存在 `docs/overrides/assets/benchmarks/`，中英文共用一份；
 保留批次、计时口径、运行配置、输入/二进制与证据摘要。完整 manifest、逐文件 harness
 清单、宿主路径和软件包收据留在批次 `.data/`。启动仅发布文档引用的 Ready / Exit
 两张 JSON 表，单行复测保留其他条件的来源配置。
 发布器验证 `metric_scope` 与绑定声明的负载配置；中位数与标准差同一行，批次名称放在来源记录，不挤入数值表。
 没有 live binding 的条件会拒绝发布；工程 A/B 不写入用户表。filesystem 的历史 hyperfine 结果
-保留在本地归档，其用户表、下载和发布绑定已删除；新 Python 时钟数据需单独登记文档表与 CSV。改变历史表数据时需同步
+保留在本地归档，其用户表、下载和发布绑定已删除；新 Python 时钟数据需单独登记文档表，必要公开 CSV 按白名单发布。改变历史表数据时需同步
 登记新来源与摘要，不能让旧 CSV 或旧结论自动冒充新实验。原文章归档留在
 `.data/docs-tables-20261011/`；原 CSV 未覆盖。
 整理前的完整文档 provenance 归档于 `.data/docs-provenance-20261011/`。
+公开图表使用 SVG，不再发布 PDF；工程实验只公开 SVG，完整统计与来源保留在本地 publication。
+历史和工程 CSV/JSON、旧 provenance 等保存在 `.data/docs-assets-prune-20261018/`，
+迁移清单记录原路径、字节摘要与新位置。裁减公开文件不改变正文表图、统计口径或测量值；
+必要公开摘要保留与原始来源的哈希关联。
 
 ## Replay
 

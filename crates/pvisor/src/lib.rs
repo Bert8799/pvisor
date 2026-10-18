@@ -31,14 +31,15 @@ pub use executor::sandbox;
 pub use image::cache;
 mod util;
 
-#[cfg(feature = "gateway")]
-pub use config::GatewayDriverConfig;
 pub use config::{
-    ContainerMount, ContainerNetwork, ContainerPlatform, ContainerSettings, FilesystemMode,
-    GatewayMode, GatewaySettings, NetworkDriverConfig, OverlayFsCommit, OverlayFsSettings,
-    OverlayNetMode, OverlayNetPolicy, OverlayNetSettings, PVisorConfig, RecordSettings, RunConfig,
-    RunExecutorKind, RunPolicy, RunSettings, RunStdio, VmSettings,
+    BaseReference, ContainerMount, ContainerNetwork, ContainerPlatform, ContainerSettings,
+    FilesystemMode, GatewayMode, GatewaySettings, NetworkDriverConfig, OverlayFsCommit,
+    OverlayFsSettings, OverlayNetMode, OverlayNetPolicy, OverlayNetSettings, PVisorConfig,
+    PreparedBase, PreparedRootfs, RecordSettings, RunConfig, RunExecutorKind, RunPolicy,
+    RunSettings, RunStdio, VmSettings,
 };
+#[cfg(feature = "gateway")]
+pub use config::{GatewayDriverConfig, NativeModelWait};
 pub use executor::container::ContainerExecutor;
 pub use executor::process::ProcessExecutor;
 #[cfg(target_os = "linux")]

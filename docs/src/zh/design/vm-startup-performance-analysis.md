@@ -20,7 +20,7 @@ B-STARTUP-REVISION-ENG，Linux/KVM/FUSE；每后端、每版本 3 次预热、60
 
 **整轮性能验收仍不通过：** staged 启动存在明显波动，且[同制品文件系统复测](filesystem-performance-analysis.md#concurrency-retest)显示 VM 写入和工具成本仍退化。需要独立诊断，不能拿 host 的退出收益替代其他后端或任务内部性能结论。
 
-[完整统计、分布与配对区间](concurrency-startup-summary.csv) · [制品与实验来源](concurrency-retest-provenance.csv)。原始数据、每次 stdout/时序、Run Bundle、输入与构建收据在本地 `benchmark.new/startup/.data/concurrency-retest2-20261011/`。这些工程版本比较不重写用户页的历史跨运行时表，不覆盖冷缓存、并发负载、macOS 或服务首次启动；0.5 s 干扰检测可能漏掉短暂、不可见或未识别活动。
+完整统计、分布、配对区间及制品与来源记录保存在本地批次或归档中。原始数据、每次 stdout/时序、Run Bundle、输入与构建收据在 `benchmark.new/startup/.data/concurrency-retest2-20261011/`。这些工程版本比较不重写用户页的历史跨运行时表，不覆盖冷缓存、并发负载、macOS 或服务首次启动；0.5 s 干扰检测可能漏掉短暂、不可见或未识别活动。
 
 ## 当前通用与裁剪内核的能力检查 {#kernel-capabilities}
 
@@ -50,7 +50,7 @@ Shell 使用 128 MiB guest RAM，工具使用 16 GiB，网络使用 1 GiB；它�
 
 两种配置都启用 SMP、KVM guest、CPU mitigations、seccomp/filter、namespaces、virtio-mmio、virtio-fs、virtio-net、IPv4。裁剪配置关闭 PCI、ACPI、guest security/SELinux 和 audit；两者仍启用 `CONFIG_BLOCK`，不能将设备裁剪概括成所有块设备基础设施都消失。配置变化不构成相同加固程度的对照。这里只验证上述 HTTP 和私有内存恢复负载，没有建立完整设备、TLS/DNS/UDP/IPv6、安全逃逸或 SDK 状态恢复的兼容性保证，也没有证明启动、物理内存或密度收益。
 
-[整理后的能力检查 CSV](kernel-capabilities.csv) · [实际配置选项 CSV](kernel-config-capabilities.csv)。两批独立原始报告、逐次输出、快照、输入清单、构建与审核回执保留在本地 `.data/`；CSV 保留批次时间、样本数和摘要关联。复现见[内核配置实验手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md#paired-kernel-configuration-experiment)。启动与完整任务收益需使用当前 CLI 另跑正式配对计时，不能由能力通过或文件尺寸推出。
+能力检查和实际配置选项 CSV 保存在本地批次或归档中，保留批次时间、样本数和摘要关联；两批独立原始报告、逐次输出、快照、输入清单、构建与审核回执保留在本地 `.data/`。复现见[内核配置实验手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md#paired-kernel-configuration-experiment)。启动与完整任务收益需使用当前 CLI 另跑正式配对计时，不能由能力通过或文件尺寸推出。
 
 ## 1. 结论
 
@@ -361,7 +361,7 @@ Exit 还包含正常关机：pVisor 中位数 174 ms，Firecracker/Ubuntu 约 9.
 | KVM / 2 vCPU / 256 MiB | 175.41 | 183.74 | 186.86 | 233.99 | 254.13 |
 | KVM / 2 vCPU / 2048 MiB | 220.47 | 228.20 | 231.22 | 284.08 | 294.39 |
 
-在这批测量中，新 VM 就绪约需 **0.2 秒**，完成退出约需 **0.23–0.28 秒**；两者应分别评估。这里测的是新建 VM；[快照恢复](vm-memory-performance-analysis.md#linux-snapshot)的耗时另外记录。没有采集 Linux 的细分启动账本，不能把 macOS 的阶段比例直接套用到 Linux。
+在这批测量中，新 VM 就绪约需 **0.2 秒**，完成退出约需 **0.23–0.28 秒**；两者应分别评估。这里测的是新建 VM，不能据此推导快照恢复耗时。没有采集 Linux 的细分启动账本，不能把 macOS 的阶段比例直接套用到 Linux。
 
 #### 裁剪内核与直接 init：Docker / Firecracker / QEMU 历史对照 {#reference-startup}
 
@@ -412,6 +412,8 @@ QEMU q35 的 218 ms 不能代表 QEMU 的最低启动成本；关闭可选传统
 
 ## 5. 复现与原始数据
 
+完整 CSV/JSON、来源摘要和原始记录保留在对应批次的本地 `.data/` 或 publication 目录。此前公开的数据文件归档于 `benchmark.new/.data/docs-assets-prune-20261018/`，迁移清单保留原路径、字节摘要和归档位置。
+
 ### macOS / HVF
 
 先准备 release CLI、Alpine rootfs 和两个 firmware 目录，再运行：
@@ -428,7 +430,7 @@ python3 benchmark/pvisor/vm_ready.py \
 
 输出目录必须尚不存在。harness 只依赖 Python 标准库，复用已有百分位数计算和 Bundle 验证。主矩阵与诊断矩阵隔离；预热不计入摘要；输出包括 `results.json`、逐行刷新的 `samples.jsonl`、输入 hash 和逐次 stdout/stderr。它使用独立 schema `pvisor-vm-readiness/v1`，不要与 `startup.py` 的命令完成耗时 schema 混用。
 
-本次本地日志位于 `target/vm-startup-20261003/`，正式报告为上方原始 JSON 链接。历史持久化、熵优化与 firmware 对照的完整实验说明保留在 `review_project/03-modules/`；旧 C/Rust guest init 的 runner 基准保留在 `benchmark/pvisor/README.md`，它不包含完整 CLI 准备，不能与本表直接比较。
+本地日志位于 `target/vm-startup-20261003/`；正式 JSON 报告与此前公开的数据文件保留在上述本地归档中。历史持久化、熵优化与 firmware 对照的完整实验说明保留在 `review_project/03-modules/`；旧 C/Rust guest init 的 runner 基准保留在 `benchmark/pvisor/README.md`，它不包含完整 CLI 准备，不能与本表直接比较。
 
 测量时的 harness 快照保留在 `review_project/06-evidence/vm-startup-20261003/`；可复用入口随后补上管道显式关闭，并在无日志矩阵中显式设置 `PVISOR_STARTUP_TIMING=0`；归档源码保留测量时的实现。
 

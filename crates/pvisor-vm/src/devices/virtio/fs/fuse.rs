@@ -60,6 +60,15 @@ const FOPEN_NONSEEKABLE: u32 = 4;
 /// Allow caching this directory.
 const FOPEN_CACHE_DIR: u32 = 8;
 
+/// A lower object whose opened identity survives a later upper copy-up.
+const FOPEN_PVISOR_LOWER: u32 = 1 << 30;
+
+/// Skip only the backend FLUSH RPC after the negotiated guest-side barriers.
+const FOPEN_PVISOR_LOCAL_FLUSH: u32 = 1 << 29;
+
+/// Isolate immutable lower data pages from the merged namespace inode.
+const FOPEN_PVISOR_DATA_OBJECT: u32 = 1 << 28;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -68,6 +77,16 @@ bitflags! {
         const KEEP_CACHE = FOPEN_KEEP_CACHE;
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
         const CACHE_DIR = FOPEN_CACHE_DIR;
+        /// With PVISOR_WRITEBACK, reads of this original lower object bypass
+        /// the shared inode cache after a writable open or truncate.
+        const PVISOR_LOWER = FOPEN_PVISOR_LOWER;
+        /// With PVISOR_LOCAL_FLUSH and writeback disabled, the guest retains
+        /// write_inode_now, sync_writes and mapping-error checks before skipping
+        /// this read-only local descriptor's backend FLUSH. Not FOPEN_NOFLUSH.
+        const PVISOR_LOCAL_FLUSH = FOPEN_PVISOR_LOCAL_FLUSH;
+        /// The negotiated OPEN reply carries a stable nonzero data-object ID
+        /// and fixed physical-lower size. Namespace/FH authorization is unchanged.
+        const PVISOR_DATA_OBJECT = FOPEN_PVISOR_DATA_OBJECT;
     }
 }
 
@@ -183,6 +202,25 @@ const CREATE_SUPP_GROUP: u64 = 1 << 34;
 
 /// We need this for idmapped mounts support
 const ALLOW_IDMAP: u64 = 1 << 40;
+
+/// Guest virtio-fs resolves imported directory pages locally.
+///
+/// Bit 41 is unused by Linux 6.12.109. The guest advertises it from its
+/// patched FUSE client; stock clients leave it clear and keep per-request
+/// lookups.
+const PVISOR_META: u64 = 1 << 41;
+
+/// Guest-owned cross-file writeback; negotiated only with WRITEBACK_CACHE.
+const PVISOR_WRITEBACK: u64 = 1 << 42;
+
+/// Per-open local read-only FLUSH elision after all ordinary guest barriers.
+const PVISOR_LOCAL_FLUSH: u64 = 1 << 43;
+
+/// Connection-local immutable lower data objects; OPEN replies have 24 bytes.
+const PVISOR_DATA_OBJECT: u64 = 1 << 44;
+
+/// `ReadIndexOut.flags`: no further directory pages exist.
+pub const READINDEX_COMPLETE: u32 = 1;
 
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
@@ -439,6 +477,25 @@ bitflags! {
 
         /// Indicates if idmapped mounts are allowed for virtiofs.
         const ALLOW_IDMAP = ALLOW_IDMAP;
+
+        /// Guest kernel imports directory pages and performs lookup, getattr,
+        /// readdir, and read-only open locally. Host requests remain for page
+        /// misses, file bytes, and operations that change the stage.
+        const PVISOR_META = PVISOR_META;
+
+        /// Keep cached writes and their handles across close, then submit them
+        /// by byte threshold or timer. Only guest-owned writeback sessions
+        /// enable this; ordinary FUSE guests keep their existing close behavior.
+        const PVISOR_WRITEBACK = PVISOR_WRITEBACK;
+        /// The guest can skip a flagged read-only local handle's backend FLUSH
+        /// after its ordinary inode/write/mapping-error checks. Incompatible
+        /// with writeback, DAX and remote POSIX/flock locking. Experimental
+        /// sessions negotiating this capability do not support snapshots.
+        const PVISOR_LOCAL_FLUSH = PVISOR_LOCAL_FLUSH;
+        /// OPEN has a 16-byte standard prefix plus a fixed lower size u64.
+        /// Qualified descriptors use independent guest data mappings. Default
+        /// off; negotiated sessions cannot be captured or restored.
+        const PVISOR_DATA_OBJECT = PVISOR_DATA_OBJECT;
     }
 }
 
@@ -710,6 +767,14 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
+    /// Not issued by this server. Present so the numeric space matches Linux 6.12.
+    Syncfs = 50,
+    /// Not issued by this server. Present so the numeric space matches Linux 6.12.
+    Tmpfile = 51,
+    /// Not issued by this server. Present so the numeric space matches Linux 6.12.
+    Statx = 52,
+    /// Import one directory page into the guest metadata cache.
+    ReadIndex = 53,
 }
 
 #[repr(u32)]
@@ -885,7 +950,7 @@ unsafe impl ByteValued for CreateIn {}
 pub struct OpenOut {
     pub fh: u64,
     pub open_flags: u32,
-    pub padding: u32,
+    pub backing_id: u32,
 }
 unsafe impl ByteValued for OpenOut {}
 
@@ -958,6 +1023,15 @@ pub struct FsyncIn {
     pub padding: u32,
 }
 unsafe impl ByteValued for FsyncIn {}
+
+/// Connection-wide synchronization request; the reserved field is ignored.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SyncfsIn {
+    pub padding: u64,
+}
+// SAFETY: the C-compatible structure contains a single integer and no padding.
+unsafe impl ByteValued for SyncfsIn {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1156,6 +1230,18 @@ pub struct OutHeader {
     pub unique: u64,
 }
 unsafe impl ByteValued for OutHeader {}
+
+/// Header of a `ReadIndex` reply. Directory records follow in `fuse_direntplus` form.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct ReadIndexOut {
+    /// Cookie for the next page. Zero when the directory was empty.
+    pub next_offset: u64,
+    /// `READINDEX_COMPLETE` when this page finishes the directory.
+    pub flags: u32,
+    pub padding: u32,
+}
+unsafe impl ByteValued for ReadIndexOut {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]

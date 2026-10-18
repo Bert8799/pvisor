@@ -20,6 +20,8 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+#[cfg(test)]
+use axum::http::Uri;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -27,7 +29,7 @@ use axum::{
         DefaultBodyLimit, MatchedPath, Path, RawQuery, Request, State,
         rejection::{JsonRejection, PathRejection},
     },
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -155,16 +157,17 @@ fn unauthorized() -> ApiError {
     )
 }
 
-async fn not_found() -> ApiError {
-    ApiError::new(404, "NOT_FOUND", "Unknown API route")
+async fn not_found() -> Response {
+    ApiError::new(404, "NOT_FOUND", "Unknown API route").into_response()
 }
 
-async fn method_not_allowed() -> ApiError {
+async fn method_not_allowed() -> Response {
     ApiError::new(
         405,
         "METHOD_NOT_ALLOWED",
         "Method is not supported on this route",
     )
+    .into_response()
 }
 
 async fn unsupported() -> ApiError {
@@ -409,6 +412,10 @@ async fn endpoint(
 // Connection can be repeated, and each value can nominate several additional
 // hop-by-hop headers. Collect nominations before removing Connection itself.
 fn strip_headers(headers: &mut HeaderMap, request: bool) {
+    strip_service_headers(headers, request, false);
+}
+
+fn strip_service_headers(headers: &mut HeaderMap, request: bool, envd: bool) {
     let nominated: Vec<HeaderName> = headers
         .get_all(header::CONNECTION)
         .iter()
@@ -433,9 +440,22 @@ fn strip_headers(headers: &mut HeaderMap, request: bool) {
         "upgrade",
         "open-sandbox-api-key",
         "x-pvisor-sandbox-token",
-        "authorization",
+        "x-api-key",
+        "e2b-sandbox-id",
+        "e2b-sandbox-port",
     ] {
         headers.remove(name);
+    }
+    // envd uses Basic authorization to select the guest Unix user. Bearer
+    // credentials and all OpenSandbox Authorization headers remain control data.
+    if !request
+        || !envd
+        || headers.get_all(header::AUTHORIZATION).iter().count() != 1
+        || !headers
+            .get(header::AUTHORIZATION)
+            .is_some_and(|value| value.as_bytes().starts_with(b"Basic "))
+    {
+        headers.remove(header::AUTHORIZATION);
     }
     if request {
         // Only the explicitly supplied guest X-EXECD-ACCESS-TOKEN is allowed
@@ -458,7 +478,13 @@ fn strip_headers(headers: &mut HeaderMap, request: bool) {
     }
 }
 
+#[cfg(test)]
 fn proxy_url(base: &str, uri: &Uri) -> Result<Url, ApiError> {
+    let suffix = uri.path().splitn(7, '/').nth(6).unwrap_or_default();
+    upstream_url(base, &format!("/{suffix}"), uri.query())
+}
+
+fn upstream_url(base: &str, path: &str, query: Option<&str>) -> Result<Url, ApiError> {
     let mut url = Url::parse(base).map_err(|_| internal("Invalid proxy upstream"))?;
     let loopback = match url.host() {
         Some(Host::Ipv4(ip)) => ip.is_loopback(),
@@ -481,13 +507,11 @@ fn proxy_url(base: &str, uri: &Uri) -> Result<Url, ApiError> {
     }
     // Use the original escaped URI, not the decoded wildcard extractor. Never
     // join a user path as a URL reference (//host could replace the authority).
-    let suffix = uri.path().splitn(7, '/').nth(6).unwrap_or_default();
-    let path = format!("/{suffix}");
-    url.set_path(&path);
-    url.set_query(uri.query());
+    url.set_path(path);
+    url.set_query(query);
     // URL parsing normalizes dot segments and backslashes. Reject these rather
     // than silently changing the requested guest resource or an encoded suffix.
-    if url.path() != path || url.query() != uri.query() {
+    if url.path() != path || url.query() != query {
         return Err(ApiError::bad_request(
             "Proxy path/query cannot be forwarded without normalization",
         ));
@@ -525,14 +549,41 @@ async fn proxy(
         path.get("port")
             .ok_or_else(|| ApiError::bad_request("Missing port"))?,
     )?;
+    let suffix = request
+        .uri()
+        .path()
+        .splitn(7, '/')
+        .nth(6)
+        .unwrap_or_default();
+    let guest_path = format!("/{suffix}");
+    forward(&daemon, id, port, request, guest_path).await
+}
+
+pub(super) async fn forward(
+    daemon: &Daemon,
+    id: &str,
+    port: u16,
+    request: Request,
+    guest_path: String,
+) -> Result<Response, ApiError> {
+    if request.method() == Method::CONNECT
+        || request.headers().contains_key(header::UPGRADE)
+        || request.headers().contains_key("sec-websocket-key")
+    {
+        return Err(ApiError::new(
+            501,
+            "NOT_IMPLEMENTED",
+            "WebSocket upgrades and CONNECT are not supported",
+        ));
+    }
     // Shared admission permits parallel proxies; exclusive lifecycle writers
     // fence delete/rebind and prevent new readers starving a queued control.
     let guard = daemon.proxy_guard(id).await?;
     let send = async {
         let upstream = daemon.upstream(id, port).await?;
-        let url = proxy_url(&upstream, request.uri())?;
+        let url = upstream_url(&upstream, &guest_path, request.uri().query())?;
         let (mut parts, body) = request.into_parts();
-        strip_headers(&mut parts.headers, true);
+        strip_service_headers(&mut parts.headers, true, port == crate::runtime::ENVD_PORT);
         daemon
             .proxy_client()
             .request(parts.method, url)

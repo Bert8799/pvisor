@@ -618,7 +618,7 @@ live VM。offload 的新目标路径限于当前 backing 的同一文件系统�
 | `--vm-ram-compression[=BOOL]` | `ram_compression` | `false`；FUSE/macFUSE Seekable backing |
 | `--vm-cold-ram-compression[=BOOL]` | `cold_ram_compression` | `false`；Linux x86_64 本地 live 冷 pager |
 | `--vm-ram-dedup[=BOOL]` | `ram_dedup` | `false`；尽力而为的宿主去重建议 |
-| `--vm-memory-pool SOCKET` | `memory_pool` | 未设置：实验性外部池；Linux 使用物理共享页，不需要 userfaultfd |
+| `--vm-memory-pool SOCKET` | `memory_pool` | 未设置：外部池；Linux 物理共享或 sealed 压缩，后者要求 userfaultfd |
 | `--vm-node-socket SOCKET` | `node_socket` | 未设置：同宿主 node 资源服务，提供不可变镜像/恢复 RAM |
 | `--vm-snapshot-filesystem-pool DIR` | `snapshot_filesystem_pool` | 未设置：独立副本；可选的宿主管理不可变 lower 池，用于 Linux x86_64 无网络原生 checkpoint |
 
@@ -730,7 +730,8 @@ sysctl。单用户 ACL 授权/撤销示例及受限映射、构建 feature 见
 [实例内压缩](../design/memory-optimization/compression-local.md#direction)。
 它拒绝 `vm.ram_backing`、`vm.ram_compression`、`vm.ram_dedup`、
 `vm.snapshot_filesystem_pool`、快照捕获/恢复及整 VM offload。
-Linux 外部 `vm.memory_pool` 使用物理共享页池：读取保持共享、写入 COW，不需要 userfaultfd；
+Linux 外部 `vm.memory_pool` 协商物理共享（私有 COW 映射，无需 userfaultfd）
+或 sealed 压缩对象（本地解码，要求内核缺页 userfaultfd）；
 它与实例本地压缩二选一，并要求私有匿名 RAM。
 guest 在短暂捕获/复核窗口之间持续运行，无需应用参与；这是驱逐/refault
 探测，不是普通 pause 或真正的读访问热度检测器，不承诺生产密度收益。
@@ -750,7 +751,7 @@ Podman 或 Buildah。未提供显式 rootfs 或镜像时，Linux 上默认通过
 OverlayFS 使用宿主 `/`，保留宿主运行环境、PATH 和 HOME，不拉取镜像。
 macOS 上需要显式提供 Linux rootfs 或镜像。
 manifest 和 layer digest 会被校验，host 架构选择 `linux/arm64` 或
-`linux/amd64`，解包后的 rootfs 成为 pVisor OverlayFS 的不可变 lower。
+`linux/amd64`，解包后的 rootfs 成为 pVisor OverlayFS 的共享 lower。
 `--image-store` 覆盖平台缓存目录。OCI 缓存目标被标为不可变，且该保护在逻辑
 checkpoint/fork 后仍然有效，因此 `pvisor apply` 不能改写被其他 Run 共享的
 rootfs。
@@ -787,6 +788,72 @@ host/container 的选择性网络规则作用于经过显式代理的流量。ho
 namespace 或 Seatbelt 阻止直接出口；容器离线使用 `--container-network none`。
 在 pVisor VM 上，`auto` 使用 smoltcp IPv4 TCP/DNS，`off` 让 guest 离线；
 deny-all 仍允许已配置的内部 Gateway 路由。各路径的范围见 [网络边界](../guides/policies/network.md)。
+
+#### 使用封存 rootfs {#prepared-rootfs}
+
+先将静止的独立 Linux rootfs 准备到私有 store，再用返回的 `base.id` 替换
+`BASE_ID`。store 应位于 workspace、stage、所有 guest 暴露路径及 VM 可写
+backing/control 路径之外。
+
+```bash
+pvisor-cache prepare-rootfs --rootfs /srv/linux-rootfs --base-store /srv/pvisor-bases
+pvisor run --vm --rootfs-base-store /srv/pvisor-bases --rootfs-base BASE_ID -- /bin/sh
+```
+
+本地准备不使用缓存服务；成功输出包含 `schema_version`、`prepared_rootfs`
+（canonical `store` 与 `base.id`）及独立 `rootfs` 路径。首次准备包含复制、
+完整内容/元数据校验和持久 pin。后续普通 CLI 由 Host worker 认证该对象，
+取得运行期 lease 并接通 Immutable 物理 lower；不会每次重新封存。
+默认工作区保持 live；可显式选择[封存工作区](#prepared-workspace)。
+
+`--rootfs-base-store` 与 `--rootfs-base` 必须成对，与 `--rootfs` 和 OCI image
+来源冲突；显式 host/container executor 和 JSON `--spec` 会拒绝。
+TOML 对应 `vm.prepared_rootfs.store`、`vm.prepared_rootfs.base.id`，并需显式
+选择 `[run] executor = "vm"`；已记录的 `vm.rootfs` 必须与认证结果一致。
+store 的 pin 跨进程和 GC 保留，当前没有删除 prepared entry 的接口；外部
+改写 store 不受支持。该来源当前不支持 execution checkpoint 捕获/恢复；
+workspace 逻辑检查点仍独立。普通目录、OCI 和 lazy
+投影的 apply 保护不自动授予这项物理所有权。
+
+Linux x86_64 上，认证后的 prepared rootfs 在 fresh native 启动时，若宿主环境未设置
+`PVISOR_VM_FS_READONLY_FLUSH_ELISION`，会自动向该 native child 请求只读 FLUSH 消除；
+显式设为 `0` 保留原行为。guest 必须支持协商，且只有合格的本地 Immutable 只读 fd
+才跳过 backend FLUSH；旧 guest 或不合格 fd 仍走原 FLUSH。未选择并认证 prepared
+rootfs 的 SDK 调用（包括仅以 `with_rootfs_base` 提供 owner），以及 macOS，
+在变量缺省时保持原行为。该默认不自动开启数据页缓存、负项缓存、WB 或 DAX。
+
+#### 使用封存工作区 {#prepared-workspace}
+
+将静止的项目准备到另一个私有 store，并在项目目录运行。`ROOTFS_ID` 来自
+上述 rootfs 准备命令，`WORKSPACE_ID` 来自工作区准备结果。
+
+```bash
+pvisor-cache prepare-workspace --workspace /srv/project --base-store /srv/pvisor-workspace-bases
+cd /srv/project
+pvisor run --vm --rootfs-base-store /srv/pvisor-bases --rootfs-base ROOTFS_ID \
+  --workspace-base-store /srv/pvisor-workspace-bases --workspace-base WORKSPACE_ID \
+  --stage /srv/pvisor-stages/review-1 -- /bin/sh
+```
+
+准备结果包含 `schema_version`、`prepared_workspace`（canonical `store` 与
+`base.id`）和独立 `workspace` 路径。首次准备复制并校验内容与元数据，持久 pin
+跨命令退出和 GC 保留；后续 Host worker 重新认证 workspace catalog 并取得
+运行期 lease，无需重新封存。
+
+读取使用所选固定 generation，宿主项目的后续修改不会进入当前 Run 的快照读视图。
+写入进入新的 stage；普通 `pvisor apply` 仍以原 live 项目为目标，对所选写入
+路径核对快照基线并保留冲突。这不是对所有读取路径的串行化事务检查。
+`apply --target` 重定向不受支持。
+
+两个工作区参数必须成对，且要求 prepared rootfs、native VM、新 stage 和单个
+工作区 lower。TOML 使用 `overlayfs.prepared_workspace.store` 与
+`overlayfs.prepared_workspace.base.id`。显式 host/container、JSON `--spec`、
+compose、工作区逻辑 checkpoint fork/恢复与 execution checkpoint 捕获/恢复会被
+拒绝；工作区 checkpoint 的创建和只读查看仍独立可用。两个 store 须彼此独立，并处于
+项目、stage、guest 暴露路径和 VM 可写 backing/control 路径之外；不要外部改写
+store。该入口沿用[prepared rootfs 的限定只读 FLUSH 默认](#prepared-rootfs)，
+不自动开启独立数据页、负项缓存、WB 或 DAX；可显式设置
+`PVISOR_VM_FS_READONLY_FLUSH_ELISION=0` 保留原 FLUSH。
 
 ## Run 项目发现 {#run-项目发现}
 
@@ -852,4 +919,4 @@ VM 镜像启动会自动探测默认 socket；服务可用时，将远程镜像�
 完整协议、限制和 SSH 远程访问方式见 [共享镜像缓存协议](shared-image-cache.md)。
 
 
-通过 `pvisor-daemon serve --memory-pool` 启用 daemon 自有实验池；独立 `memory-pool --directory DIR` 组件使用 daemon 准备的私有配置。原生 `pvisor run --vm-memory-pool SOCKET` 仍是带有平台／协议限制的显式运行时选项，不是服务启动器。池丢失会使依赖 VM 失败。启用与预算见 [daemon 池](../guides/daemon/index.md#memory-pool)；历史 macOS 压缩池结果保留其[版本范围](../design/memory-optimization/proof-of-concept.md#v1-integration)。
+通过 `pvisor-daemon serve --memory-pool` 启用 daemon 自有实验池；独立 `memory-pool --directory DIR` 组件使用 daemon 准备的私有配置。原生 `pvisor run --vm-memory-pool SOCKET` 仍是带有平台／协议限制的显式运行时选项，不是服务启动器。物理/legacy 池丢失会使依赖 VM 失败；Linux sealed 压缩客户端保留本地恢复，停止新发布，通过 daemon `--memory-pool-mode compressed` 选择。启用与预算见 [daemon 池](../guides/daemon/index.md#memory-pool)；历史 macOS 压缩池结果保留其[版本范围](../design/memory-optimization/proof-of-concept.md#v1-integration)。

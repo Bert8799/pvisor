@@ -110,7 +110,7 @@ workload-aware-memory-offloading = true
 - 含路径的配置没有“以配置文件目录为根”的通用承诺；从预期工作区启动，跨环境使用绝对路径。
 
 
-`[vm].memory_pool` 是实验性 macOS / Apple Silicon 共享冷页池的 socket 路径，默认未设置；CLI 对应 `--vm-memory-pool SOCKET`，Rust SDK 对应 `VmSettings.memory_pool`。Linux 有意拒绝外部池；有界实例本地存储使用 `cold_ram_compression`。见[首版内存共享](../design/memory-optimization/proof-of-concept.md#v1-integration)。
+`[vm].memory_pool` 是实验性外部池的 socket 路径，默认未设置；CLI 对应 `--vm-memory-pool SOCKET`，Rust SDK 对应 `VmSettings.memory_pool`。Linux 协商物理页共享或 sealed 压缩对象；压缩模式要求内核缺页 userfaultfd，并在服务丢失后保留本地恢复。Apple Silicon 保留 legacy 远程池。见[daemon 池模式](../guides/daemon/index.md#memory-pool)。
 
 ## 常用分组的具体字段 {#settings}
 
@@ -144,7 +144,7 @@ workload-aware-memory-offloading = true
 | `container` 可选字段 | `rootfs`、`pvisor_binary`、`platform`、`workdir`、`user` |
 | `container.mounts` 每项 | `source`、`target`，`read_only = false` |
 | `vm` | `memory_mib = 2048`，`cpus = 2`，`rootfs_immutable = false`，`ram_compression = false`，`cold_ram_compression = false`，`ram_dedup = false` |
-| `vm` 可选字段 | `rootfs`、`image`、`image_store`、`library_dir`、`control_socket`、`ram_backing`、`memory_pool`、`node_socket`、`snapshot_filesystem_pool` |
+| `vm` 可选字段 | `rootfs`、`prepared_rootfs`、`image`、`image_store`、`library_dir`、`control_socket`、`ram_backing`、`memory_pool`、`node_socket`、`snapshot_filesystem_pool` |
 
 `container.platform` 取 `linux-amd64` 或 `linux-arm64`，是可选的原生宿主架构断言。匹配值会被接受；跨架构值会被拒绝，即使设置了预制 `container.rootfs`。host 和 VM 配置会拒绝已配置的平台。它不启用模拟执行，也不自动发现／下载程序。`container.pvisor_binary` 默认使用当前程序；显式 Linux 二进制和 rootfs 须兼容原生架构及 guest ABI。见[容器准备](../guides/executors/container.md)。`container.network` 取 `host`、`bridge` 或 `none`，但 CNI 支持尚未实现，当前会拒绝 `bridge`。
 
@@ -204,8 +204,8 @@ CLI stderr 打印 `--vm-socket`、`--vm-job-id` 和 `--vm-attempt-id`，供
 之外，并与 Job 位于同一卷；其 Linux x86_64 无网络 profile 不代表通用 VM
 快照支持。本地冷 pager 的单一选项同时启用回收与压缩，不是独立开关。
 它与 backing/FUSE 压缩、去重、外部池、快照捕获/恢复、快照文件系统池及
-整 VM offload 互斥。去重与两种压缩模式及外部池互斥。Linux 外部池仍不受
-支持。冲突针对合并后的配置，不只是 CLI 标志。
+整 VM offload 互斥。去重与两种压缩模式及外部池互斥。Linux 外部池按上述
+协议选择物理共享或 sealed 压缩。冲突针对合并后的配置，不只是 CLI 标志。
 
 VM 的内存以 MiB 为单位，CPU 是正整数。`ram_backing` 保存 RAM 文件；`ram_compression` 启用相应的压缩 backing。macOS 的压缩 backing 与共享池有额外 FUSE 条件，见[内存共享概念验证](../design/memory-optimization/proof-of-concept.md)。
 
@@ -216,8 +216,8 @@ VM executor 时启用实验性的 Linux x86_64 实例本地 live 压缩；
 `ram_compression`。必须具备 userfaultfd syscall 或 `/dev/userfaultfd` 的
 内核缺页权限；编译支持不代表权限，缺少权限时启动失败，不回退或修改
 全局 sysctl。准入拒绝 `ram_backing`、`ram_compression`、`ram_dedup`、
-`snapshot_filesystem_pool`、快照捕获/恢复及整 VM offload；Linux 还拒绝
-`memory_pool` 及 `PVISOR_EXPERIMENTAL_MEMORY_POOL`。ACL 命令、映射/构建
+`snapshot_filesystem_pool`、快照捕获/恢复及整 VM offload；实例本地压缩还拒绝
+`memory_pool` 及 `PVISOR_EXPERIMENTAL_MEMORY_POOL`，外部 sealed 压缩是独立的 store 选择。ACL 命令、映射/构建
 限制、有界预算及经过校验的 refault 见
 [实例内压缩](../design/memory-optimization/compression-local.md)。这是持续
 进行且无需 guest 参与的驱逐/refault 探测，不是普通 pause 或读访问热度
@@ -226,6 +226,53 @@ VM executor 时启用实验性的 Linux x86_64 实例本地 live 压缩；
 `[vm].ram_dedup = true` 在使用 VM executor 时请求尽力而为的宿主 RAM 去重建议；`--vm-ram-dedup` 还会选择该 executor。它与 `memory_pool`、`ram_compression`、`cold_ram_compression` 及 `PVISOR_EXPERIMENTAL_MEMORY_POOL` 互斥。Linux 建议面向普通私有匿名 RAM 与恢复的私有 COW 映射；live `MAP_SHARED` RAM 被跳过，不转换映射。macOS 对其他条件合格的映射报告不支持。runner 将安装报告写入 stderr，建议失败仍继续运行；`accepted_bytes` 不是已合并字节、节省，也不证明扫描已启用。不修改全局 KSM 参数或增设服务。启用前先核对[去重边界与共享风险](../design/memory-optimization/deduplication.md#direction)。
 
 `[vm].snapshot_filesystem_pool` 为首次启动及从快照恢复的 VM capture 启用不可变 lower 引用，也覆盖不同 VM 的首次 capture。首次 seal 后，控制连接持有已验证的 owner；后续 capture 验证完整原 lower 并复用已封存的 pool 树，不扩大 runner 的访问范围。原生调用方应使用宿主管理的绝对路径，与 Job store 位于同一卷，并处于所有 VM 可写根和快照 store 之外。首次缓存未命中时，每个不可变摘要创建一棵 pool 树；并发未命中按摘要串行，命中不产生临时 lower 副本。此选项启用的原生 v5 快照以独立持有的 64 KiB 压缩块保留私有文件内容，复用未变化的内容；恢复时重建私有可写 inode，并保留完整元数据及硬链接关系。运行中的块 owner 在父快照退役和 GC 后仍然有效。封存先按解码后的内容标识查找 pool 块，命中时完整校验并直接复用，仅未命中才压缩；完整 RAM 压缩封存也使用这一路径。原生 capture 直接编码经过宿主认证的冻结私有目录，不产生中间私有数据树；导入、恢复和暂停任务的文件导出均不打开记录中的原始私有路径。完整数据校验仍保留；延迟和密度收益需要实测。此配置不支持网络、共享内存池、普通与 live 冷 RAM 压缩及显式 RAM backing。备份须保留 pool 与相关 Job store，或导出完整快照。
+
+### 封存 rootfs {#prepared-rootfs}
+
+`vm.prepared_rootfs` 选择由 `pvisor-cache prepare-rootfs` 持久保留的物理基底。
+设置 `[run] executor = "vm"`，并在 `[vm.prepared_rootfs]` 中提供 `store`，
+在 `[vm.prepared_rootfs.base]` 中提供准备结果的 `id`。CLI 的成对覆盖参数为
+`--rootfs-base-store STORE --rootfs-base ID`。完整命令见
+[封存 rootfs 入口](cli.md#prepared-rootfs)。
+
+首次准备复制并完整校验静止的独立 Linux rootfs。复用时，Host worker 与
+`VmExecutor::new` 认证小记录、seal 与持久 pin，并取得贯穿运行的 GC lease；
+不重新复制或全树校验。`rootfs` 若同时存在，必须与认证后的基底精确一致；
+`image` 和非 VM executor 会被拒绝；该来源当前不支持 execution checkpoint
+捕获或恢复，workspace 逻辑检查点仍独立。store 必须独立于 workspace、
+stage、可写挂载及 VM backing/control 路径。当前无删除 prepared entry 的接口，
+pin 在命令退出和 GC 后仍保留，外部修改 store 不受支持。
+
+该选择认证 rootfs 的物理 lower 所有权，workspace 默认保持 live。普通路径和
+OCI/lazy 投影继续使用原声明；`rootfs_immutable` 仍只控制 apply 限制。
+Linux x86_64 的认证 prepared rootfs 在 fresh native 启动时，若宿主环境未设置
+`PVISOR_VM_FS_READONLY_FLUSH_ELISION`，会自动向该 native child 请求只读 FLUSH 消除；
+显式 `0` 保留原行为。旧 guest 或未满足本地 Immutable 只读资格的 fd 回退原 FLUSH。
+未选择并认证 prepared rootfs 的 SDK 调用（包括仅使用 `with_rootfs_base` 提供 owner），
+以及 macOS，在变量缺省时保持原行为。数据页缓存、负项缓存、WB 和 DAX 不自动开启；
+准备和运行性能需分开测量。
+
+### 封存工作区 {#prepared-workspace}
+
+`overlayfs.prepared_workspace` 选择 workspace catalog 持久保留的固定 generation，
+字段为 `store` 和 `base.id`。CLI 对应成对参数
+`--workspace-base-store STORE --workspace-base ID`；准备与运行命令见
+[封存工作区入口](cli.md#prepared-workspace)。rootfs 与 workspace 复用同一种
+选择器形状，各自认证用途对应的 catalog，不能相互替代。
+
+该来源要求 prepared rootfs、native VM、新 stage 和单个工作区 lower。读取使用
+所选快照，stage/apply target 保留为独立 live 项目；apply 对所选写入路径检查
+快照基线，宿主冲突仍会保留。宿主后续改动不会进入当前 Run 的快照读视图，
+也不提供整个读集合的串行化检查。`apply --target`、compose、JSON `--spec`、
+非 VM executor、工作区逻辑 checkpoint fork/恢复与 execution checkpoint 捕获/恢复
+不受支持；工作区 checkpoint 的创建和只读查看仍独立可用。
+
+两 store 必须独立于彼此及项目、stage、guest 暴露路径和 VM 可写
+backing/control 路径。首次准备复制并完整校验，后续认证小记录并持 lease，
+不会每次重新封存；持久 pin 跨命令退出和 GC 保留，外部改写 store 不受支持。
+该字段沿用[prepared rootfs 的限定只读 FLUSH 默认](#prepared-rootfs)，不自动开启
+数据页、负项缓存、WB 或 DAX；显式 `PVISOR_VM_FS_READONLY_FLUSH_ELISION=0`
+保留原 FLUSH。准备费用与运行耗时分别测量。
 
 ### 捕获与记录
 
@@ -283,10 +330,14 @@ VM executor 时启用实验性的 Linux x86_64 实例本地 live 压缩；
 | `vm.ram_compression` | `bool` | `false` | Seekable 压缩 backing；`--vm-ram-compression` |
 | `vm.cold_ram_compression` | `bool` | `false` | 实验性 Linux x86_64 本地 live pager；需内核缺页 userfaultfd 权限；无 FUSE/外部池；`--vm-cold-ram-compression` 选择 VM |
 | `vm.ram_dedup` | `bool` | `false` | 显式启用尽力而为的宿主 RAM 去重建议；`--vm-ram-dedup` 选择 VM；与内存池/压缩互斥；接受建议不等于节省 |
-| `vm.memory_pool` | `Option<PathBuf>` | `未设置` | 实验性 macOS pool socket；`--vm-memory-pool` |
+| `vm.memory_pool` | `Option<PathBuf>` | `未设置` | 实验性 Linux 物理/sealed 压缩或 macOS legacy pool socket；`--vm-memory-pool` |
 | `vm.snapshot_filesystem_pool` | `Option<PathBuf>` | `未设置` | 宿主管理的不可变快照 lower 池；仅 Linux x86-64 无网络私有 RAM 配置；`--vm-snapshot-filesystem-pool` |
 | `vm.node_socket` | `Option<PathBuf>` | `未设置` | 同宿主 node 资源服务 socket；恢复时保留共享只读 RAM backing 的引用，直到 native VM 退出；`--vm-node-socket` |
 | `vm.rootfs` | `Option<PathBuf>` | `未设置` | Linux 根目录；Linux CLI 默认宿主 `/`；`--rootfs` |
+| `vm.prepared_rootfs` | `Option<PreparedRootfs>` | `未设置` | 持久封存 rootfs 选择器；VM-only，省略保持原行为 |
+| `vm.prepared_rootfs.store` | `PathBuf` | `未设置` | 选择时必填；私有 SnapshotStore，执行调用者 cwd 下解析并持久化 canonical 路径；`--rootfs-base-store` |
+| `vm.prepared_rootfs.base` | `BaseReference` | `未设置` | 选择时必填；已由 store 持久 pin 的基底标识 |
+| `vm.prepared_rootfs.base.id` | `String` | `未设置` | 选择时必填；64 位小写十六进制 seal SHA-256；`--rootfs-base` |
 | `vm.image` | `Option<String>` | `未设置` | OCI 镜像，替代 rootfs 目录；`--rootfs IMAGE` |
 | `vm.image_store` | `Option<PathBuf>` | `未设置` | OCI 缓存路径；`--vm-image-store` |
 | `vm.rootfs_immutable` | `bool` | `false` | 拒绝将变更 apply 到 rootfs lower |
@@ -296,6 +347,10 @@ VM executor 时启用实验性的 Linux x86_64 实例本地 live 压缩；
 | `overlayfs.mount` | `Vec<FilesystemMount>` | `[]` | 统一挂载；重复 `--mount` 替换列表 |
 | `overlayfs.access` | `Vec<FilesystemAccessRule>` | `[]` | 访问规则；重复 `--access` 追加；`--clear-access` 清空 |
 | `overlayfs.stage` | `Option<PathBuf>` | `未设置` | 项目外的新持久 Stage；`--stage` |
+| `overlayfs.prepared_workspace` | `Option<PreparedBase>` | `未设置` | 封存工作区选择器；要求 prepared rootfs、新建 native VM stage 与独立 live apply target |
+| `overlayfs.prepared_workspace.store` | `PathBuf` | `未设置` | 选择时必填；独立私有 SnapshotStore，执行时认证 workspace catalog；`--workspace-base-store` |
+| `overlayfs.prepared_workspace.base` | `BaseReference` | `未设置` | 选择时必填；已由 workspace catalog 持久 pin 的基底标识 |
+| `overlayfs.prepared_workspace.base.id` | `String` | `未设置` | 选择时必填；64 位小写十六进制 seal SHA-256；`--workspace-base` |
 | `overlayfs.durability` | `pvisor_core::overlay::StageDurability` | `"checkpoint"` | `checkpoint` 或 `strict`；`--stage-durability`；不改变隔离和内容冲突检测 |
 | `overlayfs.max_size` | `Option<u64>` | `未设置` | 暂存总字节额度；`--overlayfs-max-size` |
 | `overlayfs.mount[].source` | `PathBuf` | `必需` | 宿主源路径 |

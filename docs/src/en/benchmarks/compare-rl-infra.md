@@ -62,8 +62,8 @@ Native Agent resume owns the client's session/context. Prepare-only supplies a c
 
 Training throughput, useful-sample success, reward, retries and end-to-end resource cost remain unmeasured. OpenHands, SWE-Gym and verl integrations need separate acceptance; an adapter's prefix fidelity is insufficient evidence.
 
-### Downloads and reproduction {#run}
+### Sources and reproduction {#run}
 
-[Scenario evidence CSV](compare-rl-infra.csv) retains topic, source, cohort, statistic, counts, values and limitations. Source summaries: [density](density-summary.csv), [repair/CLI](agent-tasks.csv), [startup](startup.csv), [replay](replay-fidelity.csv), [lazy startup/payload](lazy-startup-summary.csv), [isolation](isolation-tests.csv), [VM memory](vm-memory/memory-choices.csv). Artifact digests and full controls stay with each owning topic's provenance downloads; raw evidence stays in local `.data/`.
+Complete CSV/JSON, artifact digests, controls and raw records for each topic remain in their local cohorts or the documentation data archive, retaining provenance and statistical scope.
 
 [Comparison method](methodology.md) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
