@@ -3,10 +3,6 @@
     "Data status": "Historical data",
     "Measured scope": "Original metrics and sources retained; no matching new measurements"
   },
-  "[cluster-scalability](cluster-scalability.md)": {
-    "Data status": "Historical data",
-    "Measured scope": "Original metrics and sources retained; no matching new measurements"
-  },
   "[compare-rl-infra](compare-rl-infra.md)": {
     "Data status": "Historical data",
     "Measured scope": "Original metrics and sources retained; no matching new measurements"
@@ -31,10 +27,6 @@
     "Data status": "Partially rerun",
     "Measured scope": "Same host staged executor, four-file lazy loading; N30 cold/warm including fetch and mount; VM application startup retains separate historical data"
   },
-  "[methodology](methodology.md)": {
-    "Data status": "Historical data",
-    "Measured scope": "Original metrics and sources retained; no matching new measurements"
-  },
   "[network](network.md)": {
     "Data status": "Historical data",
     "Measured scope": "Original metrics and sources retained; no matching new measurements"
@@ -45,7 +37,7 @@
   },
   "[startup](startup.md)": {
     "Data status": "Partially rerun",
-    "Measured scope": "Same-launch Ready / Exit; whole-command time is separate"
+    "Measured scope": "Launch to first checked output; exit time is not reported"
   },
   "[supervision-cost](supervision-cost.md)": {
     "Data status": "Historical data",

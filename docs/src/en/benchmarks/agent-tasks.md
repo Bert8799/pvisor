@@ -1,41 +1,28 @@
-# End-to-end Agent tasks: when should you choose pVisor?
-
-## Conclusions {#conclusions}
-
-**Evaluate pVisor staged when you repeatedly create task views, retain sparse edits and review/apply them: fixed repair takes 0.64 s versus Docker's 0.81 s, but seven-tool completion takes 1.09 s versus Docker's 0.82 s. pVisor VM repair takes 3.25 s, behind Firecracker's 2.20 s and QEMU microvm's 1.40 s; budget the cost of an independent guest boundary.**
-
-| Need | Selection implication |
-| --- | --- |
-| Large workspace, sparse edits, fresh task view each time | Staged has a complete machine-workflow advantage; also budget tool overhead |
-| Small workspace, existing container or native Agent sandbox | Keep existing Git/tool flows; do not replace everything for individual operation speed |
-| Independent guest kernel | Validate CLI compatibility and complete tool cost before choosing VM |
-| Remote API and managed elasticity | Evaluate clouds by repository synchronization, deployment and operations needs; matched performance and billing are unmeasured |
-
-<!-- measurement-status:start -->
-
-The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
-
-<!-- measurement-status:end -->
+# How long does a real Agent task take?
 
 ## Motivation {#motivation}
 
-A task includes environment preparation, model/tool interaction, verification, review/application and cleanup. Startup alone misses tool and result-handling costs; tool speed alone misses repeated workspace creation. A fixed tool plan removes inference and public-network variability, while a separate complete review workflow measures how the same edits reach the original workspace.
+Judge an execution mode by the complete task: environment preparation, model and tool interaction, verification, review and application, and cleanup. Evaluate staged when you repeatedly create task views, keep sparse edits and review them; keep an existing container or native sandbox when the workspace is small; validate CLI compatibility and complete tool cost before choosing a VM. For managed clouds, compare repository synchronization, deployment and operations needs instead.
+
+Fixed repair takes 0.64 s staged versus Docker's 0.81 s, but seven-tool completion takes 1.09 s versus 0.82 s. pVisor VM repair takes 3.25 s, behind Firecracker's 2.20 s and QEMU microvm's 1.40 s, so budget the cost of an independent guest boundary.
+
+<!-- measurement-status:start -->
+
+These numbers and conclusions remain the original historical cohorts; the new framework has no matching rerun. See [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
 
 ## Experiment design {#interpretation}
 
-Linux x86_64, AMD Ryzen 7 9700X, Fedora 7.2.8-200.fc44.x86_64. Launched process trees and the private Docker daemon are pinned to CPUs 0,1. VMs use 2 vCPU, 128 MiB for the shell probe and 16 GiB for tools. Native/Docker memory is uncapped: this is a CPU-controlled task comparison, not a capacity comparison under identical memory limits. Host/staged use rootless_process.
+Measure time from launch through exit for a fixed tool plan as complete-task time. That time is what one Agent task costs; a shorter time delivers the same verified result sooner.
 
-All backends share offline tools and fixed inputs, with a new workspace per trial. Warm caches, three warmups and 60 measured samples per fixed-plan cell; 30 for environment checks and real CLIs; backends alternate in seeded randomized order. Preparation, builds, image import and fixture resets are outside timing; complete tasks include launch and exit. Docker Engine 29.7.2 uses a private rootless **overlay2** daemon, the classic image store and writable bind mounts. Firecracker 1.13.1 PCI runs without jailer; QEMU 10.2.2 uses q35/microvm and private ext4. pVisor VM uses virtio-fs and its own firmware. Kernels, storage and staging semantics differ: these are task costs for the stated configurations, not pure VMM or security rankings.
+All backends share offline tools and fixed inputs, with a new workspace per trial, under Linux x86_64 / Ryzen 7 9700X / Fedora 7.2.8 on CPUs 0–1. VMs use 2 vCPU, 128 MiB for the shell probe and 16 GiB for tools; native and Docker memory is uncapped, so this compares CPU-controlled task time rather than capacity. Warm caches, three warmups and 60 samples per fixed-plan cell (30 for environment checks and real CLIs), with seeded randomized order.
 
-The fixed plan inspects/searches the repository, fixes Python, runs Python/Rust/Node tests, installs 32 offline npm packages and generates a diff. Result ends at checked returned results; Completion includes exit. Tests and expected edits must pass. The tool plan does not measure model inference or establish compatibility of real Agent CLIs.
-
-These samples do not verify equal Node/npm compile-cache state across backends. A fresh workspace does not establish an empty tool cache. Complete-task differences include each configuration's cache behavior; they cannot all be attributed to staging or the VMM.
-
-Scenario analysis also reuses separately registered [filesystem](filesystem.md), [complete review workflow](supervision-cost.md), [startup](startup.md), [lazy-image](lazy-image-startup.md) and [isolation](isolation-tests.md) experiments. Review has thirty samples per cell and includes view creation, twenty edits, review, application of ten files and cleanup; Git/reflink do not supply the same isolation. Experiments remain separate: do not sum medians to estimate a real Agent task or reuse their differing budgets for one ranking.
+The fixed plan inspects and searches the repository, runs Python, Rust and Node tests, installs 32 offline npm packages and generates a diff. Result ends at checked returned results; Completion includes exit. Docker uses a private rootless overlay2 daemon, Firecracker PCI runs without jailer, QEMU uses q35/microvm, and pVisor VM uses virtio-fs: kernels, storage and staging differ, so these are task costs, not VMM or security rankings. The plan does not measure model inference or establish real-CLI compatibility, and a fresh workspace does not imply an equal tool cache.
 
 ## Data and analysis {#results}
 
-Measured on 2026-10-06: each fixed-plan backend has 60/60 valid samples and zero measured failures; environment/CLI counts and preflight failures are listed separately. Outputs, exit and execution records must pass validation; staging also requires unchanged host originals and complete retained changes. Every valid slow sample is kept, with no timing-based exclusions. Tables normally show P50; separated distributions show cluster medians and counts. P95 is descriptive only. Raw reports, binaries and input/source manifests stay in ignored `.data/`; complete local CSV/JSON retains workload, cohort and provenance associations.
+Measured on 2026-10-06: each fixed-plan backend has 60/60 valid samples and zero measured failures; environment/CLI counts and preflight failures are listed separately. Outputs, exit and execution records must pass validation; staging also requires unchanged host originals and complete retained changes. Every valid slow sample is kept, with no timing-based exclusions. Tables normally show P50; separated distributions show cluster medians and counts. Raw reports, binaries and input/source manifests stay in ignored `.data/`; complete local CSV/JSON retains workload, cohort and provenance associations.
 
 ### Fixed repair and tests {#reference-env}
 
@@ -91,7 +78,6 @@ The environment check runs Python, Node, Git, Cargo/Rustc and CLI version checks
 | QEMU q35 | 0.88 | 2.07 | 6.93 |
 | QEMU microvm | 0.80 | 2.05 | 6.86 |
 
-
 Claude Code in pVisor VM exceeded the 90 s initialization deadline during preflight: zero valid samples, excluded from latency comparisons. Other Claude conditions and every Codex condition completed the controlled tool loop.
 
 Staged minus Docker completion median: Claude Code −127.83 ms, paired-bootstrap 95% interval [−137.91, −116.72] ms; Codex −3864.45 ms, interval [−3948.16, −3804.45] ms. These differences include client initialization, tool calls and exit waiting; they do not identify a single filesystem cost.
@@ -104,4 +90,4 @@ Claude uses `--bare` with only Bash allowed; Codex uses `--ephemeral` and `dange
 
 Complete CSV/JSON and raw records remain in their local cohorts or the documentation data archive.
 
-[Method](methodology.md) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[Comparison method](index.md#interpretation) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

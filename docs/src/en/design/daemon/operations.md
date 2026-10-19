@@ -4,7 +4,7 @@ Run a single-node sandbox service with the native VM runtime, private state and 
 
 ## Deployment {#deployment}
 
-Requires Linux x86_64, usable `/dev/kvm`, trusted absolute paths and a writable delegated cgroup v2 hierarchy with enabled CPU/memory/PID controllers and `cgroup.kill`. Preflight checks real controller writes and the KVM API; there is no host, OCI command or registry-pull fallback.
+Platform prerequisites (Linux x86_64, `/dev/kvm`, a delegated cgroup v2 hierarchy) and how they are checked are documented in the [operations guide's prerequisites](../../guides/daemon/index.md#prerequisites).
 
 Set `OPEN_SANDBOX_API_KEY` to a protected random secret of at least 32 bytes, not argv.
 
@@ -24,15 +24,13 @@ pvisor-daemon serve \
 
 Keep state and runtime configuration compatible across restarts. Use TLS termination in a trusted reverse proxy before non-loopback exposure. Set `--public-endpoint` to the externally routed host:port authority; wildcard or ephemeral listeners require it. Automatic endpoint publication is not implemented.
 
-Keep runtime paths absolute and unchanged across daemon restarts. Use short state paths such as `/run/user/1000/pvd`: per-sandbox `control.sock` must be shorter than 104 bytes, and vsock Unix sockets also have path limits. Retain state; this `/run` example does not promise persistence across logout/reboot, and VMs cannot survive host reboot. `/sys/fs/cgroup/pvd` must be a real delegated hierarchy, not an ordinary directory.
+Runtime/state path absoluteness, length and persistence constraints are documented in the [operations guide's install and start](../../guides/daemon/index.md#install).
 
-An occupied version-1 `sandboxes.json` without the native `owner.json` marker is rejected under the existing exclusive store lock: it may still own live Podman containers. Use fresh native state while preserving and cleaning up the old deployment, or delete every sandbox through the old Podman daemon and confirm cleanup before switching backends with the emptied registry. Never erase registry entries, reservations or ownership state, or fabricate a native marker to bypass this guard. The native daemon neither adopts those containers as Missing nor silently releases their reservations.
-
-A v2 header is also rejected without `owner.json`, even with its intentionally empty `sandboxes` map. Preserve the native marker, header and private `records/` tree together; see [storage migration and activation](storage.md#migration).
+An occupied v1 registry or a v2 header without the native `owner.json` marker is rejected, even with an intentionally empty map: it may still own live Podman containers. Preserve the original ownership state; use fresh native state or clean up through the old Podman daemon before switching, and never erase records/reservations or fabricate markers. Rejection and migration rules live in [storage](storage.md#migration).
 
 ## Prepared image contract {#image-contract}
 
-Images are trusted local `images_dir/<key>.json` manifests, not registry references. Fields are absolute independent Linux `rootfs` (never host `/` or overlapping daemon state), absolute guest bootstrap `entrypoint` argv, optional `cmd`, optional `env` and optional absolute firmware `library_dir`. Requested workload argv (or `cmd` if empty) is appended to `entrypoint`; request env overrides manifest env, without host environment inheritance or shell interpolation.
+Image manifest fields and environment semantics are documented in the [operations guide's prerequisites](../../guides/daemon/index.md#prerequisites).
 
 The long-lived guest bootstrap must supervise workload, real OpenSandbox 1.1.0 execd and egress, initialize/authenticate services, forward signals and reap children. It must expose byte-transparent AF_VSOCK listeners on guest **CID 3**, ports **44772/18080**, bridging to real services. Supervisor loopback TCP publications connect through private Unix sockets and native vsock forwarding. A stock rootfs or sleeping process is insufficient.
 
@@ -77,4 +75,4 @@ Native OverlayNet supplies VM outbound networking; OpenSandbox network-policy re
 
 ## Evidence scope {#validation}
 
-Source tests cover fake-runtime admission/lifecycle/restart/TTL, HTTP auth/schemas/filtering/endpoints and pure runtime parsing/argv. They do not establish native isolation, SDK end-to-end compatibility or density gains. No build, test, native sandbox or benchmark was run for this documentation change. Prior distributed Cluster gates and measurements do not validate this daemon.
+Source tests cover fake-runtime admission/lifecycle/restart/TTL, HTTP auth/schemas/filtering/endpoints and pure runtime parsing/argv. They do not establish native isolation, SDK end-to-end compatibility or density gains. No build, test, native sandbox or benchmark validates the current daemon. Prior distributed Cluster gates and measurements do not validate this daemon.

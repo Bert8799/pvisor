@@ -1,32 +1,26 @@
-# What does network policy add compared with ordinary OCI?
-
-## Main conclusions {#conclusions}
-
-**For eight-thread local HTTP small requests, native, pVisor host proxy and VM median request times are about 0.69, 10.09 and 2.10 ms. A 32 MiB VM transfer takes about 193.62 ms. Host-proxy small-request cost warrants attention; local measurements do not establish public model-response latency.**
-
-| Need | Selection implication |
-|---|---|
-| Frequent local small requests | Host proxy adds noticeable waiting; check your request rate |
-| Dependency downloads inside a VM | Budget transmission separately from environment startup |
-| Blocking direct TCP connections | Host/VM deny-all positive and negative controls are tested; latency is not isolation evidence |
-
-<!-- measurement-status:start -->
-
-The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
-
-<!-- measurement-status:end -->
+# How much latency does network control add?
 
 ## Motivation {#motivation}
 
-Agents request models, download dependencies and consume streams. These workloads respond differently to proxy overhead. Separate request latency, first byte, full transmission and startup to understand the waiting involved.
+Agents request models, download dependencies and consume streams, and each workload reacts differently to proxy overhead. Separate request latency, first byte, full transmission and startup to see where waiting comes from. Budget host-proxy latency for frequent local small requests, and transmission separately from startup for downloads inside a VM.
+
+Eight-thread local HTTP small requests take 0.69 ms natively, 10.09 ms through the pVisor host proxy and 2.10 ms in a VM; a 32 MiB VM transfer takes about 193.62 ms. Local measurements do not establish public model-response latency, and blocking direct TCP connections is an isolation result rather than a latency figure.
+
+<!-- measurement-status:start -->
+
+These numbers and conclusions remain the original historical cohorts; the new framework has no matching rerun. See [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
 
 ## Experiment design {#interpretation}
+
+Measure per-request time for small requests, and time to first byte plus full transfer for bulk transfers, as request latency. That latency is what an Agent pays on every call; lower latency fits more model turns or downloads into the same time.
 
 Linux/x86_64, one local HTTP origin on the same host, without Internet, TLS or DNS. Compare native, pVisor host proxy, VM auto TCP, Podman host network and pVisor OCI proxy. Every payload uses two fixed CPUs (host 0/1, two VM vCPU); memory is not identically capped and the HTTP origin sits outside the payload budget. This is not a resource-density ranking.
 
 Small requests use 256 fresh TCP connections per batch, eight threads and 1 KiB responses. Take the median within each batch, then summarize 30 independent batches; 7,680 correlated requests are not independent samples. Bulk sends 32 MiB per batch in 1 KiB writes. Stream sends ten 13-byte events, 2 ms apart. First byte means the first HTTP body byte, not model TTFT. Transfer time includes connection and reading, excluding later digest validation; worker total time includes validation.
 
-Three warmups and 30 formal batches per condition; 17 conditions are randomized within each round. Full content length/SHA-256, CPU affinity, retained command output and Run boundaries must pass. Host/VM deny-all independently test direct-socket rejection and Bundle enforcement evidence. Failed batches cannot contribute latency; all slow valid samples remain without retrospective exclusions. P95 is descriptive only, with no P99.
+Three warmups and 30 formal batches per condition; 17 conditions are randomized within each round. Full content length/SHA-256, CPU affinity, retained command output and Run boundaries must pass. Host/VM deny-all independently test direct-socket rejection and Bundle enforcement evidence. Failed batches cannot contribute latency; all slow valid samples remain without retrospective exclusions.
 
 ## Data and analysis {#results}
 
@@ -66,6 +60,6 @@ Podman host network supplies an ordinary OCI control. pVisor OCI additionally us
 
 ### Sources and reproduction {#run}
 
-[Comparison method](methodology.md) · [Runner manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[Comparison method](index.md#interpretation) · [Runner manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
 
 Complete CSV/JSON, raw reports, response timings, command logs, input/build receipts and per-invocation output audits remain in their local cohorts or the documentation data archive.

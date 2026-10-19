@@ -4,7 +4,7 @@ pVisor 是 Operation 的处理核心：接收操作请求，根据策略决定�
 
 这条主线分成两个职责：**core 提供定义，pvisor 提供实现。** 外部调用方提交执行请求，通过运行句柄控制一次执行，通过 Event 观察它的过程和结果。
 
-![以 pvisor-vm 为中心的技术架构：CPU、内存、设备、一致性冻结与 KVM/HVF 适配](assets/pvisor-architecture.svg)
+总体框图与一次任务的端到端走读见[设计与底层原理](index.md)。下列合同覆盖 crate 所有权、API 边界与宿主权限路径。
 
 ## 定义与实现
 
@@ -20,10 +20,11 @@ pVisor 是 Operation 的处理核心：接收操作请求，根据策略决定�
 | `pvisor-gateway` | 可选的模型协议路由、转换和调用观察 |
 | `pvisor-daemon` | 独立的单节点 sandbox 准入、持久归属、原生 VM supervisor 生命周期与端点代理 |
 | `pvisor-cli` | CLI、TUI、cache/replay 前端与 Host Job 应用适配；消费 runtime |
+| `pvisor-shim` | containerd Runtime v2 shim（`io.containerd.pvisor.v2`）；宿主进程路径的任务生命周期、exec 与 FIFO/PTY IO |
 | `pvisor-vm` | VM、设备、冻结、snapshot 与 RAM 映射；统一 api、私有平台实现 |
 | `pvisor-replay` | Agent 轨迹回放机制；消费 Core/Journal 合同，前端位于 CLI |
 
-[Daemon](daemon/index.md) 使用 VM-only NativeRuntime：独立 supervisor 嵌入 `PVisor::run`，跨 daemon 重启保留 RunHandle。可执行入口通过原生 CLI 设置构造 NativeRuntime；stage/apply、checkpoint/fork 和 Gateway API 未实现，也不自动获取 node 共享。见[职责收敛](daemon/responsibility-convergence.md)。主机选择和工作流属于外部编排。
+[Daemon](daemon/index.md) 使用 VM-only NativeRuntime：独立 supervisor 嵌入 `PVisor::run`，跨 daemon 重启保留 RunHandle。可执行入口通过原生 CLI 设置构造 NativeRuntime；stage/apply、checkpoint/fork 和 Gateway API 未实现，也不自动获取 node 共享。主机选择和工作流属于外部编排。
 
 core 不拥有执行循环，也不启动进程或打开控制 socket。pvisor 实现 AgentCtl 客户端／服务端和审批 socket；驱动实现各自的文件、网络与隔离边界。默认核心不依赖 Gateway、TUI 或 replay，捕获通过 `gateway` feature 启用。
 
@@ -44,7 +45,7 @@ crate 的逻辑职责和 Rust 可见性需要分别检查。当前只有 `pvisor
 
 迁移按 crate 进行：同时调整该 crate 的调用方、README、公开文档和边界检查，保留外部 API 合同覆盖。尚未迁移的 crate 不应临时套一层全量 re-export 或重复 DTO 来制造一致外观，也不能公开内部模块绕过编译边界。硬件/私有状态检查留在 crate 内；外部调用方只依据所有权、生命周期、失败后状态和同步合同。
 
-这套 Rust 边界不自动提供稳定线上协议或旧记录兼容性。CLI 的 `JobCommand`/ticket 仍要求精确构建匹配，磁盘格式也有独立 reader。版本对应关系见[记录与版本矩阵](records-and-versions.md)，VM 边界的背景见[ADR 0005](decisions/0005-rust-vm-api.md)。状态依据 `lib.rs`、VM 的 `runtime_modules.rs`、各 `api.rs` 与目录 README 静态核对；不代表本次重新运行了契约测试或平台验证。
+这套 Rust 边界不自动提供稳定线上协议或旧记录兼容性。CLI 的 `JobCommand`/ticket 仍要求精确构建匹配，磁盘格式也有独立 reader。版本对应关系见[记录与版本矩阵](records-and-versions.md)。状态依据 `lib.rs`、VM 的 `runtime_modules.rs`、各 `api.rs` 与目录 README 静态核对；不代表本次重新运行了契约测试或平台验证。
 
 ## Host 与 Guest AgentCtl {#host-agentctl}
 
@@ -145,9 +146,7 @@ Host AgentCtl 路径尚无真实 VM TUI 端到端验证。现有传输、进程�
 
 ## 一条生产执行路径
 
-![一次执行的准备、事实提交、派发、清理与结果时序](assets/execution-sequence.svg)
-
-准备驱动会建立真实的文件与网络资源，执行器派发才让工作负载开始运行。把这两个步骤分开，可以在必要启动事实提交失败时阻止派发，同时由 Session 收回已经准备的资源。结束时同样先收敛资源和观察，再公布终态；调用方取消等待不等于这些动作已经完成。
+准备、事实提交、派发、清理与终态的完整时序见[设计与底层原理](index.md#execution)的走读。下面是所有权视角的三条合同。
 
 `RunSpec` 是调用方的执行配置输入；`Operation` 是结构化的操作描述。目前唯一生产操作是 `run.execute`，包含程序、参数和工作目录。执行器实际消费有效 RunSpec 及准备好的驱动附件。`PVisor::resolve_operation` 使用同一准入路径，供启动前审查，不能代替实际执行及安装证据。
 
@@ -166,8 +165,6 @@ Process／VM 清理其受管理的进程组；容器使用 runtime 的终止接�
 ## Event 是观察接口
 
 外部观察的是 Event，不需要依赖 Session 的内部字段。事件链、身份、因果引用与记录边界见 [Operation 与 Event](operations-events.md)。
-
-当前实现先准备驱动，再提交启动事实，最后调用执行器。必要启动事实提交失败会阻止执行器派发并清理准备资源；准备阶段仍可能产生文件或 socket 副作用。
 
 ## 策略、控制与证据
 

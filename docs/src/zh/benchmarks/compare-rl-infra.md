@@ -1,27 +1,20 @@
-# pVisor 能降低强化学习 rollout 的哪些成本？
-
-## 主要结论 {#conclusions}
-
-**对于本机工具密集型尝试，stage 的实测修复成本更低、通过验证的活跃容量高于 pVisor VM；需要独立 guest 内核时选择 VM。前缀准备和镜像按需读取分别覆盖其他 rollout 成本，尚无训练吞吐、成功率或 reward 提升的证据。**
-
-| 场景 | 选型含义 |
-|---|---|
-| 大量短仓库任务 | 评估 stage 的改动保留与活跃容量；其边界是宿主进程 |
-| 每次尝试需要独立 guest 内核 | 即使启动等待短，也要预算 VM 工具成本与较低的实测容量 |
-| 历史上下文或未缓存镜像 | 在已测范围内评估前缀准备或按需读取 |
-| 已有 RL 栈 | 保留任务、模型和训练层；专用集成仍未验证 |
-
-<!-- measurement-status:start -->
-
-本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
-
-<!-- measurement-status:end -->
+# pVisor 能降低 rollout 的哪些成本？
 
 ## Motivation {#motivation}
 
-一次 rollout 创建环境，交替进行模型推理与工具调用，执行验证、赋予 reward，再保留或拒绝样本。失败尝试可能需要准备上下文、恢复环境并重新执行。选择 executor 时，需要分别预算这些阶段，并保留任务要求的执行边界。
+判断 rollout executor，要看整次尝试：创建环境、模型与工具交替、验证、赋 reward 和重试。本机工具密集型尝试中，stage 的实测修复成本更低、已测活跃容量更高，代价是宿主进程边界；需要独立 guest 内核时选 VM。任务、模型和训练层保持现有实现，专用集成按未验证看待。
+
+在两核、2 GiB 共同预算下，stage 在 32 路完成 160/160 个任务，VM 在 32 路完成 138/160、在 16 路完成 80/80。固定修复任务 stage 为 0.64 s，VM 为 3.25 s。前缀准备每种格式 6.07–6.59 ms；冷启动的 lazy shell 读取 2.58 MB 内容，完整 OCI 镜像为 41.84 MB。这些都没有训练吞吐、成功率或 reward 的实测提升。
+
+<!-- measurement-status:start -->
+
+这些数值与结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
 
 ## 实验设计 {#interpretation}
+
+测量活跃任务容量、工具与修复成本、前缀准备成本，作为一次 rollout 尝试的三个阶段。容量决定同时能跑多少尝试，成本决定每次尝试消耗多少；容量越高、成本越低，同样的基础设施承载的尝试越多。
 
 场景分析复用已登记的本机 Linux/x86_64 实验，不新增测量。所属主题定义制品、校验与控制条件：
 
@@ -66,4 +59,4 @@ Lazy 冷客户端 Ready 排除镜像服务首次准备；镜像已缓存时，Do
 
 各主题的完整 CSV/JSON、制品摘要、控制条件与原始记录保存在对应本地批次或文档数据归档，保留来源与统计口径。
 
-[比较方法](methodology.md) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[比较方法](index.md#interpretation) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

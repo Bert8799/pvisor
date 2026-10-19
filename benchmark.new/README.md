@@ -142,7 +142,7 @@ python3 benchmark.new/docs.py check
 python3 benchmark.new/docs.py publish "$batch"
 ```
 
-`python3 benchmark.new/measurement_coverage.py` 更新 14 个用户页的复测范围清单。没有匹配负载的页面保留历史数字并明确标识。
+`python3 benchmark.new/measurement_coverage.py` 更新 `docs.json` 登记的中英文 benchmark 用户页的复测范围清单。没有匹配负载的页面保留历史数字并明确标识。
 
 `check` 检查文章覆盖、动态 JSON 引用、表结构、未执行命令与 CSV 来源。
 公开的新表还必须逐格等于各条件最新 CSV 的展示值，样本数和计时范围不匹配会阻止构建。
@@ -150,8 +150,8 @@ python3 benchmark.new/docs.py publish "$batch"
 仅向共享位置发布白名单内的完整精度 CSV，更新构建所需展示 JSON 与必要用户实验的 provenance，原 MD 无需改写。
 必要 provenance 摘要统一保存在 `docs/overrides/assets/benchmarks/`，中英文共用一份；
 保留批次、计时口径、运行配置、输入/二进制与证据摘要。完整 manifest、逐文件 harness
-清单、宿主路径和软件包收据留在批次 `.data/`。启动仅发布文档引用的 Ready / Exit
-两张 JSON 表，单行复测保留其他条件的来源配置。
+清单、宿主路径和软件包收据留在批次 `.data/`。启动页引用 Ready JSON 表；完整
+Ready / Exit 指标保留在统计 CSV 中，单行复测保留其他条件的来源配置。
 发布器验证 `metric_scope` 与绑定声明的负载配置；中位数与标准差同一行，批次名称放在来源记录，不挤入数值表。
 没有 live binding 的条件会拒绝发布；工程 A/B 不写入用户表。filesystem 的历史 hyperfine 结果
 保留在本地归档，其用户表、下载和发布绑定已删除；新 Python 时钟数据需单独登记文档表，必要公开 CSV 按白名单发布。改变历史表数据时需同步
@@ -182,3 +182,11 @@ python3 benchmark.new/docs.py publish "$batch"
 
 亲和性在准备与 semspec 外层设置，manifest 记录实际选择；被测命令没有 Python 或
 `taskset` 包裹。所有适配器按独立条件采样，不声称随机配对改善比例。
+
+## 公开图表清理
+
+`docs.py check` 拒绝未被文章、展示表或主题引用的公开 SVG。新增图表先在对应文章中引用；
+`filesystem/publish_io_curves.py` 只发布当前引用的图，完整图表仍在批次 publication 中归档。
+2026-10-18 撤下的无引用 SVG 原字节保存在 `.data/docs-assets-cleanup-20261018/`，
+可提交的路径、大小和 SHA-256 索引见 [清理清单](evidence/docs-assets-cleanup-20261018.json)。
+清单只覆盖这次公开图表清理，不表示其他历史原始批次已在当前 checkout 核验或完整保留。

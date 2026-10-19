@@ -1,26 +1,20 @@
-# Which execution modes block host access outside the workspace?
-
-## Main conclusions {#conclusions}
-
-**In the tested Linux configurations, pVisor staged, safe and VM allow inside-view operations, block the listed outside host accesses and retain workspace writes in stage across 3/3 checks each. pVisor OCI and Podman also block outside access, but their authorized writable workspace mounts modify host files directly. Host allows the listed host accesses.**
-
-| Need | Selection implication |
-|---|---|
-| Review execution results and merge selected workspace changes | Choose a validated staged, safe or VM configuration |
-| Use an OCI writable workspace mount | Writes reach the host directly; provide review and rollback separately |
-| Allow access to host paths | Tested host keeps host paths visible and is not a workspace file sandbox |
-
-<!-- measurement-status:start -->
-
-The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
-
-<!-- measurement-status:end -->
+# Do executors block writes outside the workspace?
 
 ## Motivation {#motivation}
 
-Choosing an execution mode requires knowing both the accessible paths and where writes land. A successful command alone cannot distinguish a staged write from a host modification. The boundary also determines which performance controls offer comparable semantics.
+Choose an execution mode by both the accessible paths and where writes land. A successful command alone cannot distinguish a staged write from a host modification, and the boundary also determines which performance comparisons share the same semantics.
+
+In the tested Linux configurations, pVisor staged, safe and VM allowed inside-view operations, blocked the listed outside host accesses and kept workspace writes in stage, 3/3 checks each. pVisor OCI and Podman also blocked outside access, but their authorized writable workspace mounts modify host files directly. Host allowed the listed host accesses.
+
+<!-- measurement-status:start -->
+
+These numbers and conclusions remain the original historical cohorts; the new framework has no matching rerun. See [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
 
 ## Experiment design {#interpretation}
+
+Check each execution mode against a fixture with known paths — what is allowed, what is denied, where writes land — as the isolation boundary it actually enforces. The tighter that boundary, the fewer host paths stay reachable or modifiable.
 
 Seven configurations each run three fresh fixtures. A fixed seed shuffles configurations in each repetition, giving 21 attempts. Native and host provide host-accessible controls. Podman uses private overlay storage and a writable workspace mount; pVisor OCI uses crun and an explicit writable mount. VM and OCI use the same prepared Python/Git rootfs.
 
@@ -54,4 +48,4 @@ Mount grants, rootfs and configuration determine the boundary; other configurati
 
 Complete CSV/JSON and raw records remain in their local cohorts or the documentation data archive.
 
-[Comparison method](methodology.md) · [Runner manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[Comparison method](index.md#interpretation) · [Runner manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

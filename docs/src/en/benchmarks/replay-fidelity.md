@@ -1,26 +1,14 @@
-# Can recorded trajectories prepare a faithful execution starting point?
-
-## Main conclusions {#conclusions}
-
-**In the new framework, each of seven adapters passes 60/60 checks for fixed task 0, with whole prepare-only CLI medians of 5.56–5.74 ms. No tools execute and workspaces remain unchanged. Historical clusters across twenty trajectories use a different input cohort and retain their original scope; consistency of real model continuation remains unmeasured.**
-
-| Need | Selection implication |
-|---|---|
-| Prepare historical tool context across Agents | Use the validated pinned-format adapters |
-| Restore actual file state | Restore the task environment separately; prefix preparation does not replay file changes |
-| Compare native resume or RL pipeline speed | No matched-trajectory timing control is available for a ranking |
-
-<!-- measurement-status:start -->
-
-New experiments and historical data are published separately. Each table retains its timing scope and inputs from the design and provenance; distinct cohorts are not pooled.
-
-<!-- measurement-status:end -->
+# Can a recorded trajectory start a new run?
 
 ## Motivation {#motivation}
 
-Training and reproduction need tasks to continue at an accurate historical boundary. Missing tool observations or including a future action changes the model's context; executing tools during preparation may introduce additional side effects. These properties determine whether recorded trajectories provide reliable task inputs.
+Training and reproduction need a task to continue from an accurate historical boundary. Missing tool observations or including a future action changes the model's context, and executing tools during preparation may add side effects. Use the validated pinned-format adapters to prepare context, restore file state separately, and do not rank native resume or RL pipeline speed from these numbers.
+
+Each of seven adapters passes 60/60 checks for fixed task 0, with whole prepare-only CLI medians of 5.56–5.74 ms; no tools run and workspaces stay unchanged. Historical clusters across twenty trajectories use a different input cohort and keep their original scope, and consistency of real model continuation remains unmeasured.
 
 ## Experiment design {#interpretation}
+
+Check whether each adapter reconstructs the recorded boundary exactly — digests, arguments, observations, no tool execution — as replay fidelity. Fidelity decides whether a recorded trajectory can serve as a real task input; higher fidelity carries more of the original context into the new run.
 
 Each adapter receives twenty synthetic native-format trajectories, each with two tool batches, using `after-step=1` and `prepare-only`. Three repetitions shuffle adapter/task order with a fixed seed, giving 420 attempts. The table pins format profiles separately from installed Agent CLI versions.
 
@@ -32,7 +20,7 @@ Native Agent resume and RL pipeline prefix preparation are relevant alternatives
 
 ## Data and analysis {#results}
 
-Measured on 2026-10-06. N=60 per adapter, all passing; units are ms. Separated clusters have their own shares and medians. P95 describes the entire adapter distribution as an observation reference, with no stable tail-latency claim.
+Measured on 2026-10-06. N=60 per adapter, all passing; units are ms. Separated clusters have their own shares and medians.
 
 | Adapter | Pinned format profile | Passed / planned (failed) | Lower cluster: share; median ms | Higher cluster: share; median ms | Reference P95 ms |
 |---|---|---:|---|---|---:|
@@ -62,4 +50,4 @@ These results support structure, argument and observation fidelity for pinned sh
 
 Complete CSV/JSON and raw records remain in their local cohorts or the documentation data archive.
 
-[Comparison method](methodology.md) · [Runner manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[Comparison method](index.md#interpretation) · [Runner manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

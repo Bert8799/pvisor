@@ -1,39 +1,26 @@
-# How long do filesystem tasks take in each execution mode?
+# How long do file-heavy tasks take?
 
-## Main conclusions {#conclusions}
+## Motivation {#motivation}
 
-**On the measured inspection and build tasks, pVisor host approaches direct-execution levels; when VM isolation is needed, writeback shortens the wait for batch artifact writes.**
+An agent inspects repositories, searches, builds incrementally and publishes artifacts, so file reads and writes dominate these tasks. Choosing between host, staged, container and VM is a trade-off between isolation needs and waiting, and the decision needs complete task time rather than startup alone.
 
-- **Writeback benefits depend on task shape.** The extraction/publication task with batch artifact writes shortens clearly; the read- and metadata-heavy repository inspection takes nearly the same time under both VM configurations, with no observed benefit.
-- **Synchronized writes are the main extra cost.** With synchronization after every write, writeback is slower and the default VM configuration is preferable; dense small writes that allow buffered merging are clearly shorter with writeback.
-- **Large working sets hit a completion limit.** For sustained writes at a 640 MiB working set, both pVisor VM configurations in this cohort timed out; other sizes require separate measurement.
-
-Results come from a local exploratory cohort of three independent environments. Applicability conditions are in [experiment design](#interpretation); per-configuration numbers are in [data and analysis](#results).
-
-## Motivation: what to answer before choosing an execution mode {#motivation}
-
-An agent's repository inspection, search, incremental builds and artifact publication repeatedly read and write files. Choosing an execution mode for these tasks — host, staged, container or VM — is a trade-off between isolation needs and waiting. Selection requires three answers: how long startup takes, how long a task takes from execution to artifacts on disk, and whether tasks still finish as the working set grows or concurrency increases.
+On the measured tasks, pVisor host approaches direct execution, and guest writeback shortens batch artifact writes when VM isolation is required. Writeback helps only when writes can merge before synchronization: extraction and publication shorten clearly, while read- and metadata-heavy inspection shows no benefit, and synchronizing after every 4 KiB write makes writeback slower than the default VM. At a 640 MiB working set, both VM configurations timed out in this cohort.
 
 ## Experiment design {#interpretation}
 
-### What is compared? {#comparison-design}
+Measure the time to finish a complete task — repository inspection, incremental build or artifact publication — as complete-task time. That time is what a file-heavy task costs in the chosen mode; shorter time means more tasks finish in the same budget.
 
-On the same machine, compare direct execution (Native), pVisor host, staged file changes, default pVisor VM, pVisor VM with guest writeback, Docker, Firecracker, QEMU q35 and QEMU microvm. Every configuration uses the same inputs, programs and tools, measuring the cost of its complete storage path separately. Container images and VM disks are prepared beforehand.
+Nine configurations on one machine — native, pVisor host, staged, default VM, VM with guest writeback, Docker, Firecracker, QEMU q35 and QEMU microvm — use the same inputs, programs and tools. Images and VM disks are prepared beforehand.
 
-| Workloads | What is measured | Question answered |
+| Workloads | Coverage | Question answered |
 | --- | --- | --- |
 | 3 complete tasks | Repository inspection/search; edit, incrementally compile and run; offline extraction, artifact generation and synchronized publication | Do caching and writeback benefits reach real workflows? |
 | 12 basic operations | File queries, directory traversal, repeated reads, writes of different sizes, small files, per-write synchronization, mixed reads/writes, creation and deletion | Which access patterns benefit, and which retain extra waiting? |
 | 4 resource combinations | 128 or 640 MiB working sets, 1 or 4 concurrent writers; fixed 1 GiB written per round | Do tasks finish as working sets or concurrency grow, and how does throughput change? |
 
-### Measurement method {#measurement}
+Each workload/configuration uses three fresh environments in randomized order, three rounds each, on Linux x86_64 / Ryzen 7 9700X / Btrfs. The process tree shares two CPUs and 2 GiB with swap disabled; VMs use 2 vCPU / 512 MiB. Host caches stay warm, and the median is taken across three environments, not nine independent samples.
 
-- **Resources and cache:** Linux x86_64, Ryzen 7 9700X, Btrfs; experiment processes and private background services share a two-CPU, 2 GiB memory budget with swap disabled. VMs use 2 vCPU and 512 MiB memory. Host page caches are retained, and later rounds reuse environment state and validation-warmed pages. Containers and VMs have different cache and memory-limit scopes.
-- **Sampling:** Each workload/configuration uses three fresh environments in randomized mode order, with three consecutive rounds per environment. Sum the rounds first, then report the median and range across three independent environments. The nine rounds are not nine independent samples, and no overall score is calculated.
-- **Timing:** Ready runs only from executor launch to the common test program becoming ready, excluding tasks, exit and cleanup. Task completion includes actual work and final file/directory synchronization. Preparation, additional full validation and exit are recorded separately.
-- **Validation and failures:** Check round outputs, final file content, compiled artifacts and workspace isolation. Each environment has a 90-second limit. After the first failure in a configuration/case, remaining planned observations are marked unexecuted; failures are not zero-filled and valid slow samples are retained. There is no external-interference gate. Cells with fewer than three valid environments receive no median.
-
-These are exploratory measurements from three environments, applicable to local tasks with prepared environments. Initial image acquisition, cold disks, reliable tails, network proxying and larger-scale concurrency require separate measurements. Kernels, filesystems and cache boundaries differ, so results describe complete configurations. See [reproduction configurations](#configuration-details) for storage paths and switches.
+Task completion includes the work and final synchronization; Ready stops at test-program readiness and excludes tasks, exit and cleanup. Every environment has a 90-second limit; outputs, final contents and isolation are checked, and after a first failure the remaining planned observations are marked unexecuted. Initial image acquisition, cold disks, tail latency and larger concurrency need separate measurements.
 
 ## Data and analysis {#results}
 
@@ -153,13 +140,12 @@ Each round writes **1 GiB**, varying only the **128/640 MiB** working set and **
 | QEMU q35 | 2.566 | 1.685 |
 | QEMU microvm | 2.605 | 2.414 |
 
-At 128 MiB, the writeback VM sits in the same range as the container and reference-VM configurations, while the default VM's continuous synchronized writes cost clearly more; four writers share the fixed 1 GiB per round, so summed completion is correspondingly shorter. At a 640 MiB working set, both default and writeback-enabled pVisor VMs have two cells that do not finish within 90 seconds; all four cells lack complete N=3 results. Timeouts are neither zero throughput nor ordinary durations.
+At 128 MiB, the writeback VM sits in the same range as the container and reference-VM configurations, while the default VM's continuous synchronized writes cost clearly more. Four writers share the fixed 1 GiB per round, so summed completion is correspondingly shorter. At a 640 MiB working set, both default and writeback-enabled pVisor VMs have two cells that do not finish within 90 seconds; all four cells lack complete N=3 results. Timeouts are neither zero throughput nor ordinary durations.
 
 <details markdown="1">
 <summary>Working-set/concurrency curves and failure details</summary>
 
 ![Completed throughput and final-sync share at four resource anchors](../../../overrides/assets/benchmarks/filesystem-layered-references/resource-workers.svg)
-
 
 Each round fixes logical writes at 1 GiB, four files and 4 KiB requests, varying only the 128/640 MiB working set and 1/4 workers. Throughput uses completed time; points represent independent environments. Missing points identify cells without complete N=3 results, not zero throughput. Working-set changes also affect retained data and final synchronization costs; four points cannot locate a capacity knee.
 
@@ -253,4 +239,4 @@ The former seven-tool N=5 Ready/resident statistics and provenance, the historic
 
 In the complete local statistics, write_ops/read_ops count explicit logical workload operations, not guest→host requests or all I/O inside child tools.
 
-2026-10-17, an independent user-configuration cohort. Complete CSV/JSON, raw records, frozen entry points and tool/firmware receipts remain locally in `benchmark.new/filesystem/.data/user-layered-references-v2-20261017/`. [Reproduction steps](https://github.com/DeepLink-org/pvisor/blob/main/benchmark.new/filesystem/README.md#user-workloads). The separate [cache and asynchronous-write engineering analysis](../design/filesystem-io-performance-analysis.md) explains implementation switches and request counts; it does not fill gaps in the user comparison.
+2026-10-17, an independent user-configuration cohort. Complete CSV/JSON, raw records, frozen entry points and tool/firmware receipts remain locally in `benchmark.new/filesystem/.data/user-layered-references-v2-20261017/`. [Reproduction steps](https://github.com/DeepLink-org/pvisor/blob/main/benchmark.new/filesystem/README.md#user-workloads). The separate [cache and asynchronous-write engineering analysis](../lab-notes/filesystem-io-performance-analysis.md) explains implementation switches and request counts; it does not fill gaps in the user comparison.

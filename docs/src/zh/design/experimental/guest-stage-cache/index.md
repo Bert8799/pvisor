@@ -1,4 +1,4 @@
-# EXP-002（设计阶段）：Guest 内核文件系统缓存与延迟后端绑定
+# Guest 内核文件系统缓存与延迟后端绑定（EXP-002）
 
 让 guest 内核使用版本明确的文件系统视图，直接完成缓存命中的路径查询、属性查询和普通只读 open；在数据缺失、stage 修改或持久化时调用 VMM。宿主继续持有 stage、基线观察、访问策略、review/apply 与恢复的权威状态。
 
@@ -29,7 +29,7 @@
 
 因此，需要判断哪些请求可以在 guest 内核依据稳定视图完成，把不可变 lower 的元数据和受协议管理的 stage 状态交给 guest，同时保留宿主的修改、授权和持久化职责。目录扫描、open/fstat/close 和混合 stage 视图分别对应元数据供给、打开生命周期和缓存一致性三个问题。
 
-现有[写合并对照](../../filesystem-performance-analysis.md#writeback-ab)支持关闭写合并后该写入负载改善，完整任务仍未检出加速。缓存方案针对元数据与打开路径的结构性成本，其端到端收益需要独立实验；写回、copy-up 和持久化成本仍需各自定位。
+现有[写合并对照](../../../lab-notes/filesystem-performance-analysis.md#writeback-ab)支持关闭写合并后该写入负载改善，完整任务仍未检出加速。缓存方案针对元数据与打开路径的结构性成本，其端到端收益需要独立实验；写回、copy-up 和持久化成本仍需各自定位。
 
 ### 1.2 当前基础与设计缺口
 
@@ -291,7 +291,7 @@ namespace 修改、普通数据写入和策略变化分别更新相关版本。�
 
 宿主在交付元数据时裁剪不可见路径、受保护别名和对象访问范围；必要的访问模式、ownership、ACL/xattr 输入要完整。原始路径字节保留，symlink 不能使 guest 请求任意宿主路径。对象摘要仅表达内容身份，不能作为跨租户读取权限。
 
-guest 做本地 Linux 权限检查；VMM 对数据和修改请求继续验证宿主认可的授权。会话 token、guest uid 或修改清单不能替代 Host 控制凭据，不能修改宿主权限账本。[Host/Guest 权限分离](../../decisions/0008-host-guest-control-authority.md)
+guest 做本地 Linux 权限检查；VMM 对数据和修改请求继续验证宿主认可的授权。会话 token、guest uid 或修改清单不能替代 Host 控制凭据，不能修改宿主权限账本（Host/Guest 权限分离）。
 
 需要每次宿主回调的动态策略或审计 profile 不进入本地 open 快速路径。策略变化先撤销新缓存准入并协调现存引用；恢复只在权限与引用合同重建后继续。
 

@@ -85,7 +85,7 @@ pvisor-daemon memory-pool --help
 pvisor-cache --help
 ```
 
-为 `pvisor-daemon serve` 添加 `--memory-pool`，启用默认关闭的独立池组件。`pvisor-cache prepare/publish/serve/list/stat/read` 保持独立。Node 运行时协议供原生调用方使用，没有 daemon acquire/release 适配器。NativeRuntime 嵌入 VM 执行；checkpoint/fork 与 stage/apply API 未实现。所有权、安装与部署边界见 [daemon 与缓存入口](../guides/daemon/service.md)。
+为 `pvisor-daemon serve` 添加 `--memory-pool`，启用默认关闭的独立池组件。`pvisor-cache prepare/publish/serve/list/stat/read` 保持独立。Node 运行时协议供原生调用方使用，没有 daemon acquire/release 适配器。NativeRuntime 嵌入 VM 执行；checkpoint/fork 与 stage/apply API 未实现。所有权、安装与部署边界见 [daemon 指南](../guides/daemon/index.md)。
 
 其他未知名称按默认执行规则处理。已退役的 `ctrl` 是明确例外：
 `pvisor ctrl`、`pvisor ctrl --help` 和 `pvisor help ctrl` 在 Job 准入前
@@ -178,26 +178,28 @@ Session 决定写入当前 Job 目录的 `audit-policy.json`，workspace 和 use
 代理网络审计属于协作式边界：未经过代理的直接连接不会触发此弹窗。
 
 ```text
-Jobs:
+Execution:
   run         启动 Job
   status      查看 Job 状态
   kill        终止 Job
-  suspend     保存执行状态并暂停 Job
-  resume      继续暂停的 Job
-  fork        从暂存文件或 VM 执行状态创建分支
-  checkpoint  Create, list, show, delete, verify, import-base, verify-base, gc
 
-
-Filesystems:
-  inspect     只读查看 Job 文件系统
+Changes:
   review      审查暂存变化与执行证据
   apply       接受选定的暂存变化
   drop        丢弃暂存变化
+  inspect     只读查看 Job 文件系统
 
-Extensions:
-  service     原生服务生命周期与已安装的 daemon/cache/memory-pool companion
+Checkpoints:
+  checkpoint  create, list, show, delete, verify, import-base, verify-base, gc
+  suspend     保存执行状态并暂停 Job
+  resume      继续暂停的 Job
+  fork        从暂存文件或 VM 执行状态创建分支
+
+Tools:
   replay      回放 Agent 轨迹（安装后可见）
   tui         交互式 Job 终端（安装后可见）
+  feature     查询编译期特性
+  help        查看命令详细选项
 ```
 
 ## 安全的第一次运行 {#安全的第一次运行}
@@ -345,7 +347,7 @@ HOME 状态改动在 Run 结束后丢弃，不包含在工作区 Run Bundle 中�
 已有容器挂载和文件系统底层仍保留；项目 base、rootfs、executor 不变。
 需要向 Agent 交付凭据时显式使用 `--pass-env`；使用已配置的 Gateway 可由可信侧持有上游 Key。
 
-启动时会打印实际策略及覆盖提醒。必须注意：
+启动时会打印实际策略及覆盖提醒：
 
 - 不使用 `--safe` 时，host/container 选择性代理仍可绕过。
 - 域名规则无法区分同域名下的推理、遥测与上传 API，也无法阻止内容被夹带在模型请求中。
@@ -454,7 +456,9 @@ pvisor replay --agent pi-agent \
 
 Replay 有三种模式。默认回放前缀并继续；`--replay-only` 执行前缀并在模型
 请求前停止；`--prepare-only` 构造前缀，不执行工具、也不要求 runtime。
-`--max-steps` 是包含已回放动作的总动作预算。
+`--max-steps` 是包含已回放动作的总动作预算：`--after-step 30 --max-steps 50`
+最多留下 20 个续跑动作；replay-only 的预算必须覆盖前缀，续跑模式还必须
+至少留下一个实时动作。
 `--allow-stale-observations` 是显式的仅 Claude 逃生口，会把 v3 结果标为
 `degraded`。
 
@@ -462,17 +466,24 @@ Replay 有三种模式。默认回放前缀并继续；`--replay-only` 执行前
 模型推理之前追加一条用户消息。TOML 写法是 `replay.boundary_user_prompt`。
 prepare-only 和 replay-only 模式下它不参与推理；省略该选项则保持未修改的
 replay 边界。结构化结果和 replay journal 只存储注入状态、长度和 digest；
-Agent 原生的 prepared 或 continued 轨迹可以包含这条用户消息。
+Agent 原生的 prepared 或 continued 轨迹可以包含这条用户消息。配置提示词后
+`next-action-comparison.json` 的输入条件为 `boundary_user_prompt_appended`，
+此时文本相似度与工具一致性仅供观察，不能解释为相同输入下的回放一致性。
 
-结果 schema 是 `sandbox-playback.result/v3`，带类型化的 `phase`、`quality`
-和 `agent_status` 字段，以及 state/output 位置、artifacts 和可选结构化失败。
+结果 schema 是 `sandbox-playback.result/v3`：`phase` 为 `prepared`、
+`replayed` 或 `continued`；`quality` 为 `verified` 或 `degraded`；
+`agent_status` 区分 `not_started`、`completed`、`max_steps` 与 `failed`，
+另带 state/output 位置、artifacts 和可选结构化失败。失败结果保留已经生成的
+日志和原生轨迹；即使 OpenHands 进程返回 0，只要控制器报告 fatal 状态，
+结果仍为失败。
 原先只用 `replay_only = true` 来构造前缀的非 Claude 调用方必须迁移到
 `prepare_only = true`。
 
 `disable_thinking` 属于 `[replay]`，也暴露为 `--disable-thinking`。Claude Code
 由协议 bridge 将其应用到上游请求；OpenCode 设置后会省略 `--thinking`。该选项
 不会打开 Gateway capture。可选的 `[run]`、`[overlayfs]` 和 `[overlaynet]` 段会
-创建外层受管 `pvisor run`；它们不改变内部 replay 模型路径。
+创建外层受管 `pvisor run`；它们不改变内部 replay 模型路径。replay 的文件系统
+参数以 `pvisor replay --help` 为准，不能照搬 `run` 的 `--stage/--mount` 写法。
 
 默认情况下，replay 的内部状态、WAL、manifest、新鲜 observation 比较和原生
 工作文件留在 `/tmp/pvisor-sandbox-replay`，并随 sandbox 消失。Replay 不启用
@@ -876,7 +887,7 @@ project/                         # reusable workspace / default base
     ├── lease.lock
     ├── control.sock             # while a live OverlayFS Run is available
     ├── .capture/                # when OverlayNet/Gateway is enabled
-    └── events.jsonl             # when --record-destination is set
+    └── events.trace.jsonl       # when --record-destination is set
 ```
 
 生命周期命令接受 Run id、Run 目录、项目工作区、`run.json`、upper 或 merged
@@ -919,4 +930,6 @@ VM 镜像启动会自动探测默认 socket；服务可用时，将远程镜像�
 完整协议、限制和 SSH 远程访问方式见 [共享镜像缓存协议](shared-image-cache.md)。
 
 
-通过 `pvisor-daemon serve --memory-pool` 启用 daemon 自有实验池；独立 `memory-pool --directory DIR` 组件使用 daemon 准备的私有配置。原生 `pvisor run --vm-memory-pool SOCKET` 仍是带有平台／协议限制的显式运行时选项，不是服务启动器。物理/legacy 池丢失会使依赖 VM 失败；Linux sealed 压缩客户端保留本地恢复，停止新发布，通过 daemon `--memory-pool-mode compressed` 选择。启用与预算见 [daemon 池](../guides/daemon/index.md#memory-pool)；历史 macOS 压缩池结果保留其[版本范围](../design/memory-optimization/proof-of-concept.md#v1-integration)。
+通过 `pvisor-daemon serve --memory-pool` 启用 daemon 自有实验池；独立 `memory-pool --directory DIR` 组件使用 daemon 准备的私有配置。原生 `pvisor run --vm-memory-pool SOCKET` 仍是带有平台／协议限制的显式运行时选项，不是服务启动器。
+
+物理/legacy 池丢失会使依赖 VM 失败；Linux sealed 压缩客户端保留本地恢复，停止新发布，通过 daemon `--memory-pool-mode compressed` 选择。启用与预算见 [daemon 池](../guides/daemon/index.md#memory-pool)；历史 macOS 压缩池结果保留其[版本范围](../design/memory-optimization/proof-of-concept.md#v1-integration)。

@@ -4,7 +4,7 @@ pVisor processes Operations: it accepts requests, decides how to handle and plac
 
 There are two responsibilities: **core provides definitions; pvisor provides implementation.** External callers submit execution requests, control execution through a run handle and observe progress and results through Events.
 
-![Technical architecture centered on pvisor-vm: CPUs, memory, devices, consistent freeze and KVM/HVF adapters](assets/pvisor-architecture.svg)
+For the overall diagram and an end-to-end task walkthrough see [Design and internals](index.md). The contracts below cover crate ownership, API boundaries and the host authority path.
 
 ## Definitions and implementation
 
@@ -20,10 +20,11 @@ There are two responsibilities: **core provides definitions; pvisor provides imp
 | `pvisor-gateway` | Optional model protocol routing, conversion and call observation |
 | `pvisor-daemon` | Separate single-node sandbox admission, durable ownership, native VM supervisor lifecycle and endpoint proxy |
 | `pvisor-cli` | CLI, TUI, cache/replay frontends and Host Job application adapters; consumes the runtime |
+| `pvisor-shim` | containerd Runtime v2 shim (`io.containerd.pvisor.v2`); task lifecycle, exec and FIFO/PTY IO for the host process path |
 | `pvisor-vm` | VMs, devices, freezing, snapshots and RAM mappings; uniform api and private platform implementations |
 | `pvisor-replay` | Agent trajectory replay mechanisms; consumes Core/Journal contracts, with frontends in CLI |
 
-The [daemon](daemon/index.md) uses VM-only NativeRuntime: detached supervisors embed `PVisor::run` and retain RunHandles across daemon restart. The executable constructs NativeRuntime with native CLI settings; stage/apply, checkpoint/fork and Gateway APIs are absent, and node sharing is not automatically acquired. See [responsibility convergence](daemon/responsibility-convergence.md). External orchestration owns host choice and workflows.
+The [daemon](daemon/index.md) uses VM-only NativeRuntime: detached supervisors embed `PVisor::run` and retain RunHandles across daemon restart. The executable constructs NativeRuntime with native CLI settings; stage/apply, checkpoint/fork and Gateway APIs are absent, and node sharing is not automatically acquired. External orchestration owns host choice and workflows.
 
 Core neither owns the execution loop nor starts processes or opens control sockets. pvisor implements AgentCtl clients/servers and approval sockets. Drivers implement file, network and isolation boundaries. The default core does not depend on Gateway, TUI or replay; the `gateway` feature enables capture.
 
@@ -44,7 +45,7 @@ Migrated `api` modules declare public data, fields and trait methods. Opaque own
 
 Migration proceeds one crate at a time, updating its consumers, README, public documentation and boundary checks together while preserving external contract coverage. Unmigrated crates should not gain blanket re-export layers or duplicate DTOs merely to appear uniform, nor expose internals to bypass compilation boundaries. Hardware/private-state checks remain inside the crate; callers rely on ownership, lifecycle, post-failure state and synchronization contracts.
 
-This Rust boundary does not automatically establish stable wire protocols or old-record compatibility. CLI `JobCommand`/tickets still require exact build matching, and stored formats have independent readers. See [Records and version matrix](records-and-versions.md) and the VM rationale in [ADR 0005](decisions/0005-rust-vm-api.md). Status follows static inspection of `lib.rs`, VM `runtime_modules.rs`, `api.rs` and directory READMEs; it does not claim fresh contract-test or platform validation.
+This Rust boundary does not automatically establish stable wire protocols or old-record compatibility. CLI `JobCommand`/tickets still require exact build matching, and stored formats have independent readers. See [Records and version matrix](records-and-versions.md). Status follows static inspection of `lib.rs`, VM `runtime_modules.rs`, `api.rs` and directory READMEs; it does not claim fresh contract-test or platform validation.
 
 ## Host and Guest AgentCtl {#host-agentctl}
 
@@ -166,9 +167,7 @@ full platform behavior; see above for macOS identity and cleanup limits.
 
 ## A production execution path
 
-![Preparation, launch-fact commit, dispatch, cleanup and result ordering](assets/execution-sequence.svg)
-
-Driver preparation creates real file and network resources; executor dispatch starts the workload. Separating these steps lets a failed required launch-fact commit prevent dispatch while the Session reclaims prepared resources. Completion similarly converges resources and observations before terminal publication; cancelling a caller wait does not establish that those actions finished.
+For the full preparation, launch-fact commit, dispatch, cleanup and terminal-publication sequence see the walkthrough in [Design and internals](index.md#execution). The three ownership-level contracts follow.
 
 `RunSpec` is execution configuration supplied by the caller; `Operation` is the structured operation description. The only current production operation is `run.execute`, with program, arguments and working directory. Executors consume the effective RunSpec and prepared driver attachments. `PVisor::resolve_operation` uses the same admission path for pre-launch review; it cannot replace execution or evidence that controls were installed.
 
@@ -187,8 +186,6 @@ Process/VM executors clean up their managed process groups; containers use the r
 ## Event is the observation interface
 
 External callers observe Events without depending on Session's internal fields. See [Operation and Event](operations-events.md) for chains, identities, causal references and recording boundaries.
-
-The implementation prepares drivers, commits startup facts, then calls the executor. Failure to commit required startup facts prevents dispatch and triggers prepared-resource cleanup. Preparation can still have file or socket effects.
 
 ## Policy, controls and evidence
 

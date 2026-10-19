@@ -1,26 +1,20 @@
-# 哪些执行模式能阻止工作区外的宿主访问？
-
-## 主要结论 {#conclusions}
-
-**所测 Linux 配置中，pVisor staged、safe 和 VM 在各自 3/3 次检查中允许视图内操作、阻止所列视图外宿主访问，并把工作区写入保留在 stage。pVisor OCI 和 Podman 也阻止了视图外访问，但授权的可写工作区挂载直接修改宿主文件。host 允许所列宿主访问。**
-
-| 需求 | 选型含义 |
-|---|---|
-| 执行后审查、选择合入工作区改动 | 选择经过验证的 staged、safe 或 VM 配置 |
-| 使用 OCI 可写工作区挂载 | 写入直接落到宿主，需另行提供审查和回滚机制 |
-| 允许访问宿主路径 | 所测 host 保持宿主可见，不能视为工作区文件沙箱 |
-
-<!-- measurement-status:start -->
-
-本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
-
-<!-- measurement-status:end -->
+# 各执行器能挡住工作区外的写入吗？
 
 ## Motivation {#motivation}
 
-选择执行模式时，需要同时知道允许访问什么，以及写入最终落在哪里。只看命令返回成功，会把暂存写入与宿主修改混为一谈。隔离边界也决定了哪些性能对照具有相同语义。
+选择执行模式时，既要看允许访问什么，也要看写入落在哪里。命令返回成功无法区分暂存写入和宿主修改；隔离边界也决定了哪些性能对照具有相同语义。
+
+所测 Linux 配置中，pVisor staged、safe 和 VM 在各自 3/3 次检查中允许视图内操作、阻止所列视图外宿主访问，并把工作区写入保留在 stage。pVisor OCI 和 Podman 也阻止了视图外访问，但授权的可写工作区挂载直接修改宿主文件。host 允许所列宿主访问。
+
+<!-- measurement-status:start -->
+
+这些数值与结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
 
 ## 实验设计 {#interpretation}
+
+测量每个执行模式在路径已知的 fixture 中的边界——哪些访问放行、哪些拒绝、写入最终落在哪里——作为实际隔离边界。实际隔离边界是模式真正执行的那一层；边界越紧，宿主上可达或可改的路径越少。
 
 七种配置各运行三次独立 fixture，每次用固定种子打乱配置顺序，共 21 次。native 与 host 提供宿主可访问的对照；Podman 使用私有 overlay 存储和可写工作区挂载，pVisor OCI 使用 crun 与显式可写挂载；VM 与 OCI 使用同一份预备 Python/Git rootfs。
 
@@ -54,4 +48,4 @@
 
 完整 CSV/JSON 和原始记录保存在对应本地批次或文档数据归档。
 
-[比较方法](methodology.md) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[比较方法](index.md#interpretation) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

@@ -21,6 +21,74 @@ English article at the same relative path under `docs/src/en/`. Chinese defines
 the canonical information architecture; both languages describe the same
 behavior, examples, evidence and known limitations.
 
+## Benchmark pages {#benchmark-pages}
+
+Benchmark articles under `docs/src/{zh,en}/benchmarks/` are user decisions, not
+engineering reports: a reader must be able to choose a mode or size a deployment
+from them. Registration, data and publication rules live in
+[`benchmark/README.md`](../benchmark/README.md#structure). The rules below are the
+failure modes that have actually reached the site; treat them as hard rules.
+
+**Structure**
+
+- Exactly three H2 sections, in this order and with these anchors:
+  `Motivation {#motivation}`, `Experiment design {#interpretation}`,
+  `Data and analysis {#results}`. Never add `Conclusions`, `What is measured`,
+  `How it is measured` or `Limitations` sections.
+- `Motivation` is two paragraphs. The first is a judgement whose first sentence
+  answers the H1. The second is quantitative support only.
+- No tables, lists, batch history, dates or artifact hashes in `Motivation`.
+- Every number in `Motivation` must be traceable to a table, figure or data
+  paragraph on the same page. Rounding to the displayed precision is fine;
+  inventing a new number is not.
+
+**Experiment design**
+
+The first paragraph is a fixed form, never a procedure and never a defence of
+the metric:
+
+1. `Measure X as Y.` Name the quantity and the metric.
+2. `Y is the capability it represents.`
+3. `A lower or higher Y means the reader's outcome.`
+
+Example, from startup latency:
+
+> Measure the interval from launch to the first checked shell output as
+> environment Ready time. That interval is how quickly the system answers a
+> caller: a shorter Ready time means the system handles bursts of large-scale
+> requests better.
+
+- Do not write "this page", "本页", "we", "我们", "note that", or a list of
+  caveats before the metric.
+- The remaining paragraphs describe only the current cohort: environment,
+  controls, sampling, validation, exclusions and what the design cannot answer.
+  Historical cohorts and before/after narratives belong in the data section,
+  and only on a page that is explicitly historical.
+- If a metric does not change a decision, do not report it. Delete its table
+  instead of keeping it for completeness: `startup.md` reports Ready only,
+  because exit time does not change which executor a reader picks.
+
+**Data and analysis**
+
+- Lead with the table or figure that answers the conclusion, then interpret it.
+  Do not restate table cells as prose.
+- Keep historical cohorts in this section, label them, and never pool them with
+  the current cohort.
+- Keep the page within roughly three screens. Move engineering A/B and
+  diagnostic detail to `lab-notes/`.
+
+**Editing rules**
+
+- Change both languages in the same edit, then run
+  `python3 scripts/check-docs.py --record-translations` and
+  `python3 scripts/check-docs.py --require-recorded`.
+- Before removing or renaming an H3/H4, search the repository for its `#anchor`.
+  Anchor churn breaks lab-note links and is not a formatting cleanup.
+- Do not put a benchmark registry ID (`B-*`) or an internal switch name on a
+  user page; link to the topic page or the runner manual instead.
+- Run `python3 benchmark.new/docs.py check` after touching a `{{ table(...) }}`
+  macro, `benchmark.new/docs.json` or a `*.render.json` file.
+
 ```bash
 just docs-serve         # native Chinese preview on 127.0.0.1:3000
 just docs-serve en      # native English preview on 127.0.0.1:3001
@@ -111,9 +179,9 @@ and user-facing protocol pages belong in the site's `reference/` tree, not at th
 ## Information architecture
 
 Value before mechanism, mechanism before implementation. Keep Home as the first
-top-level tab, followed by six sections: Quick start → User guide → Core concepts
-→ Benchmarks → Design and research → Contributing
-(首页 → 快速开始 → 用户指南 → 基础概念 → 基准测试 → 设计与研究 → 参与开发).
+top-level tab, followed by seven sections: Quick start → User guide → Core concepts
+→ Benchmarks → Design and research → Lab notes → Contributing
+(首页 → 快速开始 → 用户指南 → 基础概念 → 基准测试 → 设计与研究 → 实验记录 → 参与开发).
 Quick start includes the product introduction and `why/` articles; User guide
 includes the task learning path and reference pages; Core concepts includes
 Security as a subsection. The homepage remains accessible through its own tab
@@ -124,14 +192,15 @@ subgroups into their parent group; do not add a third sidebar level.
 
 The canonical Chinese documentation uses these sections:
 
-- `why/`: the case for pVisor — vision, supervision-bandwidth argument, trust ladder, use cases, comparisons, when not to use.
-- `start/`: product scope, installation, the first reproducible Job, and where to go next.
+- `why/`: the case for pVisor — the supervision-bandwidth argument, trust ladder with use cases, and fit check with comparisons.
+- `start/`: installation and the first reproducible Job, ending with where to go next.
 - `guides/`: tasks, commands and expected results, grouped by job (`agents/`, `policies/`, `executors/`).
-- `concepts/`: the user mental model — jobs, staging, evidence, policy, glossary.
+- `concepts/`: the user mental model — jobs, staging, evidence and policy layering.
 - `benchmarks/`: reproducible measurements and dated comparisons.
 - `security/`: what is protected, what is not, and how to report issues.
 - `reference/`: CLI, configuration, schemas and platform support matrices.
 - `design/`: implementation ownership, mechanisms, ADRs and research directions.
+- `lab-notes/`: dated engineering experiment logs and historical evidence; conclusions are governed by `benchmarks/` and `design/`, not by these notes.
 - `community/`: contributing, development, testing, release, roadmap and policies.
 
 Experimental feature documents live under `design/experimental/` in both locale
@@ -202,9 +271,10 @@ The native `exclude` plugin excludes `.data/` at every depth, and the generated
 site checker rejects leaked evidence. Zensical publishes the shared theme assets
 in each locale, including images and JSON downloads, so native previews need no
 extra server. JSON fixtures, recording tools and published figures use
-`docs/overrides/assets/` directly. Existing local evidence remains in the real
-`docs/src/assets/benchmarks/.data/` directory, outside the three projects' article
-roots. Do not replace the former tracked `docs/src/assets/` or
+`docs/overrides/assets/` directly. Historical evidence paths include
+`docs/src/assets/benchmarks/.data/`, outside the locale article roots. These local
+archives are not distributed with a checkout; preserve their recorded identities
+without presenting absent files as public downloads. Do not replace the former tracked `docs/src/assets/` or
 `docs/src/stylesheets/` directories with symlinks: Git cannot stage individual
 old-file deletions through a symlink during the migration.
 
@@ -227,7 +297,7 @@ matter or navigation label. Removing `status: todo` does not complete a missing
 field reference, schema, experiment, or policy decision. Keep outstanding items
 explicit and attach the implementation or verification that completes each one.
 Preserve page paths and bilingual parity. Keep both locale navigation trees in
-the Home-plus-six-section order defined above.
+the Home-plus-seven-section order defined above.
 
 ### Writing style
 
@@ -247,7 +317,7 @@ it. The models are the uv, Ruff and Ray docs.
 - Prefer a concrete example over an abstract description; show the command and what it does.
 - State a guarantee once, on the page that owns it, and link from elsewhere. Never open a page with a disclaimer, and never repeat a caveat in every paragraph.
 - No meta text: no “本文/本节/本页”, no “继续阅读”, no first line that restates the heading.
-- Name the mechanism when it matters; keep terms consistent with the glossary.
+- Name the mechanism when it matters; keep terms consistent with the concept page that owns them. The execution-guarantee framework has exactly one naming: **有界 / 可逆 / 可查** (bounded / reversible / checkable) — do not coin variants (可恢复/可核查, 放手/把关/有据, auditable, ...).
 - Tables for options, matrices and comparisons; code fences for anything runnable.
 - Keep article directories in the sidebar. Omit tables that only map topics to
   documentation links, and do not replace them with equivalent link lists.
@@ -260,6 +330,78 @@ it. The models are the uv, Ruff and Ray docs.
   pages own protocol fields, algorithms and platform constraints. Link to a topic
   where its detail becomes relevant instead of duplicating its sections.
 - A page with no data yet says “建设中” and links to its TODO page instead of making an empty claim.
+
+### Page count, placement and conclusions
+
+Five hard rules distilled from the October 2026 restructure (161 → 124 pages).
+They exist because the failure modes below already happened once; do not
+reintroduce them.
+
+1. **Page count follows information content (页数随信息量).** A page shorter
+   than ~30 substantive lines does not stand alone; fold it into its parent.
+   Navigation depth must not exceed content depth. Never split one topic into
+   several pages to make the sidebar look complete.
+2. **One fact, one home (一个事实一个家).** Each assertion lives on exactly
+   one page; every other page states it in one sentence and links. Before
+   adding a paragraph, grep for its key phrase — if it already exists, link,
+   do not restate. The 2026 review found the same three-command workflow on
+   ten pages and the same owner.json paragraph three times verbatim.
+3. **No pages for empty sets (空集合不建页).** No adopters page without
+   adopters, no governance page for a single-maintainer project, no
+   publications page without publications. If the set is empty, say so in one
+   sentence on the parent page. Status honesty beats maturity theater.
+4. **Status determines location (状态决定位置).** Implemented → `design/` or
+   `guides/`. Accepted but unimplemented → `design/experimental/` or an
+   explicit “proposal (not implemented)” banner, kept short. Retired → a
+   tombstone paragraph. Dated experiment batches and engineering logs →
+   `lab-notes/`, never `design/`. A page that describes a target state must
+   say so at the top and point to the current-implementation boundary.
+5. **The conclusion test (结论测试).** The first sentence of a page must
+   answer the question its title asks, with absolute numbers or a direct
+   judgment. Delete circular sentences (“adopt when benefits exceed costs”
+   without a threshold) and self-referential closures that define the product
+   by its own coinage. Benchmark pages follow the fixed pattern: absolute
+   water level in the first sentence → scenario entries → shortcomings floated
+   up.
+
+`scripts/check-docs.py` enforces the mechanical parts in CI (via
+`just docs-build`): bilingual pairing, navigation targets, link/anchor/image
+resolution — and a **duplicate-paragraph gate** that fails the build when the
+same substantive prose paragraph (≥150 chars) appears in two pages. Intentional
+shared boilerplate must use a recognized convention instead of raw repetition:
+blockquote notes, `measurement-status` marker regions, link/pointer lines, or
+an `ALLOWED_DUPLICATES` entry with a written reason.
+
+### Design writing references
+
+Model the explanation of one mechanism on this sequence: problem and constraints →
+minimal system model (who owns state) → the normal path of one real request →
+the failure path → tradeoffs → implementation and evidence entry points. The
+[design overview](src/zh/design/index.md) follows this order through one
+end-to-end task. Each figure answers one reader question: ownership (layered
+diagram), one operation (sequence), data placement (layout/map), crash residue
+(failure states), or cost (sourced measurement). Figure components must have
+corresponding entry points in source or contracts.
+
+Expression references worth studying, by local topic (accessed 2026-10-07; these
+evaluate documentation craft, not project quality):
+
+| Project and article | What to learn |
+| --- | --- |
+| [ByteHook · project overview](https://github.com/bytedance/bhook/blob/main/doc/overview.zh-CN.md) | Derive mechanisms from the necessary underlying model; connect objects and calls with figures |
+| [TigerBeetle · Architecture](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/ARCHITECTURE.md) | Start from workload and constraints before persistence and design decisions |
+| [Firecracker · Design](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md) | Host integration, threads and the device model in one architecture narrative |
+| [gVisor · Architecture guide](https://gvisor.dev/docs/architecture_guide/intro/) | Explain the boundary through one syscall example |
+| [Tokio · Runtime](https://docs.rs/tokio/latest/tokio/runtime/index.html) | Usage model first, then thread lifetimes and scheduling guarantees |
+| [etcd · Client design](https://etcd.io/docs/v3.6/learning/design-client/) | Error and retry semantics for lost ACKs and unknown outcomes |
+| [Ray · Architecture whitepapers](https://docs.ray.io/en/latest/ray-contribute/whitepaper.html) | Keep overview and internal topics in separate layers |
+| [Rust Compiler Development Guide](https://rustc-dev-guide.rust-lang.org/overview.html) | From pipeline to queries, data structures and source entry points |
+| [CockroachDB · Design](https://github.com/cockroachdb/cockroach/blob/master/docs/design.md) | Layered diagrams connecting data abstractions to physical layout |
+
+Diagrams use the site's dark-blue palette: background `#0d1b30`, cards
+`#142840`, accent `#a8cefa`, text `#e9eef8`; teal, amber and dark red mark
+sharing, change and conflict states with text labels. Keep SVG text searchable;
+split long diagrams into per-topic parts.
 
 The native TOML files own navigation. Maintain paired Chinese and English articles.
 Keep only current article paths; do not maintain historical redirect maps or
@@ -397,51 +539,15 @@ To validate a TOML file without launching an executor:
 cargo run --locked -p pvisor --example documentation_config -- run.toml
 ```
 
-### community/adopters.md
-
-Measurements, generated references, or formal decisions still need completion. The acceptance criteria below remain required; the page retains its planned status.
-
-**Acceptance criteria**
-
-- Publish users and scenarios with consent.
-- Distinguish production use from experiments.
-
-### community/code-of-conduct.md
-
-**Requirements**
-
-- Adopt [Contributor Covenant 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/) or an equivalent text;
-- Specify a reporting channel (dedicated email or maintainers), rather than public issues;
-- Describe handling procedures and possible consequences.
-
-**Acceptance criteria**
-
-- Add repository-root `CODE_OF_CONDUCT.md` and keep this page consistent;
-- Ensure that the reporting channel works and is listed on [Community](index.md).
-
 ### community/governance.md
 
-Measurements, generated references, or formal decisions still need completion. The acceptance criteria below remain required; the page retains its planned status.
+The page describes the current single-maintainer process; a formal maintainer list,
+charter and conduct reporting channel are not yet established.
 
 **Acceptance criteria**
 
-- Define the maintainer list, decision process and advancement path.
 - Describe the human role in semspec approval.
-
-### design/decisions/index.md
-
-**Requirements**
-
-- Create an ADR template (context, options, decision, consequences, status) and a numbering convention (`NNNN-short-title.md`).
-- Backfill the existing key decisions, for example:
-    - Admission plans stop at `Planned`; enforcement comes only from executor observations.
-    - Gateway and replay are separated from the core closure as optional features.
-    - `--safe` does not select an executor and refuses to start rather than degrading when it cannot enforce.
-    - The human approval process for semantic specifications.
-
-**Acceptance criteria**
-
-- At least four numbered ADRs with titles/status.
+- Announce the maintainer list, charter and conduct channel on this page once established.
 
 ### design/replay.md
 
@@ -455,46 +561,6 @@ Measurements, generated references, or formal decisions still need completion. T
 
 - Code/test references per adapter.
 - Link replay-fidelity results.
-
-### design/research/cluster-execution.md
-
-**Requirements**
-
-- Metrics: single-node useful-work density and execution/evidence overhead under fixed resource budgets.
-- Controls: native execution and external Kubernetes or Ray orchestration, with pinned versions.
-- Workload: independent sandboxes; cross-node placement, retries and workflows remain external.
-- Environment: one measured node first; any external multi-node experiment has a separately declared scope.
-
-**Acceptance criteria**
-
-- pVisor defines execution semantics without replacing schedulers.
-- Distinguish the daemon's implemented VM-only `NativeRuntime` from proposed integrations; require separate prepared-image and end-to-end SDK validation.
-- Align claims with measured density; Cluster/controller measurements are not evidence for the node-local daemon.
-
-### design/research/publications.md
-
-Measurements, generated references, or formal decisions still need completion. The acceptance criteria below remain required; the page retains its planned status.
-
-**Acceptance criteria**
-
-- Link papers/reports/talks.
-- State implementation revisions.
-- Mark outputs that do not establish product guarantees.
-
-### design/research/rl-execution-substrate.md
-
-**Requirements**
-
-- Metrics: throughput, isolation, reproducibility, fork cost.
-- Controls: RL framework sandboxes.
-- Workload: fixed rollouts, failure replay, checkpoint forks.
-- Environment: pinned model/tools.
-
-**Acceptance criteria**
-
-- Integration and scope.
-- Tested recording, fork, and prefix replay.
-- Separate design from the rollout guide.
 
 ### guides/ci.md
 

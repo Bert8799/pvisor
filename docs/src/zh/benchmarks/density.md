@@ -1,32 +1,26 @@
 # 两核、2 GiB 预算能同时完成多少个工具任务？
 
-## 主要结论 {#conclusions}
+## Motivation {#motivation}
 
-**在两核、2 GiB、禁用 swap 的共同预算下，stage 与 Podman 都在 32 路 Python/Git 任务中通过全部五轮；pVisor VM 在 16 路通过全部五轮，32 路只有三轮全部通过。stage 的空闲探针达到 128 路，Podman 达到 64 路；空闲容量不能代替活跃任务容量。**
+多个 Agent 同时执行时，要看完成了多少任务，而不是创建了多少环境。stage 与 Podman 在本负载下容量相同，按隔离和审查需求二选一；每个任务都要 VM 边界时需要更多预算，空闲容量不能推算活跃容量。
 
-| 需求 | 选型含义 |
-|---|---|
-| 并行修改代码并检查 Git 结果 | stage 与 Podman 的本负载容量相同；按隔离和审查需求选择 |
-| 大量空闲环境 | stage 达到更高的已测并发度；它使用宿主进程边界 |
-| 每个任务需要 VM 边界 | 为 VM 留出更多预算；不要按空闲数规划活跃任务 |
+在两核、2 GiB、禁用 swap 的共同预算下，stage 与 Podman 都在 32 路 Python/Git 任务中通过全部五轮；pVisor VM 在 16 路通过全部五轮，32 路只有三轮。空闲探针 stage 达到 128 路，Podman 达到 64 路。
 
 <!-- measurement-status:start -->
 
-本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+这些数值与结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
 
 <!-- measurement-status:end -->
 
-## Motivation {#motivation}
-
-多个 Agent 同时执行时，成功完成多少任务比创建多少环境更有用。容量规划还要计入运行时、辅助进程、页缓存和 VM backing，不能用单个进程 RSS 或配置内存推算。
-
 ## 实验设计 {#interpretation}
+
+统计在一个固定 cgroup 预算内通过全部校验的任务数，作为有效完成任务量。它衡量系统真正完成的工作；同一预算下完成得越多，有效容量越高。
 
 Linux/x86_64 上比较原生进程、pVisor stage、pVisor VM 和 Podman 5.8.7。每批使用独立 cgroup：共同两核配额、CPU 0/1 亲和性、2 GiB 内存上限、零 swap；协调器、payload 和辅助进程包含在预算内，Podman payload/conmon 的归属经过检查。VM 每个配置 2 vCPU/256 MiB，仍受共同总预算限制。
 
 并发扫描 1、2、4、8、16、32、64、128，每格五个新批次，无预热；每轮随机交替条件。所有任务先到 stdin readiness barrier，再共同释放。空闲组使用同一 Python 环境但不分配数据或改文件；工具组每任务触碰并校验全部 32 MiB 私有数据，在 64 文件 Git 仓库修改四个文件，执行 `git status` 并校验全部文件。stage/VM 的原工作区保持不变，结果与独立 Run 记录匹配。
 
-主指标为整个 cgroup 的物理内存计费，包括已计费页缓存、内核内存和私有 backing。预先准备的共享工具/镜像缓存可能在父 cgroup 计费，因此这不是整机净内存排名。每批都记录失败、未知结果和 OOM；只有全部任务校验通过且没有 OOM 的批次进入内存/耗时摘要，保留所有慢样本。五轮不能建立长期可靠性或尾延迟保证。负载不包含模型推理、大型编译或真实 Agent CLI。
+内存按整个 cgroup 的物理计费统计，包括已计费页缓存、内核内存和私有 backing。预先准备的共享工具/镜像缓存可能在父 cgroup 计费，因此这不是整机净内存排名。每批都记录失败、未知结果和 OOM；只有全部任务校验通过且没有 OOM 的批次进入内存/耗时摘要，保留所有慢样本。五轮只覆盖该负载：不建立长期可靠性与尾延迟保证，也不包含模型推理、大型编译或真实 Agent CLI。
 
 ## 实验数据和分析 {#results}
 
@@ -78,6 +72,6 @@ stage 在空闲 128 路通过五轮，但相同环境加入私有数据和 Git �
 
 ### 来源与复现 {#run}
 
-[比较方法](methodology.md) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[比较方法](index.md#interpretation) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
 
 完整 CSV/JSON 保留每个条件的尝试数、完整批次数、失败原因、未知数、OOM、观察范围和来源摘要，与原始记录一起保存在对应本地批次或文档数据归档；没有将失败批次移出容量统计。

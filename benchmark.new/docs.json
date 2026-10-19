@@ -16,16 +16,6 @@
     },
     {
       "locale": "zh",
-      "page": "benchmarks/cluster-scalability.md",
-      "benchmark_ids": [
-        "B-CLUSTER"
-      ],
-      "role": "user-facing",
-      "tables": [],
-      "source_csv": []
-    },
-    {
-      "locale": "zh",
       "page": "benchmarks/compare-rl-infra.md",
       "benchmark_ids": [
         "B-COMPARE"
@@ -70,7 +60,7 @@
         {
           "json": "benchmarks/measurement-coverage.render.json",
           "kind": "coverage",
-          "rows": 14,
+          "rows": 12,
           "columns": [
             "数据状态",
             "实测范围"
@@ -107,16 +97,6 @@
         "../../../overrides/assets/benchmarks/data/lazy/lazy-stage-summary.csv",
         "../../../overrides/assets/benchmarks/data/lazy/lazy-stage-comparisons.csv"
       ]
-    },
-    {
-      "locale": "zh",
-      "page": "benchmarks/methodology.md",
-      "benchmark_ids": [
-        "B-METHOD"
-      ],
-      "role": "user-facing",
-      "tables": [],
-      "source_csv": []
     },
     {
       "locale": "zh",
@@ -175,20 +155,6 @@
           ],
           "rows": 8,
           "options": {}
-        },
-        {
-          "json": "benchmarks/startup-timing.exit.render.json",
-          "kind": "published",
-          "columns": [
-            "N",
-            "Exit 中位数 ms",
-            "Exit 均值 ms",
-            "Exit 标准差 ms",
-            "Exit 最小 ms",
-            "Exit 最大 ms"
-          ],
-          "rows": 8,
-          "options": {}
         }
       ],
       "source_csv": [
@@ -219,7 +185,7 @@
     },
     {
       "locale": "zh",
-      "page": "design/vm-startup-performance-analysis.md",
+      "page": "lab-notes/vm-startup-performance-analysis.md",
       "benchmark_ids": [
         "B-STARTUP-ENG",
         "B-KERNEL-ENG",
@@ -231,7 +197,7 @@
     },
     {
       "locale": "zh",
-      "page": "design/vm-memory-performance-analysis.md",
+      "page": "lab-notes/vm-memory-performance-analysis.md",
       "benchmark_ids": [
         "B-MEMORY-SCALE",
         "B-MEMORY-DIAG",
@@ -243,7 +209,7 @@
     },
     {
       "locale": "zh",
-      "page": "design/filesystem-performance-analysis.md",
+      "page": "lab-notes/filesystem-performance-analysis.md",
       "benchmark_ids": [
         "B-FS-ENG",
         "B-FS-DIAG"
@@ -254,7 +220,7 @@
     },
     {
       "locale": "zh",
-      "page": "design/filesystem-io-performance-analysis.md",
+      "page": "lab-notes/filesystem-io-performance-analysis.md",
       "benchmark_ids": [
         "B-FS-ENG",
         "B-FS-DIAG"
@@ -265,7 +231,7 @@
     },
     {
       "locale": "zh",
-      "page": "design/agent-task-performance-analysis.md",
+      "page": "lab-notes/agent-task-performance-analysis.md",
       "benchmark_ids": [
         "B-AGENT-TASK"
       ],
@@ -275,27 +241,7 @@
     },
     {
       "locale": "zh",
-      "page": "design/cluster-performance-analysis.md",
-      "benchmark_ids": [
-        "B-CLUSTER"
-      ],
-      "role": "engineering evidence",
-      "tables": [],
-      "source_csv": []
-    },
-    {
-      "locale": "zh",
-      "page": "design/cluster-benchmark-plan.md",
-      "benchmark_ids": [
-        "B-CLUSTER"
-      ],
-      "role": "engineering evidence",
-      "tables": [],
-      "source_csv": []
-    },
-    {
-      "locale": "zh",
-      "page": "design/benchmark-methodology-evidence.md",
+      "page": "lab-notes/benchmark-methodology-evidence.md",
       "benchmark_ids": [
         "B-METHOD"
       ],
@@ -309,16 +255,6 @@
       "benchmark_ids": [
         "B-AGENT-TASK",
         "B-COMPARE"
-      ],
-      "role": "user-facing",
-      "tables": [],
-      "source_csv": []
-    },
-    {
-      "locale": "en",
-      "page": "benchmarks/cluster-scalability.md",
-      "benchmark_ids": [
-        "B-CLUSTER"
       ],
       "role": "user-facing",
       "tables": [],
@@ -370,7 +306,7 @@
         {
           "json": "benchmarks/measurement-coverage.render.json",
           "kind": "coverage",
-          "rows": 14,
+          "rows": 12,
           "columns": [
             "Data status",
             "Measured scope"
@@ -407,16 +343,6 @@
         "../../../overrides/assets/benchmarks/data/lazy/lazy-stage-summary.csv",
         "../../../overrides/assets/benchmarks/data/lazy/lazy-stage-comparisons.csv"
       ]
-    },
-    {
-      "locale": "en",
-      "page": "benchmarks/methodology.md",
-      "benchmark_ids": [
-        "B-METHOD"
-      ],
-      "role": "user-facing",
-      "tables": [],
-      "source_csv": []
     },
     {
       "locale": "en",
@@ -475,20 +401,6 @@
           ],
           "rows": 8,
           "options": {}
-        },
-        {
-          "json": "benchmarks/startup-timing.exit.render.json",
-          "kind": "published",
-          "columns": [
-            "N",
-            "Exit median ms",
-            "Exit mean ms",
-            "Exit SD ms",
-            "Exit min ms",
-            "Exit max ms"
-          ],
-          "rows": 8,
-          "options": {}
         }
       ],
       "source_csv": [
@@ -519,7 +431,7 @@
     },
     {
       "locale": "en",
-      "page": "design/vm-startup-performance-analysis.md",
+      "page": "lab-notes/vm-startup-performance-analysis.md",
       "benchmark_ids": [
         "B-STARTUP-ENG",
         "B-KERNEL-ENG",
@@ -531,7 +443,7 @@
     },
     {
       "locale": "en",
-      "page": "design/vm-memory-performance-analysis.md",
+      "page": "lab-notes/vm-memory-performance-analysis.md",
       "benchmark_ids": [
         "B-MEMORY-SCALE",
         "B-MEMORY-DIAG",
@@ -543,7 +455,7 @@
     },
     {
       "locale": "en",
-      "page": "design/filesystem-performance-analysis.md",
+      "page": "lab-notes/filesystem-performance-analysis.md",
       "benchmark_ids": [
         "B-FS-ENG",
         "B-FS-DIAG"
@@ -554,7 +466,7 @@
     },
     {
       "locale": "en",
-      "page": "design/filesystem-io-performance-analysis.md",
+      "page": "lab-notes/filesystem-io-performance-analysis.md",
       "benchmark_ids": [
         "B-FS-ENG",
         "B-FS-DIAG"
@@ -565,7 +477,7 @@
     },
     {
       "locale": "en",
-      "page": "design/agent-task-performance-analysis.md",
+      "page": "lab-notes/agent-task-performance-analysis.md",
       "benchmark_ids": [
         "B-AGENT-TASK"
       ],
@@ -575,27 +487,7 @@
     },
     {
       "locale": "en",
-      "page": "design/cluster-performance-analysis.md",
-      "benchmark_ids": [
-        "B-CLUSTER"
-      ],
-      "role": "engineering evidence",
-      "tables": [],
-      "source_csv": []
-    },
-    {
-      "locale": "en",
-      "page": "design/cluster-benchmark-plan.md",
-      "benchmark_ids": [
-        "B-CLUSTER"
-      ],
-      "role": "engineering evidence",
-      "tables": [],
-      "source_csv": []
-    },
-    {
-      "locale": "en",
-      "page": "design/benchmark-methodology-evidence.md",
+      "page": "lab-notes/benchmark-methodology-evidence.md",
       "benchmark_ids": [
         "B-METHOD"
       ],

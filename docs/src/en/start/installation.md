@@ -1,9 +1,5 @@
 # Installation
 
-Once `pvisor` is installed, you can run Agent CLIs, scripts, and automation inside a policy boundary and get checkable execution records. The Python package, CLI, and core Rust crate are all named `pvisor`; other crates use `pvisor-*` and environment variables use `PVISOR_*`.
-
-When upgrading, update deployed `PVISOR_*` settings as well. Local state defaults to `.pvisor` and user caches to `pvisor/`; existing data is not migrated automatically.
-
 ## 1. Install the tools
 
 ```bash
@@ -16,7 +12,7 @@ Check the command:
 pvisor --version
 ```
 
-The wheel installs a Python version marker and native CLI scripts directly in the current Python environment's bin directory; no Python launcher is involved. If your project has other Python dependencies, use a virtual environment:
+The wheel installs the native CLI into the current Python environment's bin directory; no Python launcher is involved. If your project has other Python dependencies, use a virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -27,9 +23,11 @@ pip install pvisor
 
 Published wheels target Linux x86_64 and macOS arm64. Check release artifacts or build from source for other architectures.
 
+Upgrading: update deployed `PVISOR_*` settings with the new release. Local state under `.pvisor` and user caches under `pvisor/` are not migrated automatically.
+
 ## 2. Check platform prerequisites
 
-Wheel installation supports macOS and Linux and requires Python 3.10 or newer; the installed native CLI does not use a Python launcher. Ordinary host Jobs write directly to the workspace; only `--safe` or `--stage` uses filesystem staging. Install macFUSE before running a staged host Job on macOS:
+Wheel installation supports macOS and Linux and requires Python 3.10 or newer. Ordinary host Jobs write directly to the workspace; only `--safe` or `--stage` uses filesystem staging. Install macFUSE before running a staged host Job on macOS:
 
 ```bash
 brew install --cask macfuse
@@ -59,7 +57,7 @@ Or build the CLI from source:
 just install-cli
 ```
 
-To test a specific native build, invoke its path directly (for example `target/debug/pvisor`) or put its directory first on `PATH`. The old launcher's `PVISOR_BIN` override is not used by installed native scripts. Editable Python installation is not a native CLI build; use `just build` or `just install-cli`.
+To test a specific native build, invoke its path directly (for example `target/debug/pvisor`) or put its directory first on `PATH`. Installed native scripts ignore `PVISOR_BIN`. Editable Python installation is not a native CLI build; use `just build` or `just install-cli`.
 
 ## Install the single-node daemon separately {#daemon}
 

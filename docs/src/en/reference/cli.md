@@ -91,7 +91,7 @@ pvisor-daemon memory-pool --help
 pvisor-cache --help
 ```
 
-Add `--memory-pool` to `pvisor-daemon serve` to enable its default-off detached pool component. `pvisor-cache prepare/publish/serve/list/stat/read` remain independent. Node runtime protocols serve native callers, without a daemon acquire/release adapter. NativeRuntime embeds VM execution; checkpoint/fork and stage/apply APIs are absent. See [daemon and cache entry points](../guides/daemon/service.md) for ownership, installation and deployment boundaries.
+Add `--memory-pool` to `pvisor-daemon serve` to enable its default-off detached pool component. `pvisor-cache prepare/publish/serve/list/stat/read` remain independent. Node runtime protocols serve native callers, without a daemon acquire/release adapter. NativeRuntime embeds VM execution; checkpoint/fork and stage/apply APIs are absent. See the [daemon guide](../guides/daemon/index.md) for ownership, installation and deployment boundaries.
 
 Other unknown names follow default execution rules. The `ctrl` name
 is an explicit exception: `pvisor ctrl`, `pvisor ctrl --help` and
@@ -234,26 +234,28 @@ Proxy network auditing is a cooperative boundary: direct connections that bypass
 the proxy do not trigger this prompt.
 
 ```text
-Jobs:
+Execution:
   run         Start a Job
   status      Show Job status
   kill        Terminate a Job
-  suspend     Save execution state and suspend a Job
-  resume      Continue a suspended Job
-  fork        Branch from staged files or VM execution state
-  checkpoint  Create, list, show, delete, verify, import-base, verify-base, gc
 
-
-Filesystems:
-  inspect     Open a read-only Job filesystem view
+Changes:
   review      Review staged changes and execution evidence
   apply       Accept selected staged changes
   drop        Discard staged changes
+  inspect     Open a read-only Job filesystem view
 
-Extensions:
-  service     Native service lifecycle and installed daemon/cache/memory-pool companions
+Checkpoints:
+  checkpoint  create, list, show, delete, verify, import-base, verify-base, gc
+  suspend     Save execution state and suspend a Job
+  resume      Continue a suspended Job
+  fork        Branch from staged files or VM execution state
+
+Tools:
   replay      Replay an Agent trajectory (when installed)
   tui         Interactive Job terminal (when installed)
+  feature     Query compile-time features
+  help        Show command details
 ```
 
 ## Safe first run {#安全的第一次运行}
@@ -451,7 +453,7 @@ layers are retained, and the project base, rootfs and executor are unchanged.
 Deliver credentials to the Agent with an explicit `--pass-env`, or let a
 configured Gateway hold the upstream key on the trusted side.
 
-Startup prints the effective policy and override notices. Note that:
+Startup prints the effective policy and override notices:
 
 - Without `--safe`, host/container selective proxies remain bypassable.
 - Hostname rules cannot distinguish inference, telemetry and upload APIs under
@@ -586,7 +588,10 @@ pvisor replay --agent pi-agent \
 Replay has three modes. The default replays the prefix and continues;
 `--replay-only` executes the prefix and stops before a model request; and
 `--prepare-only` constructs the prefix without executing tools or requiring a
-runtime. `--max-steps` is the total action budget, including replayed actions.
+runtime. `--max-steps` is the total action budget, including replayed actions:
+`--after-step 30 --max-steps 50` leaves at most 20 continuation actions;
+replay-only's budget must cover the prefix, and continuation must also leave at
+least one live action.
 `--allow-stale-observations` is an explicit Claude-only escape hatch that marks
 the v3 result `degraded`.
 
@@ -596,11 +601,18 @@ observation and before the first live model inference. The TOML spelling is
 replay-only modes, and an omitted option preserves the unmodified replay
 boundary. Structured results and replay journals store only injection state,
 length and a digest; Agent-native prepared or continued trajectories may
-contain the user message.
+contain the user message. With a prompt configured, the input condition in
+`next-action-comparison.json` is `boundary_user_prompt_appended`; text
+similarity and tool agreement are then observational only and cannot be read
+as replay fidelity under identical input.
 
-The result schema is `sandbox-playback.result/v3`, with typed `phase`, `quality`
-and `agent_status` fields plus state/output locations, artifacts and an optional
-structured failure. Non-Claude callers that used `replay_only = true` only to
+The result schema is `sandbox-playback.result/v3`: `phase` is `prepared`,
+`replayed` or `continued`; `quality` is `verified` or `degraded`;
+`agent_status` distinguishes `not_started`, `completed`, `max_steps` and
+`failed`, plus state/output locations, artifacts and an optional structured
+failure. Failed results keep the logs and native trajectory already produced;
+even when the OpenHands process exits 0, the result is still a failure if the
+controller reports a fatal status. Non-Claude callers that used `replay_only = true` only to
 construct a prefix must migrate to `prepare_only = true`.
 
 `disable_thinking` belongs to `[replay]` and is also exposed as
@@ -608,7 +620,8 @@ construct a prefix must migrate to `prepare_only = true`.
 request; OpenCode omits its `--thinking` flag when it is set. It does not turn
 on Gateway capture. Optional `[run]`, `[overlayfs]` and `[overlaynet]` sections
 create an outer managed `pvisor run`; they do not change the inner replay model
-path.
+path. Replay's filesystem parameters are governed by `pvisor replay --help`;
+do not copy `run`'s `--stage/--mount` grammar directly.
 
 By default, replay's internal state, WAL, manifest, fresh-observation
 comparisons and native working files remain under
@@ -1071,7 +1084,7 @@ project/                         # reusable workspace / default base
     ├── lease.lock
     ├── control.sock             # while a live OverlayFS Run is available
     ├── .capture/                # when OverlayNet/Gateway is enabled
-    └── events.jsonl             # when --record-destination is set
+    └── events.trace.jsonl       # when --record-destination is set
 ```
 
 Lifecycle commands accept a Run id, Run directory, project workspace,
@@ -1122,4 +1135,6 @@ and the native container executor keep their current behavior. See the
 limits and SSH remote access.
 
 
-Enable the daemon-owned experimental pool with `pvisor-daemon serve --memory-pool`; its detached `memory-pool --directory DIR` component uses daemon-provisioned private configuration. Native `pvisor run --vm-memory-pool SOCKET` remains an explicit runtime option with platform/protocol limits, not a service launcher. Physical/legacy pool loss fails dependent VMs; Linux sealed-compressed clients retain local recovery and stop new publication. Select it with daemon `--memory-pool-mode compressed`. See [daemon pool activation and budgets](../guides/daemon/index.md#memory-pool); historical macOS compressed-pool results retain their [version scope](../design/memory-optimization/proof-of-concept.md#v1-integration).
+Enable the daemon-owned experimental pool with `pvisor-daemon serve --memory-pool`; its detached `memory-pool --directory DIR` component uses daemon-provisioned private configuration. Native `pvisor run --vm-memory-pool SOCKET` remains an explicit runtime option with platform/protocol limits, not a service launcher.
+
+Physical/legacy pool loss fails dependent VMs; Linux sealed-compressed clients retain local recovery and stop new publication. Select it with daemon `--memory-pool-mode compressed`. See [daemon pool activation and budgets](../guides/daemon/index.md#memory-pool); historical macOS compressed-pool results retain their [version scope](../design/memory-optimization/proof-of-concept.md#v1-integration).

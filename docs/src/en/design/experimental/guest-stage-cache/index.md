@@ -1,4 +1,4 @@
-# EXP-002 (design stage): guest kernel filesystem cache and deferred backend binding
+# Guest kernel filesystem cache and deferred backend binding (EXP-002)
 
 Let the guest kernel use a versioned filesystem view to complete cached path resolution, attribute queries and ordinary read-only open locally. Call the VMM for missing data, stage mutations and durability. The host retains authoritative stage, baseline observation, access policy, review/apply and restoration state.
 
@@ -29,7 +29,7 @@ File traversal and tool initialization repeatedly resolve paths, query attribute
 
 Identify requests the guest kernel can complete from a stable view by supplying immutable-lower metadata and protocol-managed stage state, while preserving host mutation, authorization and durability ownership. Traversal, open/fstat/close and mixed stage views expose metadata delivery, open lifetime and cache coherence as separate problems.
 
-The existing [Writeback comparison](../../filesystem-performance-analysis.md#writeback-ab) supports improvement for that write workload with writeback disabled, without detected full-task acceleration. This proposal targets structural metadata/open costs and requires independent end-to-end evidence. Writeback, copy-up and durability costs still need separate diagnosis.
+The existing [Writeback comparison](../../../lab-notes/filesystem-performance-analysis.md#writeback-ab) supports improvement for that write workload with writeback disabled, without detected full-task acceleration. This proposal targets structural metadata/open costs and requires independent end-to-end evidence. Writeback, copy-up and durability costs still need separate diagnosis.
 
 ### 1.2 Foundations and design gaps
 
@@ -291,7 +291,7 @@ Existing control owners continue to schedule quiescence, seal and snapshot. Thes
 
 The host trims invisible paths, protected aliases and object grants before metadata delivery. Mode/owner/ACL/xattr inputs must be complete. Preserve raw path bytes; symlinks cannot request arbitrary host paths. Content digests do not grant cross-tenant access.
 
-Guest Linux checks permissions locally; VMM still validates host-recognized authorization for data/mutations. Session tokens, guest uid and mutation lists cannot replace Host-control credentials or alter host permission ledgers. See [Host/Guest authority](../../decisions/0008-host-guest-control-authority.md).
+Guest Linux checks permissions locally; VMM still validates host-recognized authorization for data/mutations. Session tokens, guest uid and mutation lists cannot replace Host-control credentials or alter host permission ledgers (Host/Guest authority separation).
 
 Profiles requiring per-operation host policy/audit callbacks exclude local open. Policy changes revoke new cache admission and coordinate references; resume only after rebuilding permission/retention contracts.
 

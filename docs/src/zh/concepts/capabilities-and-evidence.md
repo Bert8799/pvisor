@@ -3,6 +3,10 @@
 判断一次 Job 真正保证了什么，要分别核对请求的权限、准入计划、实际安装的控制和观察到的结果。
 `--safe`、暂存目录或执行器名称都不能单独证明所有能力已经强制执行。
 
+## 策略叠加规则 {#layering}
+
+策略逐层收窄：后面的 `allow` 不能覆盖前面任何一层的显式 `deny`。某一层写了规则却没写 `default_action`，这一层默认拒绝；完全不配置策略时，网络按 public 放行、文件读取也不受限——要限制就得显式声明。`--safe` 要求落实隔离并拒绝敏感路径；`--strict` 校验全部请求维度，缺证据就拒绝运行。字段与预设见[策略字段参考](../reference/policy.md)。
+
 ## 按维度检查
 
 | 维度 | 应检查的内容 |
@@ -43,7 +47,7 @@ Run Bundle 的 `executor_observations` 是当前执行的强制力证据，安�
 ## 记录能说明什么
 
 ```text
-请求的权限 → 准入计划 → 安装控制 → 执行与观察 → 终态结果和 Run Bundle
+Requested permissions → admission plan → installed controls → execution and observations → terminal result and Run Bundle
 ```
 
 `status --review` 展示 Run Bundle 的控制、警告和暂存改动。文件观察只覆盖到达

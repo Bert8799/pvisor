@@ -1,41 +1,28 @@
-# 端到端 Agent 任务：什么时候选择 pVisor？
-
-## 主要结论 {#conclusions}
-
-**需要频繁创建任务视图、保留少量改动并审查合入时，评估 pVisor staged：固定修复任务为 0.64 s，Docker 为 0.81 s；但七项工具任务 staged 为 1.09 s，Docker 为 0.82 s。pVisor VM 的修复为 3.25 s，长于 Firecracker 的 2.20 s 和 QEMU microvm 的 1.40 s，独立 guest 边界需要额外预算。**
-
-| 需求 | 选型含义 |
-| --- | --- |
-| 大工作区、稀疏改动、每次新建任务视图 | staged 有完整机器流程优势；同时预算工具开销 |
-| 小工作区、现成容器或原生 Agent 沙箱 | 保留已有 Git/工具流程，不为单项速度全面替换 |
-| 独立 guest 内核 | 选择 VM 前验证 CLI 兼容性和完整工具成本 |
-| 远端 API 与托管弹性 | 按仓库同步、部署和运维需求评估云端；同条件性能与账单未测 |
-
-<!-- measurement-status:start -->
-
-本页数值和结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
-
-<!-- measurement-status:end -->
+# 一次真实 Agent 任务要多久？
 
 ## Motivation {#motivation}
 
-一次任务包括环境准备、模型与工具交互、测试验证、审查合入和清理。只看启动会漏掉工具与结果处理；只看工具速度，又会漏掉反复创建工作区的成本。固定工具计划排除推理和公网波动，独立的完整审查流程衡量同样改动如何进入原工作区。
+执行方式要按完整任务判断：环境准备、模型与工具交互、验证、审查合入和清理。频繁创建任务视图、保留少量改动并审查合入时，评估 staged；小工作区或已有容器、原生沙箱时，保留现有流程；选 VM 前先验证 CLI 兼容性和完整工具成本。云端按仓库同步、部署和运维需求比较，同条件性能与账单未测。
+
+固定修复任务 staged 为 0.64 s，Docker 为 0.81 s；七项工具任务 staged 为 1.09 s，Docker 为 0.82 s。pVisor VM 的修复为 3.25 s，长于 Firecracker 的 2.20 s 和 QEMU microvm 的 1.40 s，独立 guest 边界要单独预算。
+
+<!-- measurement-status:start -->
+
+这些数值与结论仍属于原始历史批次；新框架尚无匹配的复测数据，见[复测覆盖](index.md#measurement-coverage)。
+
+<!-- measurement-status:end -->
 
 ## 实验设计 {#interpretation}
 
-Linux x86_64，AMD Ryzen 7 9700X，Fedora 7.2.8-200.fc44.x86_64。执行进程树与专用 Docker daemon 固定到 CPU 0,1；VM 为 2 vCPU，shell 探针配置 128 MiB，工具任务配置 16 GiB。原生/Docker 未限制内存，因此是 CPU 控制的任务对照，不能推导相同内存预算下的容量。host/staged 使用 rootless_process。
+测量固定工具计划下从启动到退出所需的时间，作为完整任务耗时。它是一次 Agent 任务付出的时间；耗时越短，同样通过校验的结果交付得越早。
 
-同一套离线工具与固定输入，每次新建工作区；热缓存、3 次预热、固定计划每格 60 次正式采样；环境检查与真实 CLI 每格 30 次，固定种子随机交替执行。环境准备、构建、镜像导入和输入重置不计时；启动和退出计入完整任务。Docker Engine 29.7.2 使用专用 rootless **overlay2** daemon、经典镜像存储和可写 bind mount；Firecracker 1.13.1 PCI 不使用 jailer，QEMU 10.2.2 分别使用 q35/microvm 与私有 ext4。pVisor VM 使用 virtio-fs 和自己的固件。内核、存储和暂存语义不同，结果是这些配置下的任务成本，不是纯 VMM 或安全排名。
+各后端共用离线工具与固定输入，每次试验新建工作区，运行在 Linux x86_64 / Ryzen 7 9700X / Fedora 7.2.8 上，固定 CPU 0–1。VM 为 2 vCPU，shell 探针 128 MiB、工具任务 16 GiB；原生与 Docker 不设内存上限，因此比较的是受 CPU 控制的任务耗时，不是容量。热缓存，固定计划每格 3 次预热、60 个样本（环境检查和真实 CLI 为 30 个），固定种子随机交替。
 
-固定计划检查和搜索仓库、修复 Python、执行 Python/Rust/Node 测试、安装 32 个离线 npm 包并生成 diff。Result 截止到校验后的结果返回，Completion 包括退出；测试和预期改动必须通过。该工具计划没有测量真实模型推理，也不能证明真实 Agent CLI 的兼容性。
-
-这些样本未验证 Node/npm 编译缓存跨后端一致。新工作区不等于空工具缓存；完整任务的差值包含各配置下的缓存行为，不能全部归因于 stage 或 VMM。
-
-场景分析还引用[文件系统](filesystem.md)、[完整审查流程](supervision-cost.md)、[启动](startup.md)、[惰性镜像](lazy-image-startup.md)和[隔离有效性](isolation-tests.md)的独立注册实验。审查流程每格 30 次，计时含视图创建、20 次修改、审查、合入 10 个文件与清理；Git/reflink 不提供同一隔离。各实验分别统计，不能相加中位数估算一次真实 Agent 任务，也不沿用它们的资源配置做统一排名。
+固定计划检查并搜索仓库、运行 Python/Rust/Node 测试、安装 32 个离线 npm 包并生成 diff。Result 截止到校验后的返回结果，Completion 包含退出。Docker 使用私有 rootless overlay2 daemon，Firecracker PCI 不使用 jailer，QEMU 使用 q35/microvm，pVisor VM 使用 virtio-fs：内核、存储和暂存语义不同，这些是任务成本，不是 VMM 或安全排名。计划不测模型推理，也不建立真实 CLI 兼容性；新工作区不等于相同的工具缓存。
 
 ## 实验数据和分析 {#results}
 
-测于 2026-10-06，固定计划每个后端 60/60 有效，正式失败 0；环境与 CLI 的样本数和预检失败另列。输出、退出和执行器记录必须通过校验；暂存模式还验证宿主原文件不变和完整改动保留。保留所有有效慢样本，没有按耗时剔除。表格通常为 P50；分离分布展示各簇中位数和数量，P95 仅作观察参考。原始报告、二进制、输入与源码摘要保存在忽略的 `.data/`，本地完整 CSV/JSON 保留负载、批次和来源关联。
+测于 2026-10-06，固定计划每个后端 60/60 有效，正式失败 0；环境与 CLI 的样本数和预检失败另列。输出、退出和执行器记录必须通过校验；暂存模式还验证宿主原文件不变和完整改动保留。保留所有有效慢样本，没有按耗时剔除。表格通常为 P50；分离分布展示各簇中位数和数量。原始报告、二进制、输入与源码摘要保存在忽略的 `.data/`，本地完整 CSV/JSON 保留负载、批次和来源关联。
 
 ### 固定修复与测试 {#reference-env}
 
@@ -91,7 +78,6 @@ staged 相对 Docker 的完整任务中位数差为 −175.84 ms，95% 配对 bo
 | QEMU q35 | 0.88 | 2.07 | 6.93 |
 | QEMU microvm | 0.80 | 2.05 | 6.86 |
 
-
 Claude Code 在 pVisor VM 的预检中超过 90 s 初始化期限：有效样本为 0，此条件不参加耗时比较。其他 Claude 条件与所有 Codex 条件完成了受控工具闭环。
 
 staged 相对 Docker 的完成时间中位数差：Claude Code 为 −127.83 ms，95% 配对 bootstrap 区间 [−137.91, −116.72] ms；Codex 为 −3864.45 ms，区间 [−3948.16, −3804.45] ms。这些差异包含客户端初始化、工具调用和退出等待，不能归因为单一文件系统成本。
@@ -104,4 +90,4 @@ Claude 使用 `--bare`、只允许 Bash；Codex 使用 `--ephemeral` 和 `danger
 
 完整 CSV/JSON 和原始记录保存在对应本地批次或文档数据归档。
 
-[比较方法](methodology.md) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[比较方法](index.md#interpretation) · [复现手册](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)

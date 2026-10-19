@@ -1,27 +1,20 @@
-# Where can pVisor reduce reinforcement-learning rollout costs?
-
-## Main conclusions {#conclusions}
-
-**For local tool-heavy attempts, stage offers lower measured repair cost and higher tested active capacity than pVisor VM; choose VM when an independent guest kernel is required. Prefix preparation and lazy image reads address other rollout costs, with no demonstrated improvement in training throughput, success rate or reward.**
-
-| Scenario | Selection implication |
-|---|---|
-| Many short repository attempts | Evaluate stage for retained edits and active capacity; its boundary is a host process |
-| Independent guest kernel per attempt | Budget VM tool cost and lower tested capacity, even with short startup waiting |
-| Historical context or uncached images | Evaluate prefix preparation or lazy reads within their measured scope |
-| Existing RL stack | Keep task, model and training layers; dedicated integrations remain unvalidated |
-
-<!-- measurement-status:start -->
-
-The numbers and conclusions on this page still belong to the original historical cohorts. The new framework has no matching rerun yet; see [measurement coverage](index.md#measurement-coverage).
-
-<!-- measurement-status:end -->
+# Where can pVisor cut rollout costs?
 
 ## Motivation {#motivation}
 
-A rollout creates an environment, alternates model inference with tool calls, runs verification, assigns a reward and retains or rejects the sample. Failed attempts may need context preparation, environment restoration and another execution. Choosing an executor requires budgeting these stages separately and preserving the task's required boundary.
+Judge a rollout executor by the whole attempt: environment creation, model and tool alternation, verification, reward assignment and retries. For local tool-heavy attempts, stage offers the lower measured repair cost and the higher tested active capacity, at the price of a host-process boundary; choose a VM when the attempt needs an independent guest kernel. Keep the existing task, model and training layers, and treat dedicated integrations as unvalidated.
+
+On a shared two-core, 2 GiB budget, stage completes 160/160 tasks at concurrency 32, while the VM completes 138/160 at 32 and 80/80 at 16. Fixed repair takes 0.64 s staged against 3.25 s on the VM. Prefix preparation takes 6.07–6.59 ms per format, and a cold lazy shell reads 2.58 MB of content against 41.84 MB for a full OCI image; none of these has a measured effect on training throughput, success rate or reward.
+
+<!-- measurement-status:start -->
+
+These numbers and conclusions remain the original historical cohorts; the new framework has no matching rerun. See [measurement coverage](index.md#measurement-coverage).
+
+<!-- measurement-status:end -->
 
 ## Experiment design {#interpretation}
+
+Measure active task capacity, tool and repair cost, and prefix-preparation cost as the three stages of one rollout attempt. Capacity sets how many attempts run at once, the two costs set what each attempt consumes; more capacity and lower cost mean more attempts per unit of infrastructure.
 
 This scenario analysis reuses registered local Linux/x86_64 experiments; it makes no new measurements. The owning topics define artifacts, validation and controls:
 
@@ -66,4 +59,4 @@ Training throughput, useful-sample success, reward, retries and end-to-end resou
 
 Complete CSV/JSON, artifact digests, controls and raw records for each topic remain in their local cohorts or the documentation data archive, retaining provenance and statistical scope.
 
-[Comparison method](methodology.md) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
+[Comparison method](index.md#interpretation) · [Reproduction manual](https://github.com/DeepLink-org/pvisor/blob/main/benchmark/pvisor/README.md)
