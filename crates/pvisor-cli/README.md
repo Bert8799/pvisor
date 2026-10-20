@@ -292,3 +292,11 @@ It checks startup failure, exit codes, stdout/stderr, stdin EOF, PTY allocation,
 detached lifetime, stop/start persistence, foreground signal forwarding, orphan
 reaping and concurrent exec exit routing. A separate ordinary Job VM case checks
 the default launch configuration's orphan reaping and exit status.
+
+### Known Linux timestamp-sensitive test
+
+`verified_image_reuses_hash_but_detects_in_place_and_inode_changes` can fail
+intermittently on Linux `6.8.0-136-generic`, observed with both ext4 and tmpfs.
+After a same-size content edit with mtime restored, unchanged ctime can cause
+reuse of the old digest. Host timestamp granularity is the suspected cause;
+a kernel-only cause has not been confirmed.
