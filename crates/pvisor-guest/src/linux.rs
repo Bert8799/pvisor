@@ -317,6 +317,39 @@ fn run() -> io::Result<i32> {
     if let Some(target) = &config.workspace {
         mount("pvisor-workspace", target, "virtiofs", 0)?;
     }
+    if let Some(target) = &config.payloads_dir {
+        // Read-only shared payloads: the device enforces immutability, the
+        // mount adds `ro,dax=inode` so guest reads map the host copy
+        // directly instead of duplicating it into guest page cache. A
+        // failed mount is fatal — staged symlinks would dangle.
+        fs::create_dir_all(target)?;
+        mount_with_options(
+            "pvisor-payloads",
+            target,
+            "virtiofs",
+            libc::MS_RDONLY,
+            Some("dax=inode"),
+        )?;
+    }
+    for share in &config.shares {
+        // Pod volume mounts the VM tier re-expresses as shares. Read-only
+        // datasets deliberately use `dax=never`: ordinary reads stream
+        // through the one host page-cache copy with no DAX-window coupling
+        // to dataset size. A failed mount is fatal — the workload expects
+        // the volume to exist.
+        fs::create_dir_all(&share.path)?;
+        if share.read_only {
+            mount_with_options(
+                &share.tag,
+                &share.path,
+                "virtiofs",
+                libc::MS_RDONLY,
+                Some("dax=never"),
+            )?;
+        } else {
+            mount(&share.tag, &share.path, "virtiofs", 0)?;
+        }
+    }
     if let Some(network) = &config.network {
         configure_network(network)?;
     }
@@ -332,8 +365,155 @@ fn run() -> io::Result<i32> {
             .stderr(Stdio::null())
             .spawn()?;
     }
+    // Fatal guest setup finishes before any advisory process spawns: a
+    // failed mount must abort the launch without leaking sidecars.
     shares::install(&config)?;
+    for sidecar in &config.sidecars {
+        // Advisory daemons: a spawn or log failure is reported on the
+        // console and never aborts the workload. stderr (and stdout) append
+        // to the sidecar's log inside the guest root; the workload's task
+        // IO is never shared.
+        match config.sidecar_command(sidecar) {
+            Ok(mut command) => {
+                let null = || (Stdio::null(), Stdio::null());
+                let stdio = match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&sidecar.log)
+                {
+                    Ok(log) => match log.try_clone() {
+                        Ok(copy) => (Stdio::from(log), Stdio::from(copy)),
+                        Err(error) => {
+                            eprintln!(
+                                "pvisor guest: sidecar log {}: {error}",
+                                sidecar.log.display()
+                            );
+                            null()
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!(
+                            "pvisor guest: sidecar log {}: {error}",
+                            sidecar.log.display()
+                        );
+                        null()
+                    }
+                };
+                if let Err(error) = command
+                    .stdin(Stdio::null())
+                    .stdout(stdio.0)
+                    .stderr(stdio.1)
+                    .spawn()
+                {
+                    eprintln!(
+                        "pvisor guest: sidecar {:?} failed to start: {error}",
+                        sidecar.argv.first()
+                    );
+                }
+            }
+            Err(error) => eprintln!("pvisor guest: invalid sidecar: {error}"),
+        }
+    }
+    for bridge in &config.bridges {
+        // Advisory relays: failures report on the console and never affect
+        // the workload (the host executor's probes surface the outage).
+        match vsock_listen(bridge.vsock_port) {
+            Ok(listener) => {
+                let tcp_port = bridge.tcp_port;
+                let vsock_port = bridge.vsock_port;
+                std::thread::spawn(move || run_port_bridge(listener, tcp_port, vsock_port));
+            }
+            Err(error) => eprintln!(
+                "pvisor guest: bridge vsock {} listener failed: {error}",
+                bridge.vsock_port
+            ),
+        }
+    }
     workload(&config)
+}
+
+/// Accept loop of one port bridge: every AF_VSOCK connection is pumped to
+/// guest 127.0.0.1:tcp_port and back. One guest TCP connection per vsock
+/// connection; both directions share it.
+fn run_port_bridge(listener: std::os::fd::OwnedFd, tcp_port: u16, vsock_port: u32) {
+    loop {
+        let client = unsafe {
+            libc::accept4(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if client < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("pvisor guest: bridge vsock {vsock_port} accept: {error}");
+            return;
+        }
+        let client = unsafe { std::os::fd::OwnedFd::from_raw_fd(client) };
+        let service = match std::net::TcpStream::connect(("127.0.0.1", tcp_port)) {
+            Ok(service) => service,
+            Err(error) => {
+                eprintln!(
+                    "pvisor guest: bridge vsock {vsock_port} to 127.0.0.1:{tcp_port}: {error}"
+                );
+                continue;
+            }
+        };
+        std::thread::spawn(move || {
+            let _ = pump_vsock_to_tcp(client, service);
+        });
+    }
+}
+
+/// Byte pump for one bridged connection: vsock ↔ guest TCP.
+fn pump_vsock_to_tcp(vsock: std::os::fd::OwnedFd, service: std::net::TcpStream) -> io::Result<()> {
+    let mut vsock_read = unsafe { File::from_raw_fd(libc::dup(vsock.as_raw_fd())) };
+    let mut vsock_write = unsafe { File::from_raw_fd(libc::dup(vsock.as_raw_fd())) };
+    drop(vsock);
+    let mut service = service;
+    let mut service_write = service.try_clone()?;
+    let up = std::thread::spawn(move || {
+        let _ = io::copy(&mut vsock_read, &mut service_write);
+        let _ = service_write.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = io::copy(&mut service, &mut vsock_write);
+    let _ = up.join();
+    Ok(())
+}
+
+/// Listen on a guest AF_VSOCK port (host connections arrive through the
+/// executor's vsock tunnel). AF_VSOCK has no std API; the raw syscall shape
+/// matches AF_UNIX.
+fn vsock_listen(port: u32) -> io::Result<std::os::fd::OwnedFd> {
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    check(fd)?;
+    let mut address: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    address.svm_family = libc::AF_VSOCK as u16;
+    // VMADDR_CID_ANY (-1): any context may connect.
+    address.svm_cid = u32::MAX;
+    address.svm_port = port;
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            (&mut address as *mut libc::sockaddr_vm).cast(),
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+    };
+    if bound != 0 {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    if unsafe { libc::listen(fd, 16) } != 0 {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 pub fn main() {

@@ -26,6 +26,29 @@ The pVisor VM executor selects a unique directory and sets default TMPDIR to it.
 
 The CLI snapshot launcher and container shim omit this option. Launch-message unit tests do not establish RAM snapshot/fork behavior with the executor-selected tmpfs.
 
+## Sidecar processes
+
+`GuestConfig.sidecars` optionally lists daemons started alongside the workload:
+
+```json
+{"sidecars":[{"argv":["/opt/payload","--serve"],"env":{"P":"1"},"log":"/.payload.log"}]}
+```
+
+Sidecars are advisory by contract. Each runs with the workload environment
+overlaid by its own (`env` entries win on conflicts), stdin and stdout on
+`/dev/null`, and stderr appended to the absolute guest `log` path. A spawn
+failure or a sidecar exit is reported on the console and never affects the
+workload, its exit code or the reported guest status; nothing restarts a
+sidecar. argv[0] addresses a file the host executor staged into the rootfs;
+the supervisor performs no lookup of its own. Validation (program present,
+absolute log path, NUL-free words, valid environment names) runs with the
+whole launch contract before any side effect. Consumers that omit the field
+keep their existing behavior; JSON serialization omits it when absent.
+`GuestConfig.bridges` optionally adds AF_VSOCK-to-guest-TCP relays (advisory:
+a failed listener is reported and never affects the workload), and
+`GuestConfig.shares` lists extra virtio-fs mounts (read-only shares mount
+`ro,dax=never`; read-write plain passthrough; a failed mount is fatal).
+
 ## One workload supervisor
 
 Jobs and controlled workloads enter the same `workload` function and use
