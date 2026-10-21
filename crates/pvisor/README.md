@@ -512,6 +512,12 @@ vsock adapter adds same-VM exec, stdin, signal delivery and TCP publication;
 it owns no separate process lifecycle or host filesystem/lifecycle authority.
 Ordinary Job configurations retain inherited identity/session/stdio defaults.
 
+The Docker network resolver lower keeps its host directories private (`0700`)
+while carrying the image's guest ownership and permissions for `/` and `/etc`.
+An absent image `/etc` uses guest root ownership and `0755`; the injected resolver
+file is guest-root-owned `0644`. This prevents DNS setup from blocking non-root
+`run -u` and `exec -u`, without widening image directory permissions or host access.
+
 The supported CLI profile and its explicit differences from Docker are in the
 [application README](../pvisor-cli/README.md#docker-command-profile-experimental).
 A passing catalog or protocol test does not establish Linux/KVM acceptance,

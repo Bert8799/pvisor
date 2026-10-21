@@ -1244,6 +1244,53 @@ fn forward(mut client: std::net::TcpStream, endpoint: &Path, port: u16) -> anyho
     result
 }
 
+fn prepare_resolver(rootfs: &Path, resolver: &Path) -> anyhow::Result<()> {
+    use pvisor_overlay_core::{backend::UnixIdentity, sys};
+    use std::ffi::OsStr;
+
+    private_directory(resolver)?;
+    private_directory(&resolver.join("etc"))?;
+    fs::write(resolver.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n")?;
+    let key = OsStr::new("user.containers.override_stat");
+    // Host storage stays 0700; its guest directories retain the image's metadata.
+    // Otherwise this first lower makes guest / and /etc inaccessible after setuid.
+    for relative in ["", "etc"] {
+        let source = rootfs.join(relative);
+        let identity = match fs::symlink_metadata(&source) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir(),
+                    "resolver parent is not an image directory: {}",
+                    source.display()
+                );
+                if sys::list_xattrs(&source)?
+                    .iter()
+                    .any(|name| name == key.as_encoded_bytes())
+                {
+                    let value = sys::get_xattr(&source, key)?;
+                    UnixIdentity::parse(&value)?;
+                    value
+                } else {
+                    format!(
+                        "{}:{}:0{:o}",
+                        metadata.uid(),
+                        metadata.gid(),
+                        metadata.mode()
+                    )
+                    .into_bytes()
+                }
+            }
+            Err(error) if relative == "etc" && error.kind() == io::ErrorKind::NotFound => {
+                b"0:0:040755".to_vec()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        sys::set_xattr(&resolver.join(relative), key, &identity, 0)?;
+    }
+    sys::set_xattr(&resolver.join("etc/resolv.conf"), key, b"0:0:0100644", 0)?;
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 fn run_vm(store: &Store, instance: Instance) -> anyhow::Result<()> {
     use pvisor_vm::api::{
@@ -1263,9 +1310,7 @@ fn run_vm(store: &Store, instance: Instance) -> anyhow::Result<()> {
     let mut lowers = vec![instance.image.rootfs.clone()];
     if instance.config.network {
         let resolver = directory.join(format!("resolver-{}", instance.generation));
-        private_directory(&resolver)?;
-        private_directory(&resolver.join("etc"))?;
-        fs::write(resolver.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n")?;
+        prepare_resolver(&instance.image.rootfs, &resolver)?;
         lowers.insert(0, resolver);
     }
     vm.overlay(
@@ -1378,6 +1423,54 @@ pub use pvisor_guest::control::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolver_preserves_guest_directory_metadata_without_exposing_host_storage() {
+        use pvisor_overlay_core::{backend::UnixIdentity, sys};
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let rootfs = temporary.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o755)).unwrap();
+        let key = OsStr::new("user.containers.override_stat");
+        for custom in [false, true] {
+            if custom {
+                fs::create_dir(rootfs.join("etc")).unwrap();
+                sys::set_xattr(&rootfs, key, b"123:456:040750", 0).unwrap();
+                sys::set_xattr(&rootfs.join("etc"), key, b"234:567:040710", 0).unwrap();
+            }
+            let resolver = temporary.path().join(format!("resolver-{custom}"));
+            prepare_resolver(&rootfs, &resolver).unwrap();
+            let root = UnixIdentity::parse(&sys::get_xattr(&resolver, key).unwrap()).unwrap();
+            let etc =
+                UnixIdentity::parse(&sys::get_xattr(&resolver.join("etc"), key).unwrap()).unwrap();
+            if custom {
+                assert_eq!((root.uid, root.gid, root.mode), (123, 456, 0o40750));
+                assert_eq!((etc.uid, etc.gid, etc.mode), (234, 567, 0o40710));
+            } else {
+                let native = fs::symlink_metadata(&rootfs).unwrap();
+                assert_eq!(
+                    (root.uid, root.gid, root.mode),
+                    (native.uid(), native.gid(), native.mode())
+                );
+                assert_eq!((etc.uid, etc.gid, etc.mode), (0, 0, 0o40755));
+            }
+            for path in [&resolver, &resolver.join("etc")] {
+                assert_eq!(fs::symlink_metadata(path).unwrap().mode() & 0o777, 0o700);
+            }
+            assert_eq!(
+                fs::read(resolver.join("etc/resolv.conf")).unwrap(),
+                b"nameserver 192.0.2.1\n"
+            );
+            let file = UnixIdentity::parse(
+                &sys::get_xattr(&resolver.join("etc/resolv.conf"), key).unwrap(),
+            )
+            .unwrap();
+            assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o100644));
+        }
+    }
 
     fn fixture() -> (tempfile::TempDir, Store, Image) {
         let directory = tempfile::tempdir().unwrap();
