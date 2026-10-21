@@ -62,25 +62,46 @@
 
 ## P1：缩短新建 VM 的启动关键路径
 
-- [x] 构建时计算内置内核 SHA-256。对实际未压缩内核字节计算摘要，
-      通过统一 VM API 提供身份与存在性查询，避免查询触发解包；动态固件仍校验文件内容。
-- [ ] 同一次可执行文件读取计算 BLAKE3 和 SHA-256。从同一已固定文件描述符
-      计算两个独立摘要，供 Host 身份校验与 checkpoint 兼容性绑定使用；保留内容变化检测，
-      不以文件名、时间戳、裸环境变量或不同算法的摘要替代验证。
-- [x] 延迟创建 checkpoint 捕获专用目录。普通 VM 启动时固定私有存储根目录，
-      校验已有目录结构并绑定兼容性与身份；缺失的对象目录和捕获目录在首次捕获请求前
-      持久化创建，失败不向 guest 发送冻结请求。显式文件系统池保留启动前初始化与校验。
-      取舍：首次 checkpoint 承担目录准备开销，创建或同步错误延后到该请求返回；
-      失败不产生新快照，需要恢复运行状态时必须确认捕获成功后再退出 VM。
-- [ ] 用事件唤醒缩短 guest stdio 就绪等待。等待真实端口及名称就绪，
-      保留有截止时间的状态回查，覆盖事件丢失、设备迟到与超时，不能直接取消等待。
-- [ ] 并行执行可执行文件摘要计算与必要的快照存储准备。先验证两者依赖关系，
-      不并发修改进程环境，不破坏 namespace 初始化要求；失败和取消时回收所有任务。
-- [ ] 将 `sha2` 依赖改为速度优先编译。（未通过，已回退）
-- [ ] 将内核直接解包到私有中间映射，消除共享字节中间分配及一次复制。（未通过，已回退）
-- [ ] 将内置内核直接解包到最终 RAM backing。仅针对 RAM backing 分支，
-      在 guest RAM 建立后写入其内核范围，消除中间映射及后续复制；保持页对齐、实例私有写入、
-      所有权和快照布局，覆盖启动失败及恢复测试。原始直接映射分支保留独立 owner。（未通过，已回退）
+- [x] **将内置内核的身份查询与解包分开。** Linux x86_64 musl 构建在
+      `build_kernel.rs` 中对实际未压缩内核字节（含填充）计算 SHA-256，写入生成代码的常量。
+      `VmPlatform::embedded_kernel_sha256()` 直接返回该常量；固件解析、runner 的内核存在性
+      检查及 checkpoint 兼容性绑定改用此接口，省去这些查询触发的内核解包、分配和运行时哈希。
+      真正装载内核时仍通过原有惰性解包与私有映射复制流程取得内核内容；动态固件路径继续读取
+      并校验所选固件文件。实现见 [内核构建](crates/pvisor-vm/build_kernel.rs)、
+      [固件接口](crates/pvisor-vm/src/firmware.rs) 与 [VM 启动](crates/pvisor/src/executor/vm/supported.rs)。
+
+- [x] **合并实例控制记录与 checkpoint 所需的可执行文件读取。** 启用实例控制时，
+      Linux VM 若声明支持 checkpoint 且未启用运行时 VM 网络强制执行，发布控制记录前从
+      `/proc/self/exe` 打开的同一描述符流式读取文件，用 64 KiB 缓冲区分别计算 BLAKE3 和
+      SHA-256。BLAKE3 写入实例控制记录；后续 checkpoint 兼容性绑定重新打开可执行文件路径，
+      经身份核对后复用已计算的 SHA-256，省去第二次完整读取与哈希。
+      进程内缓存仅保留一份文件身份、摘要和固定 inode 的描述符，不保留文件内容；仅允许缓存
+      与 Linux 正在执行、受内核写保护的 inode 匹配的文件，并核对设备号、inode、大小、mtime、
+      ctime、权限和 UID/GID。读取前后身份变化则报错；身份不匹配、摘要尚未计算或路径被替换时
+      重新读取计算。普通进程和启用 VM 网络强制执行的路径仅为控制记录计算 BLAKE3，macOS
+      不复用此缓存；前端自校验保持独立。取舍：SHA-256 提前到控制记录准备阶段，某些最终不允许
+      捕获的特殊 VM 配置可能计算一次用不到的摘要。实现见
+      [运行时摘要缓存](crates/pvisor/src/runtime/executable.rs)、
+      [实例控制记录](crates/pvisor/src/runtime/instance_control.rs) 与
+      [兼容性绑定](crates/pvisor/src/executor/vm/checkpoint.rs)。
+
+- [x] **将默认快照存储的子目录初始化移到捕获请求阶段。** 未显式配置文件系统池时，
+      VM 启动调用 `SnapshotStore::prepare_launch()`：持久化创建并固定私有存储根目录，
+      校验已有子目录及 `captures` 的类型，同时完成兼容性和 Run/Attempt 身份绑定；缺失的
+      存储子目录不在启动阶段创建。收到 checkpoint 或 suspend 捕获请求后，控制端先在
+      `spawn_blocking` 中调用 `LaunchBinding::capture_directory()`，完整初始化存储子目录，
+      持久化创建 `captures` 并分配本次捕获的临时目录，全部成功后才发送 guest 冻结请求。
+      显式文件系统池仍在启动前完整初始化与校验，公共 `SnapshotStore::new()` 保持原有行为。
+      取舍：首次捕获承担缺失目录的创建与同步成本，相关错误延后到捕获请求返回；目录准备失败
+      不发送冻结请求、不产生新快照，guest 继续运行。需要保存可恢复状态时，必须确认捕获成功
+      后再退出 VM，旧快照不包含上次捕获后的改动。实现见
+      [存储初始化](crates/pvisor/src/environment_snapshot/store.rs)、
+      [捕获目录准备](crates/pvisor/src/executor/vm/checkpoint.rs) 与
+      [控制请求顺序](crates/pvisor/src/executor/vm/control.rs)。
+
+未通过验收并已回退的方案：`sha2` 速度优先编译、内核直接解包到私有中间映射或最终
+RAM backing、Linux uevent 唤醒 guest stdio 回查，以及并行计算可执行文件摘要与准备
+快照存储。这些尝试未获得可重复的 VM Ready 改善。
 
 ENOMEM workaround 的默认策略作为独立兼容性工作验证，不纳入 P1。
 P0 测量时显式关闭该开关。

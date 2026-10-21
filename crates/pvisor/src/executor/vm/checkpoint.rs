@@ -234,6 +234,18 @@ pub(super) fn compatibility(firmware: Option<&Path>) -> anyhow::Result<Compatibi
         host_boot: host_boot.trim().into(),
         build: {
             let mut span = startup_profile::Span::start("vm.checkpoint.executable_hash");
+            #[cfg(target_os = "linux")]
+            let hash = {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(std::env::current_exe()?)?;
+                crate::runtime::executable::hashes(file, true)?
+                    .sha256
+                    .context("executable SHA-256 unavailable")?
+            };
+            #[cfg(not(target_os = "linux"))]
             let hash = file_hash(&std::env::current_exe()?)?;
             span.success(None);
             hash

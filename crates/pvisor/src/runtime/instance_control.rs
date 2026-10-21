@@ -143,29 +143,23 @@ impl InstanceControlServer {
         })
     }
 
-    pub(crate) fn record(&self) -> anyhow::Result<super::host_transport::LiveControlRecord> {
-        use std::io::Read;
+    pub(crate) fn record(
+        &self,
+        checkpoint: bool,
+    ) -> anyhow::Result<super::host_transport::LiveControlRecord> {
         let binary = std::env::current_exe()?;
         #[cfg(target_os = "linux")]
-        let mut file = std::fs::File::open("/proc/self/exe")?;
+        let file = std::fs::File::open("/proc/self/exe")?;
         #[cfg(not(target_os = "linux"))]
-        let mut file = std::fs::File::open(&binary)?;
-        let mut hash = blake3::Hasher::new();
-        let mut bytes = [0; 64 * 1024];
-        loop {
-            let count = file.read(&mut bytes)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&bytes[..count]);
-        }
+        let file = std::fs::File::open(&binary)?;
+        let hashes = super::executable::hashes(file, checkpoint)?;
         Ok(super::host_transport::LiveControlRecord {
             path: self.socket.path.clone(),
             device: self.socket.device,
             inode: self.socket.inode,
             protocol: super::host_transport::INSTANCE_CONTROL_PROTOCOL.into(),
             binary,
-            binary_digest: hash.finalize().to_hex().to_string(),
+            binary_digest: hashes.blake3,
             pid: std::process::id(),
         })
     }
@@ -669,7 +663,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
         )
         .unwrap();
-        let record = server.record().unwrap();
+        let record = server.record(false).unwrap();
         assert!(record.connect().is_ok());
         std::fs::remove_file(&record.path).unwrap();
         let replacement = super::super::host_transport::bind_instance_socket(&record.path).unwrap();

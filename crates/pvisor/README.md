@@ -244,6 +244,19 @@ Read-only sharing does not guarantee freshness.
 The frontend verifies its loaded image before self-executing the owner. Linux
 hashes `/proc/self/exe`; macOS checks the loaded Mach-O UUID against the opened
 executable before hashing. This is not byte-for-byte loaded-memory attestation.
+On Linux, runtime instance discovery and native checkpoint compatibility can
+share a single streaming read for their independent BLAKE3 and SHA-256 digests.
+SHA-256 is precomputed for offline VM plans advertising checkpoint support;
+ordinary processes and network-enforced VMs retain BLAKE3-only discovery.
+This is a preparation hint, not capture admission: native profiles that later
+reject capture may compute an unused SHA-256 digest.
+The process-local cache retains one pinned descriptor, its full file identity
+and the digests, never executable contents. Hashing uses a 64 KiB buffer.
+Reuse requires matching the currently executing Linux inode, whose contents
+are protected against writes by the kernel, plus device/inode, size, mtime,
+ctime, mode and ownership. A replacement pathname is hashed afresh, even when
+coarse timestamps would otherwise match. macOS retains independent reads.
+Frontend self-verification and checkpoint digest algorithms are unchanged.
 macOS retains its existing birth-identity/polling limitations: numeric signals
 are not atomic pidfd operations, and already-reparented orphans missed by
 discovery are not guaranteed contained. Moving the listener does not establish

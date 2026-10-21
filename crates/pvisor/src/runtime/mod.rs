@@ -12,6 +12,8 @@ pub(crate) mod bundle;
 pub mod checkpoint;
 pub(crate) mod event;
 #[cfg(unix)]
+pub(crate) mod executable;
+#[cfg(unix)]
 pub mod host_transport;
 mod implant;
 #[cfg(unix)]
