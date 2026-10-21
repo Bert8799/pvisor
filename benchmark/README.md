@@ -646,6 +646,7 @@ Design: 负载、对照、控制变量与有效样本判据。
 - **想要的结论：** host、staged、VM 的 Ready / Exit 统计及同轮中位数差的 95% 配对 bootstrap 区间；不能用跨批次数字归因。
 - **实验设计：** 精确源码归档、相同 release/musl/gateway 构建参数和冻结内核；相同 rootfs、探针、CPU 0,1、2 vCPU / 128 MiB、热缓存。各条件 3 次预热、60 对正式样本，固定 seed 随机交替两个版本；Ready / Exit 同次采样。版本在独立 user/mount/PID namespace 中运行，私有 Host 状态目录，退出 namespace 时销毁自有服务；不重启宿主已有 Host。复用当前启动 observer 与完整正确性门禁，保留全部有效慢样本，无事后剔除。
 - **入口：** 每次生成并冻结的 `.data/revision-<commit>/bench.py`，由同目录 `in.json` 经 `semspec bench` 执行；构建收据、轮次顺序、逐次输出与统计一起归档。
+- **单版本 VM 复测入口：** `benchmark.new/startup/vm_ready.py --binary PATH` 每次只测一个制品，复用 `timing.py` 的时钟、3 次预热、60 次采样与正确性校验。固定 CPU 2,3、2 vCPU / 128 MiB、热缓存及 `PVISOR_KRUN_ENOMEM_WORKAROUND=0`；批次前检查所用核心及 SMT 同胞的空闲情况，结束后自动终止自有进程。结果与准备输入保存在 `target/tmp/vm-ready-*`，可信可执行副本临时位于 `/tmp/pvisor-ready-*` 并自动删除。不覆盖 release，不与上述随机配对实验混合，也不从独立批次推导因果加速比例。
 - **历史差距复核：** 先以同一 observer、探针和私有环境随机配对历史原始二进制与指定提交，明确 GNU 动态 / musl 静态等构建差异；此对照只能判断制品差距。确认差距后，以同一固件和构建目标重建源码版本，再判断源码贡献。原始固件提取出的内核摘要必须与冻结内核逐字节核对，不能仅根据链接方式断言固件不同。
 - **构建控制：** 历史 GNU、指定提交 GNU、指定提交 musl 可在同轮三条件随机顺序中采样，各 3 次预热 / 60 次正式试次，固定同一历史内核；分别报告 GNU 源码对照及指定提交 GNU/musl 路径对照的配对区间。内核差异另用同源码、同 musl 参数的两条件对照，不能从多个批次差值相减估算贡献。
 

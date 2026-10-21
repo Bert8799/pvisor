@@ -183,21 +183,7 @@ pub(super) fn binding(
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 pub(super) fn compatibility(firmware: Option<&Path>) -> anyhow::Result<Compatibility> {
     let mut compatibility_span = startup_profile::Span::start("vm.checkpoint.compatibility");
-    let embedded = {
-        let mut span = startup_profile::Span::start("vm.checkpoint.embedded_kernel_acquire_init");
-        let kernel = pvisor_vm::api::VmPlatform::embedded_kernel();
-        span.success(kernel.as_ref().map(|kernel| kernel.bytes.len() as u64));
-        kernel
-    };
-    let firmware_hash = if let Some(kernel) = embedded {
-        use sha2::{Digest, Sha256};
-
-        let digest = {
-            let mut span = startup_profile::Span::start("vm.checkpoint.embedded_kernel_sha256");
-            let digest = Sha256::digest(&kernel.bytes);
-            span.success(Some(kernel.bytes.len() as u64));
-            digest
-        };
+    let firmware_hash = if let Some(digest) = pvisor_vm::api::VmPlatform::embedded_kernel_sha256() {
         crate::util::encode_hex(&digest)
     } else {
         let mut span = startup_profile::Span::start("vm.checkpoint.firmware_file_hash");

@@ -140,3 +140,39 @@ pub(crate) fn embedded_kernel() -> Option<crate::api::KernelImage> {
         None
     }
 }
+
+/// Query build-time identity without touching the lazy decoded image.
+pub(crate) fn embedded_kernel_sha256() -> Option<[u8; 32]> {
+    #[cfg(all(target_os = "linux", target_env = "musl", target_arch = "x86_64"))]
+    {
+        Some(built_in::SHA256)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "musl", target_arch = "x86_64")))]
+    {
+        None
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "musl", target_arch = "x86_64"))]
+mod tests {
+    #[test]
+    fn embedded_kernel_identity_does_not_unpack() {
+        const CHILD: &str = "PVISOR_TEST_KERNEL_IDENTITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A fresh process isolates the lazy image from parallel VM tests.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "firmware::tests::embedded_kernel_identity_does_not_unpack"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use std::sync::LazyLock;
+        assert!(LazyLock::get(&super::built_in::KERNEL).is_none());
+        assert!(super::embedded_kernel_sha256().is_some());
+        assert!(LazyLock::get(&super::built_in::KERNEL).is_none());
+        assert!(super::embedded_kernel().is_some());
+        assert!(LazyLock::get(&super::built_in::KERNEL).is_some());
+    }
+}

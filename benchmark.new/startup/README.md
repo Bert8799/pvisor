@@ -62,6 +62,34 @@ FC 使用 stock 内核/MMIO，受控停止不能算正常退出。任何失败�
 历史报告、CSV 和旧 results 已归档到 `.data/history/`，不参与当前采样、审计或发布。
 工程与诊断占位表仍由 registry 登记，尚未准备的负载拒绝执行。
 
+## 单版本 VM Ready 复测
+
+`vm_ready.py` 属于 [B-STARTUP-REVISION-ENG](../../benchmark/README.md#b-startup-revision-eng)，
+每次只测 `--binary` 指定的一个可执行文件，默认 `target/release/pvisor`。
+它负责准备输入和清理进程，采样、统计及正确性校验继续使用 `timing.py` 与 hooks。
+
+```sh
+python3 benchmark.new/startup/vm_ready.py --binary target/release/pvisor
+python3 benchmark.new/startup/vm_ready.py --binary target/tmp/baseline-pvisor
+```
+
+需要当前用户能访问 KVM；若当前 shell 尚未取得已配置的 kvm 组权限，使用
+`sg kvm -c 'python3 benchmark.new/startup/vm_ready.py --binary target/release/pvisor'`。
+原版路径为自行保留的二进制，不由脚本构建或下载。相对二进制路径按当前工作目录解析；
+结果路径始终相对于仓库根目录，脚本不替换 `target/release/pvisor`。
+
+固定 CPU 2,3、2 vCPU / 128 MiB、3 次预热和 60 次采样，关闭额外的 5 ms workaround。
+整批采样前最多等待 30 秒，要求所用核心及 SMT 同胞连续 3 秒忙碌率不超过 20%；
+超时则停止，不开始测量。该检查不保证核心独占，脚本不修改系统调频或 Boost。
+保留全部有效样本；五项 Ready 统计为中位数、均值、样本标准差、最小值和最大值。
+
+结果、rootfs、逐次日志、原始计时和 Bundle 保存在 `target/tmp/vm-ready-*`，
+包含 `summary.json`、`summary.tsv`、`configuration.json`、环境记录和清理回执。
+为满足现有可执行文件信任规则，原字节副本临时放在 `/tmp/pvisor-ready-*`。
+脚本拒绝并发测量及已有 pVisor 进程；整批正常结束、失败或中断时清理自有进程及
+临时可执行副本，保留结果，无需额外执行清理脚本。独立版本批次分别统计，
+不通过通用发布器覆盖用户启动表，也不作为随机配对实验。
+
 ## TurboOCI 按需镜像对照
 
 [TurboOCI 对照协议](TURBO_OCI.md)属于 B-LAZY-STARTUP，分别比较客户端准备、

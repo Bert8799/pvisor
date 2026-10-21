@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -60,6 +61,7 @@ pub fn embed_kernel() {
             kernel_path.display()
         )
     });
+    let kernel_sha256: [u8; 32] = Sha256::digest(&kernel).into();
     let packed_path = out_dir.join("embedded-libkrun-kernel.packed");
     fs::write(&packed_path, kernel_bundle::pack(&kernel))
         .unwrap_or_else(|error| panic!("write packed kernel bundle: {error}"));
@@ -77,6 +79,7 @@ pub fn embed_kernel() {
              span.complete(Some(kernel.len()));\n\
              kernel\n\
          }});\n\
+         pub const SHA256: [u8; 32] = {kernel_sha256:?};\n\
          pub const GUEST_ADDR: u64 = {guest_addr};\n\
          pub const ENTRY_ADDR: u64 = {entry_addr};\n"
     );

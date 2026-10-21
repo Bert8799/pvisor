@@ -31,6 +31,11 @@ VM staged 和 lazy image 均不建立中间宿主文件系统 FUSE 挂载。lazy
 文件内容通过后端读取；copy-up 和完整快照导出会补齐所需内容。
 协议 inode/handle 表和平台权限仍留在入口适配器中。
 
+`RuntimeSupport::embedded_kernel_sha256` 返回构建时对实际未压缩内核字节
+（含 padding）计算的 SHA-256；没有内置内核时返回 `None`。存在性与兼容性查询
+可使用该接口，不触发解包或内核存储分配。`embedded_kernel` 仍在需要真实字节时
+惰性解包；动态固件与调用方提供的内核不使用这个摘要。
+
 ## 核心接口模型
 
 所有定义集中在 `src/api.rs`，实现集中在私有适配器中。文件系统配置使用 `PathBuf`，UTF-8 校验及内部设备格式转换由运行时完成。

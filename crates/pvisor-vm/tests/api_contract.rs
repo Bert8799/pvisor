@@ -303,3 +303,18 @@ fn invalid_overlay_path_does_not_poison_the_builder() {
     );
     builder.overlay("workspace", valid, 0).unwrap();
 }
+
+#[test]
+fn embedded_kernel_identity_matches_uncompressed_image() {
+    use api::RuntimeSupport;
+    use sha2::{Digest, Sha256};
+
+    let digest = api::VmPlatform::embedded_kernel_sha256();
+    let image = api::VmPlatform::embedded_kernel();
+    assert_eq!(digest.is_some(), image.is_some());
+    if let Some(image) = image {
+        let expected: [u8; 32] = Sha256::digest(&image.bytes).into();
+        assert_eq!(digest, Some(expected));
+    }
+    assert_eq!(api::VmPlatform::embedded_kernel_sha256(), digest);
+}

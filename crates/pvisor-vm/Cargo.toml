@@ -81,6 +81,7 @@ syn = { version = "2", features = ["full", "visit"] }
 pvisor = { path = "../pvisor", default-features = false }
 
 [build-dependencies]
+sha2 = "0.11"
 cc = "1"
 libloading.workspace = true
 

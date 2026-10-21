@@ -759,7 +759,7 @@ impl VmExecutor {
 }
 
 fn resolve_firmware(settings: &VmSettings) -> anyhow::Result<Option<PathBuf>> {
-    if pvisor_vm::api::VmPlatform::embedded_kernel().is_some() {
+    if pvisor_vm::api::VmPlatform::embedded_kernel_sha256().is_some() {
         return Ok(None);
     }
     if let Some(directory) = &settings.library_dir {
@@ -811,7 +811,7 @@ fn configure_runner_firmware(
             .context("configure selected VM firmware")?;
     } else {
         anyhow::ensure!(
-            pvisor_vm::api::VmPlatform::embedded_kernel().is_some(),
+            pvisor_vm::api::VmPlatform::embedded_kernel_sha256().is_some(),
             "VM runner requires an explicitly selected local firmware file"
         );
     }

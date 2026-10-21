@@ -66,6 +66,13 @@ pub trait RuntimeSupport {
     /// Build-embedded kernel, if present. This does not load host firmware.
     /// The shared bytes are immutable; addresses describe the guest boot layout.
     fn embedded_kernel() -> Option<KernelImage>;
+    /// SHA-256 of the exact uncompressed build-embedded kernel bytes, including
+    /// padding; `None` when this build has no embedded kernel. Returns an owned
+    /// digest without unpacking the kernel, allocating its storage, or loading
+    /// host firmware. Safe to query concurrently before or after VM creation;
+    /// the result is constant for this executable and matches `embedded_kernel`.
+    /// Caller-supplied kernels and dynamic firmware are not covered.
+    fn embedded_kernel_sha256() -> Option<[u8; 32]>;
     /// Process-local outstanding cold-RAM work; zero when no pager is active.
     /// These counters are diagnostic bounds, not physical memory attribution.
     fn cold_ram_activity() -> ColdRamActivity;
