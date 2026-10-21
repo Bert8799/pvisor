@@ -36,7 +36,12 @@ enum DockerCommand {
     /// Create and run a new container in its own VM.
     Run(Box<Run>),
     /// Download an image from an OCI registry.
-    Pull { image: String },
+    Pull {
+        /// Select an image platform; downloading does not enable CPU emulation.
+        #[arg(long, value_parser = ["linux/amd64", "linux/arm64", "linux/arm64/v8"])]
+        platform: Option<String>,
+        image: String,
+    },
     /// List locally pulled images.
     Images(ListImages),
     /// Remove one or more local image references.
@@ -57,6 +62,9 @@ enum DockerCommand {
 
 #[derive(Debug, Args)]
 struct Run {
+    /// Select the image platform. Execution currently requires the native platform.
+    #[arg(long, value_parser = ["linux/amd64", "linux/arm64", "linux/arm64/v8"])]
+    platform: Option<String>,
     #[arg(long)]
     name: Option<String>,
     #[arg(short, long)]
@@ -286,10 +294,16 @@ fn port(value: &str) -> anyhow::Result<docker::Port> {
 pub(super) fn run(args: DockerArgs) -> anyhow::Result<i32> {
     let store = Store::discover()?;
     match args.command {
-        DockerCommand::Pull { image } => {
+        DockerCommand::Pull { image, platform } => {
             let image = {
                 let mut display = progress::PullDisplay::new(&image);
-                store.pull_with_progress(&image, &mut |event| display.update(event))?
+                let mut progress = |event| display.update(event);
+                match platform {
+                    Some(platform) => {
+                        store.pull_for_platform_with_progress(&image, &platform, &mut progress)?
+                    }
+                    None => store.pull_with_progress(&image, &mut progress)?,
+                }
             };
             println!("Digest: {}\n{}", image.digest, image.reference);
         }
@@ -374,6 +388,7 @@ pub(super) fn run(args: DockerArgs) -> anyhow::Result<i32> {
             let config = docker::Create {
                 name: args.name,
                 image: args.invocation[0].clone(),
+                platform: args.platform,
                 command: args.invocation[1..].to_vec(),
                 entrypoint: args.entrypoint,
                 env,
@@ -669,6 +684,37 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         args: DockerArgs,
+    }
+    #[test]
+    fn docker_platform_options_precede_the_image_and_preserve_guest_flags() {
+        let parsed =
+            Cli::try_parse_from(["docker", "pull", "--platform=linux/amd64", "alpine"]).unwrap();
+        let DockerCommand::Pull { platform, image } = parsed.args.command else {
+            panic!()
+        };
+        assert_eq!(platform.as_deref(), Some("linux/amd64"));
+        assert_eq!(image, "alpine");
+        let parsed = Cli::try_parse_from([
+            "docker",
+            "run",
+            "--platform",
+            "linux/arm64/v8",
+            "alpine",
+            "echo",
+            "--platform=guest",
+        ])
+        .unwrap();
+        let DockerCommand::Run(args) = parsed.args.command else {
+            panic!()
+        };
+        assert_eq!(args.platform.as_deref(), Some("linux/arm64/v8"));
+        assert_eq!(args.invocation, ["alpine", "echo", "--platform=guest"]);
+        for command in ["pull", "run"] {
+            assert!(
+                Cli::try_parse_from(["docker", command, "--platform=windows/amd64", "alpine",])
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn command_names_and_guest_arguments_have_separate_boundaries() {

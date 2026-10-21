@@ -21,6 +21,33 @@ use std::time::{Duration, Instant};
 
 pub use crate::image::oci::PullProgress;
 
+fn native_platform() -> String {
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!("linux/{architecture}")
+}
+
+fn canonical_platform(platform: &str) -> anyhow::Result<&'static str> {
+    match platform {
+        "linux/amd64" => Ok("linux/amd64"),
+        "linux/arm64" | "linux/arm64/v8" => Ok("linux/arm64"),
+        _ => bail!("unsupported platform {platform}; expected linux/amd64 or linux/arm64"),
+    }
+}
+
+fn require_native_platform(platform: &str) -> anyhow::Result<()> {
+    let platform = canonical_platform(platform)?;
+    let native = native_platform();
+    ensure!(
+        platform == native,
+        "cannot run {platform} on a {native} VM: cross-architecture emulation is not implemented; --platform selects an image, not a CPU emulator"
+    );
+    Ok(())
+}
+
 /// Persistent image identity and the image's launch defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Image {
@@ -28,8 +55,12 @@ pub struct Image {
     pub reference: String,
     /// OCI configuration digest, used as the Docker image ID.
     pub id: String,
-    /// Selected native-platform manifest digest.
+    /// Selected platform-specific manifest digest.
     pub digest: String,
+    /// Canonical OCI platform (`linux/amd64` or `linux/arm64`). Older records
+    /// default to the host platform because they only supported native pulls.
+    #[serde(default = "native_platform")]
+    pub platform: String,
     /// Prepared root filesystem owned by this user's image store.
     pub rootfs: PathBuf,
     /// Image environment. Host environment is never implicitly inherited.
@@ -81,6 +112,10 @@ pub struct Create {
     pub name: Option<String>,
     /// Image reference or local image ID.
     pub image: String,
+    /// Optional OCI platform assertion. Only the native Linux platform can run;
+    /// unsupported or foreign platforms fail before pulling or publication.
+    #[serde(default)]
+    pub platform: Option<String>,
     /// CLI command overrides CMD; ENTRYPOINT is retained unless overridden.
     pub command: Vec<String>,
     /// `Some(empty)` explicitly clears the image entrypoint.
@@ -353,14 +388,25 @@ impl Store {
         reference: &str,
         progress: &mut dyn FnMut(PullProgress),
     ) -> anyhow::Result<Image> {
+        self.pull_for_platform_with_progress(reference, &native_platform(), progress)
+    }
+    /// Pull `linux/amd64`, `linux/arm64`, or its `linux/arm64/v8` alias.
+    /// A foreign image can be downloaded but cannot run without emulation,
+    /// which this runtime does not provide. Invalid platforms fail before I/O.
+    /// One platform is catalogued per reference: success replaces that reference
+    /// atomically; existing instances retain their pinned images. Failure and
+    /// callback contracts match `pull_with_progress`.
+    pub fn pull_for_platform_with_progress(
+        &self,
+        reference: &str,
+        platform: &str,
+        progress: &mut dyn FnMut(PullProgress),
+    ) -> anyhow::Result<Image> {
+        let platform = canonical_platform(platform)?;
+        let arch = platform.strip_prefix("linux/").unwrap();
         let reference = normalize_reference(reference);
         let reference = reference.as_str();
         let store = crate::image::oci::ImageStore::new(Some(self.root.join("images")))?;
-        let arch = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            "x86_64" => "amd64",
-            other => bail!("unsupported architecture {other}"),
-        };
         let prepared = store.prepare_with_progress(reference, arch, true, progress)?;
         let manifest: serde_json::Value = serde_json::from_reader(File::open(
             self.root.join("images/metadata/manifests-v1").join(format!(
@@ -390,6 +436,7 @@ impl Store {
             reference: reference.into(),
             id,
             digest: prepared.digest,
+            platform: platform.into(),
             rootfs: prepared.rootfs,
             env: prepared.env,
             entrypoint: prepared.entrypoint,
@@ -492,6 +539,9 @@ impl Store {
         mut config: Create,
         progress: &mut dyn FnMut(PullProgress),
     ) -> anyhow::Result<Instance> {
+        if let Some(platform) = &config.platform {
+            require_native_platform(platform)?;
+        }
         ensure!(
             config.cpus > 0 && config.memory_mib >= 16,
             "invalid VM CPU/memory budget"
@@ -518,6 +568,7 @@ impl Store {
         } else {
             self.pull_with_progress(&config.image, progress)?
         };
+        require_native_platform(&image.platform)?;
         let argv = resolve_command(&image, &config);
         ensure!(
             !argv.is_empty() && !argv[0].is_empty(),
@@ -633,6 +684,7 @@ impl Store {
         {
             let _guard = self.lock()?;
             instance = self.resolve(selector)?;
+            require_native_platform(&instance.image.platform)?;
             if self.active(&instance)? && instance.state == "running" {
                 return Ok(instance);
             }
@@ -1336,6 +1388,7 @@ mod tests {
             reference: "fixture:latest".into(),
             id: format!("sha256:{}", "1".repeat(64)),
             digest: format!("sha256:{}", "2".repeat(64)),
+            platform: native_platform(),
             rootfs,
             env: BTreeMap::from([("IMAGE_ENV".into(), "image".into())]),
             entrypoint: vec!["/entry".into()],
@@ -1353,6 +1406,7 @@ mod tests {
         Create {
             name: Some("test".into()),
             image: "fixture:latest".into(),
+            platform: None,
             command: Vec::new(),
             entrypoint: None,
             env: BTreeMap::new(),
@@ -1368,6 +1422,75 @@ mod tests {
             tty: None,
             network: false,
         }
+    }
+    #[test]
+    fn docker_platform_selection_and_legacy_records_preserve_native_defaults() {
+        assert_eq!(canonical_platform("linux/arm64/v8").unwrap(), "linux/arm64");
+        let (_temporary, store, image) = fixture();
+        let mut legacy = serde_json::to_value(&image).unwrap();
+        legacy.as_object_mut().unwrap().remove("platform");
+        let restored: Image = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.platform, native_platform());
+        for invalid in [
+            "",
+            "amd64",
+            "windows/amd64",
+            "linux/arm/v7",
+            "linux/arm64/v9",
+        ] {
+            let error = store
+                .pull_for_platform_with_progress("unused", invalid, &mut |_| {
+                    panic!("invalid platform reached image preparation")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("unsupported platform"));
+        }
+        assert_eq!(store.images().unwrap()[0].id, image.id);
+        let mut config = request();
+        config.platform = Some(native_platform());
+        assert_eq!(
+            store.create(config).unwrap().image.platform,
+            native_platform()
+        );
+    }
+    #[test]
+    fn docker_foreign_platforms_fail_before_pull_creation_or_start() {
+        let (_temporary, store, mut image) = fixture();
+        let foreign = if native_platform() == "linux/arm64" {
+            "linux/amd64"
+        } else {
+            "linux/arm64"
+        };
+        let mut config = request();
+        config.image = "missing-image".into();
+        config.platform = Some(foreign.into());
+        let error = store
+            .create_with_progress(config, &mut |_| panic!("foreign run tried to pull"))
+            .unwrap_err();
+        assert!(error.to_string().contains("cross-architecture emulation"));
+        assert!(store.instances(true).unwrap().is_empty());
+
+        image.platform = foreign.into();
+        store.save_catalog(&[image.clone()]).unwrap();
+        assert!(
+            store
+                .create(request())
+                .unwrap_err()
+                .to_string()
+                .contains(foreign)
+        );
+        assert!(store.instances(true).unwrap().is_empty());
+
+        image.platform = native_platform();
+        store.save_catalog(&[image]).unwrap();
+        let mut instance = store.create(request()).unwrap();
+        instance.image.platform = foreign.into();
+        store.save(&instance).unwrap();
+        let error = store.start(&instance.id).unwrap_err();
+        assert!(error.to_string().contains("cross-architecture emulation"));
+        let unchanged = store.resolve(&instance.id).unwrap();
+        assert_eq!(unchanged.generation, instance.generation);
+        assert_eq!(unchanged.state, instance.state);
     }
     #[test]
     fn docker_creation_pins_defaults_and_command_overrides() {

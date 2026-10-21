@@ -101,6 +101,14 @@ terminal redraws the active layer's bar; redirected output uses plain, throttled
 status lines. Extraction has a phase indicator rather than an estimated percent.
 The same display is used when `run` automatically pulls a missing image.
 
+`pull --platform linux/amd64` or `linux/arm64` selects the image architecture;
+`linux/arm64/v8` is accepted as an alias. Omission selects the native platform.
+Pulling a foreign image is supported, but `run` and `start` reject foreign images
+before launching a VM: CPU emulation is not implemented. `run --platform` asserts
+the native platform, including for cached images. Each local reference holds one
+platform; pulling the same tag for another platform replaces that reference,
+while existing containers keep their pinned images.
+
 The registered commands are exactly `run`, `pull`, `images`, `rmi`, `exec`,
 `ps`, `start`, `stop`, `rm` and `logs`. Compatibility is limited to the options
 listed in `pvisor docker COMMAND --help`; unsupported commands/options fail
@@ -110,8 +118,8 @@ Docker credential-helper integration or cross-architecture emulation.
 
 | Command | Implemented options |
 | --- | --- |
-| `run` | `--name`, `--rm`, `-d`, `-i`, `-t`, `-e`, `--env-file`, `-w`, `-u`, `--entrypoint`, `-v`, `-p`, `--cpus`, `-m/--memory`, `--network bridge/none` |
-| `pull` | One public OCI image reference |
+| `run` | `--platform`, `--name`, `--rm`, `-d`, `-i`, `-t`, `-e`, `--env-file`, `-w`, `-u`, `--entrypoint`, `-v`, `-p`, `--cpus`, `-m/--memory`, `--network bridge/none` |
+| `pull` | `--platform`, one public OCI image reference |
 | `images` | Optional repository, `-q`, `--no-trunc` |
 | `rmi` | Multiple references/IDs, `-f` |
 | `exec` | `-i`, `-t`, `-e`, `-w`, `-u`, command and arguments |

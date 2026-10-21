@@ -51,6 +51,27 @@ fn docker_help_and_empty_queries_are_inert_and_reject_unsupported_commands() {
 }
 
 #[test]
+fn docker_run_rejects_a_foreign_platform_before_pulling() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("store");
+    let foreign = if cfg!(target_arch = "aarch64") {
+        "linux/amd64"
+    } else {
+        "linux/arm64"
+    };
+    let output = command(&home)
+        .args(["run", "--platform", foreign, "unused-image", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cross-architecture emulation"), "{stderr}");
+    assert!(!stderr.contains("Pulling"), "{stderr}");
+    assert_eq!(fs::read_dir(home.join("instances")).unwrap().count(), 0);
+}
+
+#[test]
 fn pull_and_implicit_run_report_waiting_before_network_or_vm_start() {
     use fs2::FileExt;
     use sha2::{Digest, Sha256};
@@ -159,6 +180,12 @@ impl Native {
             reference: "fixture:latest".into(),
             id: format!("sha256:{}", "1".repeat(64)),
             digest: format!("sha256:{}", "2".repeat(64)),
+            platform: if cfg!(target_arch = "aarch64") {
+                "linux/arm64"
+            } else {
+                "linux/amd64"
+            }
+            .into(),
             rootfs: rootfs.canonicalize().unwrap(),
             env: BTreeMap::new(),
             entrypoint: Vec::new(),

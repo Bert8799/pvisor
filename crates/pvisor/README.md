@@ -488,6 +488,13 @@ stage/apply, capture or existing daemon APIs.
 preparation observations for frontend rendering; existing `pull`/`create` callers
 remain silent. Download counts use received compressed bytes, and layer readiness
 follows verification and extraction rather than merely reaching an expected size.
+`pull_for_platform_with_progress` selects `linux/amd64` or `linux/arm64`
+(`linux/arm64/v8` is an alias), independently of the host. Image records retain
+their canonical platform; legacy records default to native because previous
+versions only pulled native images. A reference holds one platform, replaced
+atomically on successful pull; existing instances keep their pinned image.
+`Create.platform` optionally asserts the native platform. Creation and start
+reject foreign images before publication or VM launch; no CPU emulator is supplied.
 
 Each launch self-executes a detached owner and a separate native VMM. Embedding
 applications using `docker::Store::start` must dispatch
