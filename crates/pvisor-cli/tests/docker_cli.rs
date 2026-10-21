@@ -50,6 +50,72 @@ fn docker_help_and_empty_queries_are_inert_and_reject_unsupported_commands() {
     assert_eq!(fs::read_dir(home.join("instances")).unwrap().count(), 0);
 }
 
+#[test]
+fn pull_and_implicit_run_report_waiting_before_network_or_vm_start() {
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{BufRead, BufReader},
+        sync::mpsc,
+        time::Duration,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("store");
+    pvisor::docker::Store::open(home.clone()).unwrap();
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => panic!("unsupported test architecture: {other}"),
+    };
+    // Hold the isolated OCI fixture's preparation lock. Neither command can
+    // reach a registry; progress must be flushed while the request is waiting.
+    let key = serde_json::to_vec(&(
+        "registry-1.docker.io",
+        "library/ubuntu",
+        "latest",
+        architecture,
+    ))
+    .unwrap();
+    let locks = home.join("images/locks");
+    fs::create_dir_all(&locks).unwrap();
+    let hash: String = Sha256::digest(key)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let lock = fs::File::create(locks.join(format!("prepare-{hash}.lock"))).unwrap();
+    lock.lock_exclusive().unwrap();
+    for args in [
+        vec!["pull", "ubuntu:latest"],
+        vec!["run", "ubuntu:latest", "echo", "hello"],
+    ] {
+        let mut child = command(&home)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let lines: Vec<_> = BufReader::new(stderr)
+                .lines()
+                .take(2)
+                .map(Result::unwrap)
+                .collect();
+            let _ = send.send(lines);
+        });
+        let lines = receive.recv_timeout(Duration::from_secs(5));
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            lines.unwrap(),
+            ["Pulling ubuntu:latest", "Waiting for image preparation..."]
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
 struct Native {
     _temporary: tempfile::TempDir,
     home: PathBuf,

@@ -9,6 +9,8 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod progress;
+
 #[derive(Debug, Args)]
 #[command(
     about = "Docker command subset using one rootless VM per container",
@@ -285,7 +287,10 @@ pub(super) fn run(args: DockerArgs) -> anyhow::Result<i32> {
     let store = Store::discover()?;
     match args.command {
         DockerCommand::Pull { image } => {
-            let image = store.pull(&image)?;
+            let image = {
+                let mut display = progress::PullDisplay::new(&image);
+                store.pull_with_progress(&image, &mut |event| display.update(event))?
+            };
             println!("Digest: {}\n{}", image.digest, image.reference);
         }
         DockerCommand::Images(args) => {
@@ -392,7 +397,10 @@ pub(super) fn run(args: DockerArgs) -> anyhow::Result<i32> {
                 tty: args.tty.then(terminal_size),
                 network: args.network != "none",
             };
-            let instance = store.create(config)?;
+            let instance = {
+                let mut display = progress::PullDisplay::new(&config.image);
+                store.create_with_progress(config, &mut |event| display.update(event))?
+            };
             let output = store.output(&instance)?;
             let started = store.start(&instance.id)?;
             let _terminal = Terminal::new(args.tty && !args.detach, args.interactive)?;

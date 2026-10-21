@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub use crate::image::oci::PullProgress;
+
 /// Persistent image identity and the image's launch defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Image {
@@ -340,6 +342,17 @@ impl Store {
     }
     /// Resolve a native OCI image and refresh its reference. Publication is atomic.
     pub fn pull(&self, reference: &str) -> anyhow::Result<Image> {
+        self.pull_with_progress(reference, &mut |_| {})
+    }
+    /// Pull with synchronous progress observations. The callback must return
+    /// promptly and must not panic or reenter this store. Completion is reported
+    /// by the result only; on failure the previous catalog entry is preserved.
+    /// Terminal rendering belongs to the caller, and silent `pull` is unchanged.
+    pub fn pull_with_progress(
+        &self,
+        reference: &str,
+        progress: &mut dyn FnMut(PullProgress),
+    ) -> anyhow::Result<Image> {
         let reference = normalize_reference(reference);
         let reference = reference.as_str();
         let store = crate::image::oci::ImageStore::new(Some(self.root.join("images")))?;
@@ -348,7 +361,7 @@ impl Store {
             "x86_64" => "amd64",
             other => bail!("unsupported architecture {other}"),
         };
-        let prepared = store.prepare_with_refresh(reference, arch, true)?;
+        let prepared = store.prepare_with_progress(reference, arch, true, progress)?;
         let manifest: serde_json::Value = serde_json::from_reader(File::open(
             self.root.join("images/metadata/manifests-v1").join(format!(
                 "{}.json",
@@ -468,7 +481,17 @@ impl Store {
         Ok(found.into_iter().next().unwrap())
     }
     /// Create a stopped instance. A missing image is pulled before publication.
-    pub fn create(&self, mut config: Create) -> anyhow::Result<Instance> {
+    pub fn create(&self, config: Create) -> anyhow::Result<Instance> {
+        self.create_with_progress(config, &mut |_| {})
+    }
+    /// Create an instance, observing preparation if its image must be pulled.
+    /// Local images emit no events. Callback and failure contracts match
+    /// `pull_with_progress`; no owner or VM is started by this operation.
+    pub fn create_with_progress(
+        &self,
+        mut config: Create,
+        progress: &mut dyn FnMut(PullProgress),
+    ) -> anyhow::Result<Instance> {
         ensure!(
             config.cpus > 0 && config.memory_mib >= 16,
             "invalid VM CPU/memory budget"
@@ -493,7 +516,7 @@ impl Store {
         let image = if let Some(image) = candidates.first() {
             (*image).clone()
         } else {
-            self.pull(&config.image)?
+            self.pull_with_progress(&config.image, progress)?
         };
         let argv = resolve_command(&image, &config);
         ensure!(

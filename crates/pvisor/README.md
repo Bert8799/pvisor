@@ -484,6 +484,10 @@ container configuration, writable uppers, managed volumes and launch generation
 records used by `pvisor docker`. The CLI owns Docker argument parsing, rendering
 and terminal adapters. This profile does not convert ordinary Jobs or alter
 stage/apply, capture or existing daemon APIs.
+`Store::pull_with_progress` and `create_with_progress` emit synchronous OCI
+preparation observations for frontend rendering; existing `pull`/`create` callers
+remain silent. Download counts use received compressed bytes, and layer readiness
+follows verification and extraction rather than merely reaching an expected size.
 
 Each launch self-executes a detached owner and a separate native VMM. Embedding
 applications using `docker::Store::start` must dispatch

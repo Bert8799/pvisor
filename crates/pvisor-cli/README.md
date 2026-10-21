@@ -95,6 +95,12 @@ pvisor docker images
 pvisor docker rmi redis:7
 ```
 
+Pulls report metadata resolution, per-layer downloaded bytes and transfer rate,
+checksum verification, extraction and cache hits. Progress goes to stderr: a
+terminal redraws the active layer's bar; redirected output uses plain, throttled
+status lines. Extraction has a phase indicator rather than an estimated percent.
+The same display is used when `run` automatically pulls a missing image.
+
 The registered commands are exactly `run`, `pull`, `images`, `rmi`, `exec`,
 `ps`, `start`, `stop`, `rm` and `logs`. Compatibility is limited to the options
 listed in `pvisor docker COMMAND --help`; unsupported commands/options fail
