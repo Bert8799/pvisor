@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 use anyhow::{Context, bail, ensure};
 use fs2::FileExt;
-use pvisor_guest::container::{self, Reply, Request, read_frame, write_frame};
+use pvisor_guest::control::{self, Reply, Request, read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -1145,11 +1145,11 @@ fn forward(mut client: std::net::TcpStream, endpoint: &Path, port: u16) -> anyho
         loop {
             let size = input.read(&mut bytes)?;
             if size == 0 {
-                return write_frame(&mut writer, &container::StdinFrame::Eof {});
+                return write_frame(&mut writer, &control::StdinFrame::Eof {});
             }
             write_frame(
                 &mut writer,
-                &container::StdinFrame::Data {
+                &control::StdinFrame::Data {
                     bytes: bytes[..size].to_vec(),
                 },
             )?;
@@ -1223,12 +1223,20 @@ fn run_vm(store: &Store, instance: Instance) -> anyhow::Result<()> {
         env: instance.env,
         cwd: instance.cwd,
         stdio_ports: Some([false, true, true]),
-        container: Some(container::ContainerConfig {
-            user: instance.user,
-            mounts: Vec::new(),
-            interactive: instance.config.interactive,
+        process: Some(pvisor_guest::ProcessConfig {
+            user: Some(instance.user),
+            // Docker's default bounding set is a host-side compatibility policy.
+            capabilities: Some(vec![0, 1, 3, 4, 5, 6, 7, 8, 10, 13, 18, 27, 29, 31]),
+            new_session: true,
+            stdin: if instance.config.interactive {
+                pvisor_guest::StdinMode::Pipe
+            } else {
+                pvisor_guest::StdinMode::Closed
+            },
             tty: instance.config.tty,
+            create_workdir: true,
         }),
+        control: true,
         ..Default::default()
     };
     for (index, mount) in instance.config.mounts.iter().enumerate() {
@@ -1238,17 +1246,12 @@ fn run_vm(store: &Store, instance: Instance) -> anyhow::Result<()> {
         } else {
             vm.filesystem(&tag, &mount.source, 0)?;
         }
-        guest
-            .container
-            .as_mut()
-            .unwrap()
-            .mounts
-            .push(container::Mount {
-                tag,
-                target: mount.target.clone(),
-                read_only: mount.read_only,
-                initialize: mount.volume.is_some(),
-            });
+        guest.mounts.push(pvisor_guest::Mount {
+            tag,
+            target: mount.target.clone(),
+            read_only: mount.read_only,
+            initialize: mount.volume.is_some(),
+        });
     }
     let _network = if instance.config.network {
         use pvisor_overlaynet::{
@@ -1279,7 +1282,7 @@ fn run_vm(store: &Store, instance: Instance) -> anyhow::Result<()> {
         0o400,
         true,
     )?;
-    vm.vsock_port(container::CONTROL_PORT, endpoint, true)?;
+    vm.vsock_port(control::CONTROL_PORT, endpoint, true)?;
     vm.task_stdio(-1, 1, 2)?;
     let ready = directory.join(format!("boot-{}", instance.generation));
     vm.run(move |_| fs::write(ready, b"ready"))?;
@@ -1292,7 +1295,7 @@ fn run_vm(_: &Store, _: Instance) -> anyhow::Result<()> {
 }
 
 /// Shared guest protocol for CLI stream adapters.
-pub use pvisor_guest::container::{
+pub use pvisor_guest::control::{
     Reply as GuestReply, Request as GuestRequest, StdinFrame as GuestStdin,
     read_frame as read_guest_frame, write_frame as write_guest_frame,
 };

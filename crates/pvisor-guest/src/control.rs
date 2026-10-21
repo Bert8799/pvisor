@@ -1,4 +1,4 @@
-//! Launch and control messages for an independently owned container VM.
+//! Host-only guest control messages; process policy belongs to the launch contract.
 #![deny(missing_docs)]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -9,34 +9,6 @@ use std::path::PathBuf;
 pub const CONTROL_PORT: u32 = 1025;
 /// Maximum encoded control frame, including streamed output frames.
 pub const MAX_FRAME: usize = 1024 * 1024;
-
-/// Additional launch configuration for the container command profile.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContainerConfig {
-    /// Guest user or numeric UID, optionally followed by `:GROUP`.
-    pub user: String,
-    /// Extra guest virtio-fs mounts, installed before changing user.
-    pub mounts: Vec<Mount>,
-    /// Keep the main process's stdin open until an input attachment closes it.
-    pub interactive: bool,
-    /// Allocate a guest terminal with `[rows, columns]`, or use separate pipes.
-    pub tty: Option<[u16; 2]>,
-}
-
-/// One host-owned share. The source is a VMM tag, never a guest-provided host path.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Mount {
-    /// VMM filesystem tag.
-    pub tag: String,
-    /// Absolute guest mount location.
-    pub target: PathBuf,
-    /// Install a guest read-only mount.
-    pub read_only: bool,
-    /// Populate an empty managed volume from the image destination before mounting.
-    pub initialize: bool,
-}
 
 /// One operation on the current VM generation. Requests are length-bounded.
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,13 +27,13 @@ pub enum Request {
     Exec {
         /// Executable and arguments; the program must be nonempty.
         argv: Vec<String>,
-        /// Overrides merged with the container launch environment.
+        /// Overrides merged with the workload launch environment.
         env: BTreeMap<String, String>,
         /// Environment names to remove before applying overrides.
         unset_env: Vec<String>,
         /// Absolute working-directory override; omission inherits launch cwd.
         cwd: Option<PathBuf>,
-        /// Guest user/group override; omission inherits the image user.
+        /// Guest user/group override; omission inherits the launch identity.
         user: Option<String>,
         /// Optional terminal dimensions, rows followed by columns.
         tty: Option<[u16; 2]>,
@@ -117,7 +89,7 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> io::Resul
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "container frame exceeds 1 MiB",
+            "guest control frame exceeds 1 MiB",
         ));
     }
     writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
@@ -132,7 +104,7 @@ pub fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> io:
     if size > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "container frame exceeds 1 MiB",
+            "guest control frame exceeds 1 MiB",
         ));
     }
     let mut bytes = vec![0; size];

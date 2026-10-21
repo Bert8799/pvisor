@@ -78,6 +78,9 @@ commands and their stage/review/apply semantics are unchanged. Each container
 uses its own Linux VM and supervisor, started as the current host user. No
 central Docker daemon, privileged helper or shared Linux VM is required.
 Guest root is independent of host root; the image's `User` is respected.
+Docker defaults are translated on the host into generic guest launch options.
+Jobs, container workloads and exec share one guest launcher and PID-1 reaper;
+the optional control transport does not implement a separate supervisor.
 
 ```bash
 pvisor docker pull alpine:3.20
@@ -268,8 +271,10 @@ virtualization access:
 
 ```bash
 PVISOR_DOCKER_TEST_ROOTFS=/absolute/path/to/rootfs just test pvisor-cli -- \
-  -E 'test(docker_native_vm_lifecycle_streams_terminal_and_persistent_upper)' --run-ignored only
+  -E 'binary(docker_cli)' --run-ignored only
 ```
 
 It checks startup failure, exit codes, stdout/stderr, stdin EOF, PTY allocation,
-detached lifetime, stop/start persistence and foreground signal forwarding.
+detached lifetime, stop/start persistence, foreground signal forwarding, orphan
+reaping and concurrent exec exit routing. A separate ordinary Job VM case checks
+the default launch configuration's orphan reaping and exit status.

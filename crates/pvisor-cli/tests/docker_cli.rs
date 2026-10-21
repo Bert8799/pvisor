@@ -139,6 +139,39 @@ impl Native {
         );
         output
     }
+
+    fn job(&self, script: &str, expected: i32) {
+        let root = self._temporary.path();
+        let mut command = Command::new(&self.binary);
+        for (key, directory) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
+            fs::create_dir(root.join(directory)).unwrap();
+            command.env(key, root.join(directory));
+        }
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let output = command
+            .current_dir(workspace)
+            .env("PVISOR_RUN_HOME", root.join("jobs"))
+            .env("PVISOR_STARTUP_TIMING", "0")
+            .args(["run", "--executor", "vm", "--rootfs"])
+            .arg(std::env::var_os("PVISOR_DOCKER_TEST_ROOTFS").unwrap())
+            .args(["--stdio", "capture", "--", "/bin/sh", "-c", script])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 impl Drop for Native {
     fn drop(&mut self) {
@@ -151,8 +184,33 @@ impl Drop for Native {
 
 #[test]
 #[ignore = "requires native virtualization, local sockets and PVISOR_DOCKER_TEST_ROOTFS"]
+fn job_native_vm_uses_shared_supervision() {
+    Native::new().job(
+        include_str!("../../pvisor-guest/tests/fixtures/reap_orphans.sh"),
+        0,
+    );
+    Native::new().job("echo job-stderr >&2; exit 7", 7);
+}
+
+#[test]
+#[ignore = "requires native virtualization, local sockets and PVISOR_DOCKER_TEST_ROOTFS"]
 fn docker_native_vm_lifecycle_streams_terminal_and_persistent_upper() {
     let native = Native::new();
+    let reap_orphans = include_str!("../../pvisor-guest/tests/fixtures/reap_orphans.sh");
+    native.call(
+        &[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "fixture",
+            "/bin/sh",
+            "-c",
+            reap_orphans,
+        ],
+        None,
+        0,
+    );
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mapping = format!("127.0.0.1:{}:8080", occupied.local_addr().unwrap().port());
     let output = native.call(
@@ -221,6 +279,29 @@ fn docker_native_vm_lifecycle_streams_terminal_and_persistent_upper() {
     );
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim().len(), 64);
     native.call(&["exec", "native-test", "/no-such-command"], None, 127);
+    native.call(
+        &["exec", "native-test", "/bin/sh", "-c", reap_orphans],
+        None,
+        0,
+    );
+    std::thread::scope(|scope| {
+        for code in [7, 23, 0, 19] {
+            let native = &native;
+            scope.spawn(move || {
+                native.call(
+                    &[
+                        "exec",
+                        "native-test",
+                        "/bin/sh",
+                        "-c",
+                        &format!("exit {code}"),
+                    ],
+                    None,
+                    code,
+                );
+            });
+        }
+    });
     let output = native.call(
         &["exec", "-i", "native-test", "/bin/cat"],
         Some(b"input\n"),

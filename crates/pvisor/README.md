@@ -494,12 +494,12 @@ its owner dies. Stop escalation goes through the current owner and generation;
 no command signals a host PID saved in metadata. VM setup errors and workload
 exit codes remain visible in completion records and instance output.
 
-The guest supervisor's optional container contract adds same-VM exec, stdin,
-PTY allocation, signal delivery and TCP publication over explicit virtio-vsock.
-It carries no host filesystem paths or host lifecycle authority. Accepted peers
-must be the host CID. Main and exec workloads use the default Docker capability
-bounding set; guest root cannot remount a read-only share. Ordinary Job guests
-omit this optional contract and keep their original launch/reaping path.
+The host translates Docker defaults into generic guest process/mount options,
+including the Docker capability bounding set. The guest has one launcher and
+PID-1 reaper shared by Jobs, the initial workload and exec. An optional host-CID
+vsock adapter adds same-VM exec, stdin, signal delivery and TCP publication;
+it owns no separate process lifecycle or host filesystem/lifecycle authority.
+Ordinary Job configurations retain inherited identity/session/stdio defaults.
 
 The supported CLI profile and its explicit differences from Docker are in the
 [application README](../pvisor-cli/README.md#docker-command-profile-experimental).
