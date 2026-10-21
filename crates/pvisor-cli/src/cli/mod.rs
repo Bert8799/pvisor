@@ -1,6 +1,7 @@
 //! Job lifecycle commands and dispatch to first-party companions.
 mod cache;
 mod checkpoint;
+mod docker;
 mod features;
 #[cfg(unix)]
 pub(crate) mod host;
@@ -46,6 +47,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run Docker-compatible commands in independent rootless VMs.
+    Docker(docker::DockerArgs),
     /// List runtime experiments.
     Feature(crate::cli::features::FeatureArgs),
     /// Build, publish and query image, rootfs and workspace caches.
@@ -97,7 +100,10 @@ fn grouped_commands(command: &clap::Command) -> String {
         ("Execution", &["run", "status", "kill"]),
         ("Changes", &["review", "apply", "drop", "inspect"]),
         ("Checkpoints", &["checkpoint", "suspend", "resume", "fork"]),
-        ("Tools", &["cache", "replay", "tui", "feature", "help"]),
+        (
+            "Tools",
+            &["docker", "cache", "replay", "tui", "feature", "help"],
+        ),
     ];
     let width = command
         .get_subcommands()
@@ -173,6 +179,9 @@ fn normalize_default_run(mut args: Vec<OsString>, command: &clap::Command) -> Ve
 }
 
 pub fn main() -> anyhow::Result<()> {
+    if pvisor::docker::internal_if_requested()? {
+        return Ok(());
+    }
     if host_service::internal_if_requested()? {
         return Ok(());
     }
@@ -269,9 +278,39 @@ pub fn main() -> anyhow::Result<()> {
     } else {
         core_command
     };
-    let mut parsed = Cli::from_arg_matches(&command.get_matches_from(args.clone()))?;
+    let matches = match command.try_get_matches_from(args.clone()) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let offset = command_offset(&args);
+            if error.use_stderr()
+                && args.get(offset).is_some_and(|arg| arg == "docker")
+                && args.get(offset + 1).is_some_and(|arg| arg == "run")
+            {
+                error.print()?;
+                finish(125);
+                return Ok(());
+            }
+            error.exit();
+        }
+    };
+    let mut parsed = Cli::from_arg_matches(&matches)?;
     if let Command::Feature(query) = &parsed.command {
         return query.print(&parsed.features);
+    }
+    if let Command::Docker(args) = parsed.command {
+        anyhow::ensure!(
+            parsed.features.is_empty(),
+            "--feature enables apply only to run or feature queries"
+        );
+        let failure_code = args.failure_exit_code();
+        match docker::run(args) {
+            Ok(code) => finish(code),
+            Err(error) => {
+                eprintln!("pvisor docker: {error:#}");
+                finish(failure_code);
+            }
+        }
+        return Ok(());
     }
     // Informational invocations return without emitting execution diagnostics.
     pvisor::startup_mark("process.entry");
@@ -289,6 +328,7 @@ pub fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     match parsed.command {
+        Command::Docker(_) => unreachable!("Docker commands dispatch before Job startup"),
         Command::Feature(_) => unreachable!("feature queries return without contacting Host"),
         Command::Cache(args) => cache::run(args)?,
         Command::Run(run) => {

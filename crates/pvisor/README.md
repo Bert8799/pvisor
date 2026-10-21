@@ -477,6 +477,35 @@ is a separate executable linking `pvisor` and `pvisor-core`; synchronous interna
 VM dispatch runs before Tokio. Packaging does not supply or validate the
 prepared-image bootstrap, SDK conformance or density.
 
+## Independent container VM lifecycle
+
+The experimental `docker` module owns the user-private image catalog, pinned
+container configuration, writable uppers, managed volumes and launch generation
+records used by `pvisor docker`. The CLI owns Docker argument parsing, rendering
+and terminal adapters. This profile does not convert ordinary Jobs or alter
+stage/apply, capture or existing daemon APIs.
+
+Each launch self-executes a detached owner and a separate native VMM. Embedding
+applications using `docker::Store::start` must dispatch
+`docker::internal_if_requested` at process entry, before threads or normal CLI
+parsing. Lifecycle mutations use the catalog lock, and both owner and VMM hold
+independent lifetime leases. A private inherited pipe terminates the VMM when
+its owner dies. Stop escalation goes through the current owner and generation;
+no command signals a host PID saved in metadata. VM setup errors and workload
+exit codes remain visible in completion records and instance output.
+
+The guest supervisor's optional container contract adds same-VM exec, stdin,
+PTY allocation, signal delivery and TCP publication over explicit virtio-vsock.
+It carries no host filesystem paths or host lifecycle authority. Accepted peers
+must be the host CID. Main and exec workloads use the default Docker capability
+bounding set; guest root cannot remount a read-only share. Ordinary Job guests
+omit this optional contract and keep their original launch/reaping path.
+
+The supported CLI profile and its explicit differences from Docker are in the
+[application README](../pvisor-cli/README.md#docker-command-profile-experimental).
+A passing catalog or protocol test does not establish Linux/KVM acceptance,
+Docker SDK conformance, database durability or performance.
+
 ## Source and application boundary
 
 Runtime APIs are exported explicitly from `src/lib.rs`: `PVisor`, Session/Attempt

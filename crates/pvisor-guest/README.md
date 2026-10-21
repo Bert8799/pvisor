@@ -25,3 +25,30 @@ Capacity is charged inside guest RAM; it does not allocate a second VM memory bu
 The pVisor VM executor selects a unique directory and sets default TMPDIR to it. Capacity is one quarter of effective guest RAM, capped at 64 MiB. An explicit invocation TMPDIR disables this default, as does overlap with the workspace. The original image `/tmp` remains available. Other GuestConfig consumers that omit the optional field retain their existing behavior; JSON serialization omits it when absent.
 
 The CLI snapshot launcher and container shim omit this option. Launch-message unit tests do not establish RAM snapshot/fork behavior with the executor-selected tmpfs.
+
+## Optional container supervisor
+
+`GuestConfig.container` opts into the independent container-VM command profile.
+Omitting it preserves ordinary Job behavior and does not start a control server.
+The launch contract carries the image user, directory mount tags, stdin mode and
+optional initial PTY dimensions. It contains no host source paths.
+
+The container supervisor mounts shares, initializes empty managed volumes from
+the image, creates the working directory, applies guest IDs/limits and the
+Docker default capability bounding set, then launches the main process in its
+own process group. The default bounding set excludes `CAP_SYS_ADMIN`; workload
+root cannot remount a read-only share. The guest supervisor remains responsible
+for privileged initialization. Main exit terminates remaining guest processes
+before the existing final virtio-fs synchronization and exit report.
+
+An explicit vsock listener on port 1025 accepts only host-CID peers. Bounded
+frames support ping, main stdin attachment, process-group signals, exec and
+TCP tunnels to guest loopback services. Exec inherits launch environment and
+working directory unless overridden, keeps stdout/stderr separate without a
+PTY, and reports 126/127 for execution errors. TTY mode combines output on the
+PTY and supports initial dimensions; live resizing is not implemented.
+
+Both host and guest use `container`'s shared protocol definitions. Raw vsock
+accept is required: `UnixListener::accept` rejects AF_VSOCK peer addresses.
+Protocol tests reject oversized and unknown-field frames; real VM tests remain
+necessary for terminal, mount, networking and process-lifecycle behavior.

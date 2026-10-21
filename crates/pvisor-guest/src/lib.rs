@@ -1,4 +1,5 @@
 //! Launch contract shared by the host executors and the Linux guest.
+pub mod container;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -41,6 +42,10 @@ pub struct GuestConfig {
     pub stdio_ports: Option<[bool; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary_filesystem: Option<TemporaryFilesystem>,
+    /// Opt in to the container supervisor and its guest-only control channel.
+    /// Omission retains the existing Job launch and reaping behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<container::ContainerConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

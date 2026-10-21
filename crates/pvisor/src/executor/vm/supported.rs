@@ -2810,6 +2810,7 @@ fn guest_config(
         agent: None,
         stdio_ports: None,
         temporary_filesystem: None,
+        container: None,
     }
 }
 

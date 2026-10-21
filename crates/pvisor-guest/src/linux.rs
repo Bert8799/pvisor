@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod container;
+
 fn check(result: libc::c_int) -> io::Result<()> {
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -345,7 +347,11 @@ fn run() -> io::Result<i32> {
             .stderr(Stdio::null())
             .spawn()?;
     }
-    workload(&config)
+    if let Some(container) = &config.container {
+        container::run(&config, container)
+    } else {
+        workload(&config)
+    }
 }
 
 pub fn main() {

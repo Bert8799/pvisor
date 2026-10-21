@@ -71,6 +71,80 @@ there is no user-wide digest admission or generation socket. For upgrade, drain
 old Jobs and stop the old `--pvisor-internal-host` with the old binary first.
 New CLIs read old records without live control as disk state only.
 
+## Docker command profile (experimental)
+
+`pvisor docker` adds a separate container workflow. Existing top-level Job
+commands and their stage/review/apply semantics are unchanged. Each container
+uses its own Linux VM and supervisor, started as the current host user. No
+central Docker daemon, privileged helper or shared Linux VM is required.
+Guest root is independent of host root; the image's `User` is respected.
+
+```bash
+pvisor docker pull alpine:3.20
+pvisor docker run --rm alpine:3.20 echo hello
+pvisor docker run -d --name redis -p 127.0.0.1:6379:6379 redis:7
+pvisor docker exec -it redis redis-cli
+pvisor docker logs -f redis
+pvisor docker stop redis
+pvisor docker start redis
+pvisor docker rm -f redis
+pvisor docker images
+pvisor docker rmi redis:7
+```
+
+The registered commands are exactly `run`, `pull`, `images`, `rmi`, `exec`,
+`ps`, `start`, `stop`, `rm` and `logs`. Compatibility is limited to the options
+listed in `pvisor docker COMMAND --help`; unsupported commands/options fail
+rather than being silently ignored. This is not complete Docker CLI or
+Docker Engine API compatibility. There is no `build`, Compose, Docker socket,
+Docker credential-helper integration or cross-architecture emulation.
+
+| Command | Implemented options |
+| --- | --- |
+| `run` | `--name`, `--rm`, `-d`, `-i`, `-t`, `-e`, `--env-file`, `-w`, `-u`, `--entrypoint`, `-v`, `-p`, `--cpus`, `-m/--memory`, `--network bridge/none` |
+| `pull` | One public OCI image reference |
+| `images` | Optional repository, `-q`, `--no-trunc` |
+| `rmi` | Multiple references/IDs, `-f` |
+| `exec` | `-i`, `-t`, `-e`, `-w`, `-u`, command and arguments |
+| `ps` | `-a`, `-q`, `--no-trunc` |
+| `start` | Multiple container names/IDs |
+| `stop` | Multiple names/IDs, `-t/--timeout`, `-s/--signal` |
+| `rm` | Multiple names/IDs, `-f`, `-v` |
+| `logs` | One container, `-f` |
+
+The first profile supports Apple Silicon macOS/HVF and Linux x86_64/KVM;
+Linux runtime acceptance must be validated separately. macOS binaries require
+the existing Hypervisor entitlement and firmware. Each `--cpus` unit is a
+whole vCPU, not a fractional Docker CPU quota. `--memory` sizes total guest
+RAM. Public IPv4 TCP/DNS egress uses existing OverlayNet policy; general UDP,
+IPv6, host networking, private-address egress and cross-container discovery
+are not implemented. `-p` publishes TCP through the owning VM's guest control
+transport; omitted host addresses bind `0.0.0.0`, matching Docker syntax.
+An exposed image port does not publish itself.
+
+Directory bind mounts require an existing source. Named and anonymous volumes
+are managed separately from instance uppers; empty managed volumes are
+initialized from the image destination. Special-file initialization is
+unsupported. An empty managed volume must first be initialized through a
+writable mount before it can be mounted read-only. Read-only shares reject
+mutation requests in the host adapter as well as in the guest mount. `stop`/`start` retains the instance upper and volumes; `rm` drops
+the upper, `rm -v` also drops anonymous volumes, and named volumes survive.
+There is not yet a volume-management CLI or image-blob garbage collector;
+`rmi` removes local references while retaining the internal OCI cache.
+
+TTY allocation supports initial terminal dimensions; live resizing and detach
+key sequences are not implemented. stdout/stderr retain separate log streams
+without a merged timestamp ordering or `--since`/`--tail` filtering. Current
+human-readable list output is a pVisor rendering; scripts should use the
+implemented quiet options. Read the supported profile rather than assuming
+that every flag of a registered Docker command is available.
+
+Storage defaults to the current user's local data directory under
+`pvisor/docker`. `PVISOR_DOCKER_HOME` selects an isolated store, including for
+tests. It must be private to the current user and cannot be a bind-mount source
+or ancestor. Per-generation control sockets live below an owned `0700`
+`/tmp/pvisor-docker-UID` directory, keeping macOS Unix socket paths short.
+
 ## Prepared VM rootfs
 
 `pvisor cache prepare-rootfs --rootfs DIR --base-store STORE` is a local operation,
@@ -186,3 +260,16 @@ platform limits. Its command examples refer to these installed frontends.
 Use `just test pvisor-cli` for application tests and `just test pvisor` for
 runtime tests. Native VM and ignored environment-dependent gates retain their
 existing prerequisites; compile checks are not real-guest validation.
+
+The Docker native acceptance test uses an isolated store and a native Linux
+rootfs containing `sh`, `cat` and `sleep`. On macOS it signs a private binary
+copy with the existing Hypervisor entitlement. Run it with local socket and
+virtualization access:
+
+```bash
+PVISOR_DOCKER_TEST_ROOTFS=/absolute/path/to/rootfs just test pvisor-cli -- \
+  -E 'test(docker_native_vm_lifecycle_streams_terminal_and_persistent_upper)' --run-ignored only
+```
+
+It checks startup failure, exit codes, stdout/stderr, stdin EOF, PTY allocation,
+detached lifetime, stop/start persistence and foreground signal forwarding.
