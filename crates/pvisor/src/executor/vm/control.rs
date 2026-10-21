@@ -490,13 +490,9 @@ impl VmControl {
         ) {
             let binding = connection
                 .checkpoint
-                .as_ref()
+                .clone()
                 .ok_or_else(|| anyhow::anyhow!("VM has no durable execution checkpoint binding"))?;
-            Some(
-                tempfile::Builder::new()
-                    .prefix("capture-")
-                    .tempdir_in(binding.store.join("captures"))?,
-            )
+            Some(tokio::task::spawn_blocking(move || binding.capture_directory()).await??)
         } else {
             None
         };
@@ -817,8 +813,7 @@ mod tests {
 
     fn checkpoint_binding(directory: &Path) -> super::super::checkpoint::LaunchBinding {
         let store = directory.join("snapshots");
-        crate::environment_snapshot::SnapshotStore::new(&store).unwrap();
-        std::fs::create_dir(store.join("captures")).unwrap();
+        crate::environment_snapshot::SnapshotStore::prepare_launch(&store).unwrap();
         super::super::checkpoint::LaunchBinding {
             store,
             filesystem_pool: None,
@@ -840,6 +835,48 @@ mod tests {
         let mut bytes = vec![0; size];
         runner.read_exact(&mut bytes).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn capture_storage_failure_precedes_freeze_and_preserves_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let binding = checkpoint_binding(directory.path());
+        let captures = binding.store.join("captures");
+        let cancellation = CancellationToken::new();
+        let control = VmControl::new(cancellation.clone());
+        let (host, runner) = UnixStream::pair().unwrap();
+        control
+            .attach_with_checkpoint(
+                host,
+                RamBacking::create(Some(&directory.path().join("ram"))).unwrap(),
+                Some(binding),
+            )
+            .await;
+        for symlink_failure in [false, true] {
+            if symlink_failure {
+                symlink(directory.path().join("absent"), &captures).unwrap();
+            } else {
+                std::fs::write(&captures, b"not a directory").unwrap();
+            }
+            assert!(
+                control
+                    .command(OperationKind::RunCheckpoint {
+                        request_id: "save".into(),
+                        ram_storage: pvisor_core::operation::SnapshotRamStorage::Raw,
+                    })
+                    .await
+                    .is_err()
+            );
+            assert!(!cancellation.is_cancelled());
+            assert!(control.connection.lock().await.is_some());
+            let mut byte = [0];
+            assert_eq!(
+                runner.try_read(&mut byte).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            std::fs::remove_file(&captures).unwrap();
+        }
+        control.detach().await;
     }
 
     #[tokio::test]

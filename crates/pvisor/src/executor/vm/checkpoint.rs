@@ -59,6 +59,22 @@ impl RetainedLower {
 }
 
 impl LaunchBinding {
+    pub(super) fn capture_directory(&self) -> anyhow::Result<tempfile::TempDir> {
+        // All fallible storage work finishes before asking the runner to freeze.
+        self.snapshot_store()?;
+        let captures = self.store.join("captures");
+        match fs::symlink_metadata(&captures) {
+            Ok(metadata) => ensure!(metadata.is_dir(), "invalid checkpoint capture directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Persistence::create_dir_all_durable(&captures)?;
+        tempfile::Builder::new()
+            .prefix("capture-")
+            .tempdir_in(captures)
+            .map_err(Into::into)
+    }
+
     fn snapshot_store(&self) -> anyhow::Result<SnapshotStore> {
         match &self.filesystem_pool {
             Some(pool) => SnapshotStore::with_filesystem_pool(&self.store, pool),
@@ -166,9 +182,13 @@ pub(super) fn binding(
         })
         .transpose()?;
     if filesystem_pool.is_none() {
-        SnapshotStore::new(&store)?;
+        SnapshotStore::prepare_launch(&store)?;
     }
-    Persistence::create_dir_all_durable(&store.join("captures"))?;
+    match fs::symlink_metadata(store.join("captures")) {
+        Ok(metadata) => ensure!(metadata.is_dir(), "invalid checkpoint capture directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(LaunchBinding {
         store,
         filesystem_pool,
@@ -761,6 +781,42 @@ pub(super) fn lookup_request(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[test]
+    fn launch_binding_defers_capture_trees_but_fixes_compatibility() {
+        let temp = tempfile::tempdir().unwrap();
+        let firmware = temp.path().join("firmware");
+        fs::write(&firmware, b"bound firmware").unwrap();
+        let binding = binding(
+            temp.path().join("store"),
+            "run".into(),
+            "attempt".into(),
+            Some(&firmware),
+            None,
+        )
+        .unwrap();
+        assert!(!binding.compatibility.build.is_empty());
+        assert!(!binding.compatibility.firmware.is_empty());
+        assert_eq!(fs::read_dir(&binding.store).unwrap().count(), 0);
+        let directory = binding.capture_directory().unwrap();
+        let path = directory.path().to_owned();
+        assert_eq!(
+            path.parent(),
+            Some(binding.store.join("captures").as_path())
+        );
+        for name in ["objects", "pending", "content", "filesystems"] {
+            assert!(binding.store.join(name).is_dir());
+        }
+        drop(directory);
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(binding.store.join("captures"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 
     #[cfg(all(
         not(target_env = "musl"),

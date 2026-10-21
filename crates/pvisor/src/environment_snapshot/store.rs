@@ -382,6 +382,16 @@ fn validate_environment_checked(
 
 impl SnapshotStore {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
+        Self::initialize(root, true)
+    }
+
+    // Native launch fixes the private root and validates existing children.
+    // Missing capture-only trees are created durably before a capture request.
+    pub(crate) fn prepare_launch(root: &Path) -> anyhow::Result<Self> {
+        Self::initialize(root, false)
+    }
+
+    fn initialize(root: &Path, create_children: bool) -> anyhow::Result<Self> {
         // mkdir is the arbitration point for concurrent first use. An exists
         // check followed by mkdir spuriously fails when another runner wins.
         // Create private directories from the outset, then validate even when
@@ -447,7 +457,15 @@ impl SnapshotStore {
             "filesystem-build-locks",
         ] {
             let path = root.join(name);
-            directory(&path)?;
+            if create_children {
+                directory(&path)?;
+            } else {
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) => ensure!(metadata.is_dir(), "invalid snapshot store directory"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         Ok(Self {
             filesystem_pool: root.clone(),
@@ -1806,6 +1824,42 @@ impl PublishedEnvironment {
             fs::metadata(self.filesystem_pool.join("filesystems"))?.dev()
                 == fs::metadata(references)?.dev(),
         )
+    }
+}
+
+#[cfg(test)]
+mod launch_storage_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn launch_checks_existing_storage_and_capture_rechecks_late_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        SnapshotStore::prepare_launch(&root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        for name in ["objects", "prepared-rootfs", "filesystems"] {
+            let path = root.join(name);
+            fs::write(&path, b"invalid storage").unwrap();
+            assert!(SnapshotStore::prepare_launch(&root).is_err());
+            fs::remove_file(&path).unwrap();
+            symlink(temp.path().join("absent"), &path).unwrap();
+            assert!(SnapshotStore::prepare_launch(&root).is_err());
+            fs::remove_file(&path).unwrap();
+        }
+        SnapshotStore::prepare_launch(&root).unwrap();
+        symlink(temp.path(), root.join("objects")).unwrap();
+        assert!(SnapshotStore::new(&root).is_err());
+        fs::remove_file(root.join("objects")).unwrap();
+        let store = SnapshotStore::new(&root).unwrap();
+        assert!(store.begin().is_ok());
+        let alias = temp.path().join("alias");
+        symlink(&root, &alias).unwrap();
+        assert!(SnapshotStore::prepare_launch(&alias).is_err());
     }
 }
 

@@ -401,6 +401,22 @@ and [configuration example](../../docs/src/en/reference/config.md#vm-control-mem
 
 ## Resource ownership and local cold compression
 
+Native VM checkpoint admission fixes compatibility and the private snapshot-store
+root before launch, and rejects existing non-directory storage entries. Without an
+explicit filesystem pool, missing snapshot object/catalog trees are initialized
+durably on the first capture, together with its temporary capture directory,
+before sending any freeze request. Storage preparation failures leave the live
+control connection usable; capture still uses the existing publication and cleanup
+transaction. Explicit filesystem pools retain their eager launch validation.
+
+This trades earlier storage preparation for lower VM startup latency: the first
+checkpoint pays for missing directories, and creation or synchronization errors
+can surface at that request instead of preventing VM startup. A preparation
+failure creates no new checkpoint and leaves the guest running. A caller that
+requires resumable execution must confirm successful capture before exiting;
+exiting after a failed capture loses any uncaptured in-memory/process state.
+An older valid checkpoint does not contain changes made since its capture.
+
 `pvisor-daemon serve --sandbox --memory-pool` enables the daemon-owned experimental pool;
 the daemon starts or reuses its detached `pvisor-daemon memory-pool --directory DIR`
 component. Linux `--memory-pool-mode compressed` selects shared sealed compressed
