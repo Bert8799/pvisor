@@ -1,0 +1,116 @@
+# Podman-derived Docker CLI contracts
+
+This directory retains complete copies of Podman's `test/system/` and
+`test/e2e/` under `upstream/test/`, plus an adapted supported-command profile
+in `system/` (Bats) and `e2e/` (Go). See `UPSTREAM.md` for the exact revision,
+license and adaptation map. The upstream copies are reference material: they
+are not executable pVisor gates and must not be included in normal discovery.
+
+The adapted suites drive `pvisor docker` as a black box and check expected
+outputs, exit codes and lifecycle effects, following Podman's system/e2e model.
+They require no Docker executable, daemon, socket or comparison run. Cases that
+specifically interoperate with a real Docker daemon are excluded with reasons.
+The suites use neither Podman storage nor pVisor private APIs. Go uses its
+standard-library test runner instead of importing Podman's Ginkgo harness;
+Bats retains its upstream framework.
+
+## Run
+
+Build pVisor first with `just build`. Install Bats 1.5+, Python 3.10+ and Go 1.20+ separately if needed.
+From the repository root:
+
+```sh
+PVISOR_BINARY="$PWD/target/debug/pvisor" bats tests/podman/system
+PVISOR_BINARY="$PWD/target/debug/pvisor" go test -v tests/podman/e2e/cli_test.go
+```
+
+On Apple Silicon, the executable needs the Hypervisor entitlement and its
+adjacent `libkrunfw.5.dylib`. To sign a private copy without changing your build:
+
+```sh
+runtime_dir=$(mktemp -d)
+cp target/debug/pvisor "$runtime_dir/pvisor"
+ln -s "$PWD/target/debug/libkrunfw.5.dylib" "$runtime_dir/libkrunfw.5.dylib"
+codesign --force --sign - --entitlements crates/pvisor/macos-hypervisor.entitlements "$runtime_dir/pvisor"
+export PVISOR_BINARY="$runtime_dir/pvisor"
+# Run either suite using PVISOR_BINARY, then remove runtime_dir.
+```
+
+These are special external-runtime runners, separate from `just test`.
+`PVISOR_BINARY` selects a single executable path (default: `pvisor` in PATH),
+not a shell command string. Every invocation prepends the `docker` subcommand;
+there is no engine selector. Missing pVisor, image pull failures or unavailable
+virtualization fail active cases rather than skip them.
+
+Each test owns a private `PVISOR_DOCKER_HOME`, a unique container name and bounded
+command timeouts. Cleanup removes that container and the private store, including
+its test images and named volumes. `PVISOR_TEST_IMAGE` defaults to
+`docker.io/library/alpine:3.20`; set a pinned Alpine manifest digest for repeatable
+runs and record `pvisor --version` and host architecture. Bats uses Python 3 for
+bounded process execution; Go uses `context` deadlines.
+
+## Coverage and limits
+
+The active profile has 15 Bats cases and 14 Go cases. Each test first pulls its
+image; none is skipped based on engine failure.
+
+| Suite | Active contracts |
+| --- | --- |
+| Bats `030-run.bats` | Workload exit, missing executable, stdin/EOF, env/workdir, bind read/write, read-only creation rejection |
+| Bats `031-run-options.bats` | Explicit env vs env-file, successive env-files, host env import, literal entrypoint args, numeric/named user, missing workdir creation, workdir within bind mount, read-only deletion rejection |
+| Go `cli_test.go` | Streams/exit, exec stdin/error, stop/start persistence, auto-removal, duplicate name, exec env/workdir isolation, exec user/streams, 1.7 MB stdin round trip, ps/ID lifecycle, retained logs, images/rmi, named-volume persistence across rm -v, volume image initialization/read-only reuse, running-container rm rejection/force |
+
+Together these exercise all ten registered subcommands: `pull`, `images`, `rmi`,
+`run`, `exec`, `ps`, `start`, `stop`, `rm`, `logs`. They do not cover every option.
+The volume-image-content fixture requires an Alpine image containing
+`/etc/alpine-release`, `nobody`, `sh`, `printenv`, `id`, `cat`, `sleep` and `true`.
+Use `PVISOR_TEST_IMAGE` for a pinned Alpine digest, not an arbitrary image.
+
+Explicitly unsupported commands/options are preserved as commented examples in
+`system/900-unsupported.bats.disabled` and `e2e/unsupported_test.go.disabled`,
+with source files and reasons. Their `.disabled` suffix excludes them from test
+discovery; they produce no PASS or SKIP results. Complete upstream sources stay
+unchanged. Build/Compose/API, create/inspect/wait/restart/attach/cp, registry login,
+Podman pods/Kube/Quadlet, management CLIs, extra logs/list flags and host-specific
+namespace/security controls are disabled. TCP publication, basic TTY allocation,
+`logs -f`, anonymous-volume deletion and other supported-but-unported scenarios
+remain coverage gaps, not unsupported features.
+
+A pass means the selected behavior contract held for pVisor. Dynamic IDs and
+human-readable list formatting are not compared with another engine. Unsupported
+features and Docker-daemon interoperability cases are explicitly excluded, never
+counted as passes. Do not weaken assertions or skip a supported operation because
+pVisor fails it. Other upstream cases without a port remain unvalidated.
+
+For example, upstream `test/e2e/push_test.go` includes "podman push to docker
+daemon", which invokes both Podman and the real Docker CLI. That case is recorded
+as disabled in `e2e/unsupported_test.go.disabled`; no installed Docker is needed
+to discover or execute the active profile.
+
+## Non-root identity regression
+
+The numeric/named `run -u` cases and `TestExecUserAndStreams` guard a regression
+where the synthetic DNS lower exposed private host directory permissions as guest
+`/` and `/etc`. Those directories became `0700`, so non-root commands exited 126.
+
+Resolver setup now retains the image directories' guest ownership and modes in
+virtual metadata while leaving the host resolver directories `0700`. If the image
+has no `/etc`, the injected guest directory is root-owned `0755`; the resolver
+file is root-owned `0644`. Explicit restrictive image permissions are preserved.
+The original success assertions remain active. To run just these regressions,
+select the newly built, Hypervisor-signed binary using `PVISOR_BINARY`:
+
+```sh
+bats --filter 'numeric user|named user' tests/podman/system
+go test -v -run TestExecUserAndStreams tests/podman/e2e/cli_test.go
+```
+
+On 2026-10-21, all 29 cases passed on macOS ARM64 with the repaired executable,
+alongside seven selected Rust Docker-module regressions and four Python harness
+checks. Three unrelated cases initially hit Docker Hub HTTP 429 during setup;
+they passed on retry via `mirror.gcr.io/library/alpine` using the verified same
+ARM64 manifest digest
+`sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d`.
+
+Linux/KVM execution remains unverified by the local macOS ARM64 VM run. Docker
+comparison is not part of this suite or an acceptance prerequisite.

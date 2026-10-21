@@ -2814,6 +2814,9 @@ fn guest_config(
         shares: Vec::new(),
         stdio_ports: None,
         temporary_filesystem: None,
+        process: None,
+        mounts: Vec::new(),
+        control: false,
     }
 }
 

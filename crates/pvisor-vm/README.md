@@ -595,6 +595,20 @@ Core mutation guard；整个修改期间禁用命中与填充。guard 在锁释�
 guest 属性与 entry TTL 保持原值；本实验不修改内核、KEEP_CACHE、WB 或 DAX，
 也不把未测候选作为默认优化。
 
+## 普通只读目录
+
+`VmConfiguration::read_only_filesystem(tag, path)` 在宿主适配器拒绝所有
+文件系统修改请求，供容器只读 bind mount 使用。所有平台使用同一声明；
+TEE/Nitro 返回 `Unsupported`。目录必须存在、绝对且可表达为 UTF-8，tag
+须非空且唯一；校验失败不改变已有 attachment。调用方保持目录根及挂载
+身份到 VM 退出；宿主内容可以变化，按普通 passthrough 可见性处理。
+
+该接口不创建 DAX 窗口、不承诺物理不可变、不启用不可变目录缓存，也不
+引入 DAX 的快照限制。guest remount 不会解除宿主只读限制。只读 OPEN
+检查始终使用 Linux wire 的 TRUNC/APPEND/TMPFILE 标志，不能使用 macOS
+本地标志解释 guest 请求。外部 API 测试验证输入、重复 tag 和快照兼容；
+私有协议测试覆盖读写打开标志。
+
 ## 不可变只读文件的 DAX
 
 `VmConfiguration::immutable_filesystem(tag, path, window_size)` 为独立的、

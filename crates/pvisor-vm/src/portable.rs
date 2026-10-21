@@ -307,6 +307,17 @@ impl VmConfiguration for VmBuilder {
             Err(unsupported("virtio-fs"))
         }
     }
+    fn read_only_filesystem(&mut self, tag: &str, path: &Path) -> io::Result<()> {
+        #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+        {
+            self.inner.read_only_filesystem(tag, path)
+        }
+        #[cfg(any(feature = "tee", feature = "aws-nitro"))]
+        {
+            let _ = (tag, path);
+            Err(unsupported("read-only virtio-fs"))
+        }
+    }
     fn immutable_filesystem(
         &mut self,
         tag: &str,

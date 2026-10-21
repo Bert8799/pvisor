@@ -18,6 +18,8 @@ mod cache_budget;
 mod config;
 #[doc(hidden)]
 pub mod diagnostics;
+/// Rootless container VM lifecycle and image catalog.
+pub mod docker;
 mod executor;
 pub mod features;
 mod image;

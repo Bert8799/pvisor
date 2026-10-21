@@ -2,12 +2,15 @@
 use pvisor_guest::{CONFIG_PATH, GuestConfig, NetworkConfig};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod control;
+mod process;
+mod shares;
 
 fn check(result: libc::c_int) -> io::Result<()> {
     if result < 0 {
@@ -245,60 +248,44 @@ fn resource(name: &str) -> io::Result<libc::c_int> {
 }
 
 fn workload(config: &GuestConfig) -> io::Result<i32> {
-    let limits = config
-        .limits
-        .iter()
-        .map(|(name, (soft, hard))| {
-            Ok((
-                resource(name)?,
-                libc::rlimit {
-                    rlim_cur: *soft,
-                    rlim_max: *hard,
-                },
-            ))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    let mut command = config.command()?;
-    unsafe {
-        command.pre_exec(move || {
-            for (resource, limit) in &limits {
-                // syscall's varargs avoid glibc vs musl setrlimit argument type differences.
-                check(libc::syscall(
-                    libc::SYS_prlimit64,
-                    0,
-                    *resource,
-                    limit,
-                    std::ptr::null::<libc::rlimit>(),
-                ) as libc::c_int)?;
-            }
-            Ok(())
-        });
-    }
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(127),
-        Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::ENOEXEC)) => {
-            return Ok(126);
-        }
-        Err(error) => return Err(error),
+    let processes = process::Processes::default();
+    let listener = config.control.then(control::listener).transpose()?;
+    let process::Spawned {
+        process,
+        input,
+        outputs,
+    } = match processes.spawn(config, false) {
+        Ok(spawned) => spawned,
+        Err(error) => return process::spawn_error(&error).ok_or(error),
     };
-    loop {
-        let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if pid < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(io::Error::last_os_error());
-        }
-        if pid == child.id() as libc::pid_t {
-            return Ok(if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                128 + libc::WTERMSIG(status)
-            });
-        }
+    let pumps: Vec<_> = outputs
+        .into_iter()
+        .map(|(mut reader, _)| {
+            std::thread::spawn(move || {
+                let mut buffer = [0; 16384];
+                while let Ok(size) = process::read_chunk(&mut reader, &mut buffer) {
+                    if size == 0 || io::stdout().write_all(&buffer[..size]).is_err() {
+                        break;
+                    }
+                    let _ = io::stdout().flush();
+                }
+            })
+        })
+        .collect();
+    if let Some(listener) = listener {
+        control::start(
+            listener,
+            config.clone(),
+            processes.clone(),
+            process.id(),
+            input,
+        );
     }
+    let code = processes.supervise(process)?;
+    for pump in pumps {
+        let _ = pump.join();
+    }
+    Ok(code)
 }
 
 fn run() -> io::Result<i32> {
@@ -378,6 +365,9 @@ fn run() -> io::Result<i32> {
             .stderr(Stdio::null())
             .spawn()?;
     }
+    // Fatal guest setup finishes before any advisory process spawns: a
+    // failed mount must abort the launch without leaking sidecars.
+    shares::install(&config)?;
     for sidecar in &config.sidecars {
         // Advisory daemons: a spawn or log failure is reported on the
         // console and never aborts the workload. stderr (and stdout) append

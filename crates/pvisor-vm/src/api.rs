@@ -137,6 +137,15 @@ pub trait VmConfiguration: Sized {
     /// zero; nonzero windows return Unsupported before changing configuration.
     /// Use `immutable_filesystem` for the supported read-only DAX contract.
     fn filesystem(&mut self, tag: &str, path: &Path, shm_size: usize) -> io::Result<()>;
+    /// Attach a host-enforced read-only directory without DAX or an immutability
+    /// promise. All guest mutation requests fail even if the guest remounts it.
+    /// The caller retains the directory and its mount identity until teardown;
+    /// host content changes remain subject to ordinary passthrough visibility.
+    /// Requires a nonempty unique tag and an absolute existing UTF-8 directory.
+    /// Invalid input leaves existing attachments unchanged. TEE/Nitro builds
+    /// return Unsupported. This does not enable immutable-data caching or add
+    /// the DAX profile's snapshot restrictions.
+    fn read_only_filesystem(&mut self, tag: &str, path: &Path) -> io::Result<()>;
     /// Attach a guest-read-only, physically immutable directory with a DAX window.
     /// Calling this method explicitly enables DAX capability for this share.
     /// The caller must keep contents, metadata, namespace, ancestors and hardlink

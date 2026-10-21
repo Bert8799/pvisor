@@ -44,3 +44,47 @@ the supervisor performs no lookup of its own. Validation (program present,
 absolute log path, NUL-free words, valid environment names) runs with the
 whole launch contract before any side effect. Consumers that omit the field
 keep their existing behavior; JSON serialization omits it when absent.
+`GuestConfig.bridges` optionally adds AF_VSOCK-to-guest-TCP relays (advisory:
+a failed listener is reported and never affects the workload), and
+`GuestConfig.shares` lists extra virtio-fs mounts (read-only shares mount
+`ro,dax=never`; read-write plain passthrough; a failed mount is fatal).
+
+## One workload supervisor
+
+Jobs and controlled workloads enter the same `workload` function and use
+`linux/process.rs` for command validation, resource limits, process creation,
+signals, terminal allocation and reaping. There is no Docker-specific guest
+entry point or supervisor. The host translates Docker image/CLI policy into
+generic launch options, including its capability bounding set.
+
+`GuestConfig.process` optionally supplies guest identity, capability bounds,
+session creation, stdin ownership, PTY dimensions and working-directory creation.
+Omission retains bootstrap identity/session and inherited console descriptors.
+`GuestConfig.mounts` declares additional shares, optionally populating an empty
+share from its image destination. Shares carry VMM tags, never host source paths.
+
+One blocking PID-1 reaper handles the main workload, exec processes and adopted
+orphans. It observes exits before consuming them, serializes process registration
+and signalling with reaping, and routes each exec status to its own waiter.
+Exec handlers never call waitpid themselves. Main exit stops new admissions,
+terminates remaining guest processes and reaps them before the existing final
+virtio-fs synchronization and exit report. Process groups created by the launcher
+are cleaned up when their leader exits, including exec groups.
+
+## Optional control adapter
+
+`GuestConfig.control` enables a vsock listener on port 1025; omission starts no
+listener. The adapter accepts only host-CID peers. Bounded
+frames support ping, main stdin attachment, process-group signals, exec and
+TCP tunnels to guest loopback services. Exec inherits launch environment and
+working directory unless overridden, keeps stdout/stderr separate without a
+PTY, and reports 126/127 for execution errors. TTY mode combines output on the
+PTY and supports initial dimensions; live resizing is not implemented.
+
+Both host and guest use `control`'s shared protocol definitions. Raw vsock
+accept is required: `UnixListener::accept` rejects AF_VSOCK peer addresses.
+Protocol tests reject oversized and unknown-field frames; real VM tests remain
+necessary for terminal, mount, networking and process-lifecycle behavior.
+Architecture guards keep spawning/signalling/reaping out of the transport
+adapter. Linux supervisor tests cover limits, exit statuses, orphan reaping and
+concurrent exec routing; native CLI acceptance exercises the same behavior in a VM.
