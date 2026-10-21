@@ -25,3 +25,22 @@ Capacity is charged inside guest RAM; it does not allocate a second VM memory bu
 The pVisor VM executor selects a unique directory and sets default TMPDIR to it. Capacity is one quarter of effective guest RAM, capped at 64 MiB. An explicit invocation TMPDIR disables this default, as does overlap with the workspace. The original image `/tmp` remains available. Other GuestConfig consumers that omit the optional field retain their existing behavior; JSON serialization omits it when absent.
 
 The CLI snapshot launcher and container shim omit this option. Launch-message unit tests do not establish RAM snapshot/fork behavior with the executor-selected tmpfs.
+
+## Sidecar processes
+
+`GuestConfig.sidecars` optionally lists daemons started alongside the workload:
+
+```json
+{"sidecars":[{"argv":["/opt/payload","--serve"],"env":{"P":"1"},"log":"/.payload.log"}]}
+```
+
+Sidecars are advisory by contract. Each runs with the workload environment
+overlaid by its own (`env` entries win on conflicts), stdin and stdout on
+`/dev/null`, and stderr appended to the absolute guest `log` path. A spawn
+failure or a sidecar exit is reported on the console and never affects the
+workload, its exit code or the reported guest status; nothing restarts a
+sidecar. argv[0] addresses a file the host executor staged into the rootfs;
+the supervisor performs no lookup of its own. Validation (program present,
+absolute log path, NUL-free words, valid environment names) runs with the
+whole launch contract before any side effect. Consumers that omit the field
+keep their existing behavior; JSON serialization omits it when absent.
