@@ -410,6 +410,20 @@ impl<B: Backend> Builder<B> {
             virtual_entries: Vec::new(),
         })
     }
+    pub(crate) fn read_only_filesystem(&mut self, tag: &str, path: &std::path::Path) -> io::Result<()> {
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "read-only share requires an absolute existing directory"));
+        }
+        self.attach_fs(FsDeviceConfig {
+            fs_id: tag.into(),
+            shared_dir: Some(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filesystem path is not UTF-8"))?.into()),
+            semantics: PermissionSemantics::LinuxComplete,
+            shm_size: None,
+            read_only: true,
+            overlay: None,
+            virtual_entries: Vec::new(),
+        })
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn immutable_filesystem(
         &mut self,

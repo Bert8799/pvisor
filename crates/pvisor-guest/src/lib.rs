@@ -1,4 +1,5 @@
 //! Launch contract shared by the host executors and the Linux guest.
+pub mod control;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -41,6 +42,66 @@ pub struct GuestConfig {
     pub stdio_ports: Option<[bool; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary_filesystem: Option<TemporaryFilesystem>,
+    /// Optional process setup. Omission inherits the bootstrap identity, session
+    /// and console descriptors; all workloads use the same process supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessConfig>,
+    /// Additional virtio-fs shares installed before the workload starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<Mount>,
+    /// Enable the host-only vsock command adapter; false starts no listener.
+    #[serde(default)]
+    pub control: bool,
+}
+
+/// Process setup shared by the initial workload and subsequent exec requests.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProcessConfig {
+    /// Guest UID/name and optional group. None preserves the bootstrap identity;
+    /// Some(empty) selects root. Missing HOME is resolved from guest passwd only.
+    pub user: Option<String>,
+    /// Linux capability bounding set to retain. None leaves it unchanged.
+    /// Values must be in 0..64; dropping capabilities precedes changing identity.
+    pub capabilities: Option<Vec<u32>>,
+    /// Start a separate session/process group, required for PTYs and control.
+    pub new_session: bool,
+    /// Initial stdin ownership; omission retains the bootstrap descriptor.
+    pub stdin: StdinMode,
+    /// Optional PTY dimensions, rows then columns, both nonzero. A PTY combines
+    /// output streams and requires a new session.
+    pub tty: Option<[u16; 2]>,
+    /// Create the working directory before spawning; false requires it to exist.
+    pub create_workdir: bool,
+}
+
+/// Ownership of the initial process's input descriptor.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdinMode {
+    /// Inherit the bootstrap console, retaining ordinary Job terminal behavior.
+    #[default]
+    Inherit,
+    /// Open /dev/null for noninteractive workloads.
+    Closed,
+    /// Retain a pipe or PTY input writer for one control-channel attachment.
+    Pipe,
+}
+
+/// A host-declared share; its tag identifies a VMM filesystem, never a host path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mount {
+    /// VMM filesystem tag.
+    pub tag: String,
+    /// Absolute guest destination without parent traversal. The host must also
+    /// reject overlap with guest system/control paths before attaching the share.
+    pub target: PathBuf,
+    /// Reject guest mutations at the mount boundary.
+    pub read_only: bool,
+    /// Populate an empty share from its image destination before mounting it.
+    /// Only directories, regular files and symlinks are supported.
+    pub initialize: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,6 +149,51 @@ impl GuestConfig {
         if self.limits.values().any(|(soft, hard)| soft > hard) {
             return Err(invalid("guest soft limit exceeds hard limit"));
         }
+        if let Some(process) = &self.process {
+            if let Some(user) = &process.user {
+                CString::new(user.as_str()).map_err(|_| invalid("guest user contains NUL"))?;
+            }
+            if process
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.iter().any(|cap| *cap >= 64))
+            {
+                return Err(invalid("invalid capability bounding set"));
+            }
+            if process
+                .tty
+                .is_some_and(|size| size.contains(&0) || !process.new_session)
+            {
+                return Err(invalid("guest PTY requires dimensions and a new session"));
+            }
+        }
+        if self.control
+            && !self
+                .process
+                .as_ref()
+                .is_some_and(|process| process.new_session)
+        {
+            return Err(invalid(
+                "guest control requires a separate workload session",
+            ));
+        }
+        for mount in &self.mounts {
+            if !mount.target.is_absolute()
+                || mount.target.parent().is_none()
+                || mount.target.components().any(|component| {
+                    !matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+            {
+                return Err(invalid("invalid guest mount target"));
+            }
+            CString::new(mount.target.as_os_str().as_encoded_bytes())
+                .map_err(|_| invalid("guest mount target contains NUL"))?;
+            CString::new(mount.tag.as_str())
+                .map_err(|_| invalid("guest mount tag contains NUL"))?;
+        }
         if let Some(scratch) = &self.temporary_filesystem {
             if scratch.size_bytes == 0
                 || !scratch.path.is_absolute()
@@ -120,6 +226,40 @@ impl GuestConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_process_options_preserve_old_defaults_and_validate_before_launch() {
+        let mut config: GuestConfig =
+            serde_json::from_str(r#"{"argv":["/bin/true"],"env":{},"cwd":"/"}"#).unwrap();
+        assert!(config.process.is_none());
+        assert!(!config.control);
+        assert!(config.mounts.is_empty());
+        assert!(config.command().is_ok());
+        config.control = true;
+        assert!(config.command().is_err());
+        config.process = Some(ProcessConfig {
+            new_session: true,
+            ..Default::default()
+        });
+        assert!(config.command().is_ok());
+        config.process.as_mut().unwrap().tty = Some([0, 80]);
+        assert!(config.command().is_err());
+        config.process.as_mut().unwrap().tty = Some([24, 80]);
+        config.process.as_mut().unwrap().capabilities = Some(vec![64]);
+        assert!(config.command().is_err());
+        config.process.as_mut().unwrap().capabilities = Some(vec![0, 1]);
+        config.mounts.push(Mount {
+            tag: "data".into(),
+            target: "/data".into(),
+            read_only: true,
+            initialize: false,
+        });
+        assert!(config.command().is_ok());
+        for path in ["/", "relative", "/data/../proc", "/bad\0path"] {
+            config.mounts[0].target = path.into();
+            assert!(config.command().is_err(), "accepted {path:?}");
+        }
+    }
 
     #[test]
     fn temporary_filesystem_contract_is_optional_bounded_and_separate_from_workspace() {

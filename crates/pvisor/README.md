@@ -477,6 +477,52 @@ is a separate executable linking `pvisor` and `pvisor-core`; synchronous interna
 VM dispatch runs before Tokio. Packaging does not supply or validate the
 prepared-image bootstrap, SDK conformance or density.
 
+## Independent container VM lifecycle
+
+The experimental `docker` module owns the user-private image catalog, pinned
+container configuration, writable uppers, managed volumes and launch generation
+records used by `pvisor docker`. The CLI owns Docker argument parsing, rendering
+and terminal adapters. This profile does not convert ordinary Jobs or alter
+stage/apply, capture or existing daemon APIs.
+`Store::pull_with_progress` and `create_with_progress` emit synchronous OCI
+preparation observations for frontend rendering; existing `pull`/`create` callers
+remain silent. Download counts use received compressed bytes, and layer readiness
+follows verification and extraction rather than merely reaching an expected size.
+`pull_for_platform_with_progress` selects `linux/amd64` or `linux/arm64`
+(`linux/arm64/v8` is an alias), independently of the host. Image records retain
+their canonical platform; legacy records default to native because previous
+versions only pulled native images. A reference holds one platform, replaced
+atomically on successful pull; existing instances keep their pinned image.
+`Create.platform` optionally asserts the native platform. Creation and start
+reject foreign images before publication or VM launch; no CPU emulator is supplied.
+
+Each launch self-executes a detached owner and a separate native VMM. Embedding
+applications using `docker::Store::start` must dispatch
+`docker::internal_if_requested` at process entry, before threads or normal CLI
+parsing. Lifecycle mutations use the catalog lock, and both owner and VMM hold
+independent lifetime leases. A private inherited pipe terminates the VMM when
+its owner dies. Stop escalation goes through the current owner and generation;
+no command signals a host PID saved in metadata. VM setup errors and workload
+exit codes remain visible in completion records and instance output.
+
+The host translates Docker defaults into generic guest process/mount options,
+including the Docker capability bounding set. The guest has one launcher and
+PID-1 reaper shared by Jobs, the initial workload and exec. An optional host-CID
+vsock adapter adds same-VM exec, stdin, signal delivery and TCP publication;
+it owns no separate process lifecycle or host filesystem/lifecycle authority.
+Ordinary Job configurations retain inherited identity/session/stdio defaults.
+
+The Docker network resolver lower keeps its host directories private (`0700`)
+while carrying the image's guest ownership and permissions for `/` and `/etc`.
+An absent image `/etc` uses guest root ownership and `0755`; the injected resolver
+file is guest-root-owned `0644`. This prevents DNS setup from blocking non-root
+`run -u` and `exec -u`, without widening image directory permissions or host access.
+
+The supported CLI profile and its explicit differences from Docker are in the
+[application README](../pvisor-cli/README.md#docker-command-profile-experimental).
+A passing catalog or protocol test does not establish Linux/KVM acceptance,
+Docker SDK conformance, database durability or performance.
+
 ## Source and application boundary
 
 Runtime APIs are exported explicitly from `src/lib.rs`: `PVisor`, Session/Attempt
