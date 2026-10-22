@@ -81,7 +81,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--firmware", type=Path, required=True)
-    p.add_argument("--kernel", type=Path, required=True)
+    p.add_argument(
+        "--pvisor-only",
+        action="store_true",
+        help="prepare pVisor arms without Firecracker/kernel inputs or guest.ext4",
+    )
+    p.add_argument("--kernel", type=Path)
     p.add_argument("--firecracker", type=Path, default=Path("/usr/bin/firecracker"))
     p.add_argument(
         "--firecracker-filter",
@@ -97,6 +102,14 @@ def main():
         help="optional prepared Python rootfs for common dlopen controls",
     )
     a = p.parse_args()
+    if a.pvisor_only:
+        if a.firecracker_filter or a.firecracker_build_receipt:
+            p.error("--firecracker-filter/--firecracker-build-receipt require a Firecracker arm")
+    else:
+        if a.kernel is None:
+            p.error("--kernel is required unless --pvisor-only is set")
+        if not a.firecracker.is_file():
+            p.error("--firecracker must name an executable unless --pvisor-only is set")
     root = a.output.resolve()
     root.mkdir()
     before = source_inputs()
@@ -134,13 +147,14 @@ def main():
     )
     if source_inputs() != before:
         raise ValueError("product source changed during build")
-    for source, name in [
+    inputs = [
         (REPO / "target/release/examples/pool_memory_case", "probe"),
         (REPO / "target/release/pvisor-daemon", "daemon"),
         (a.firmware, "firmware"),
-        (a.kernel, "kernel"),
-        (a.firecracker, "firecracker"),
-    ]:
+    ]
+    if not a.pvisor_only:
+        inputs += [(a.kernel, "kernel"), (a.firecracker, "firecracker")]
+    for source, name in inputs:
         shutil.copy2(source, root / name)
     extras = []
     for source, name in [
@@ -176,9 +190,14 @@ def main():
     for name in ("dev", "proc", "sys", "tmp", "run", "etc"):
         (guest / name).mkdir()
     shutil.copy2(root / "worker", guest / "worker")
-    with (root / "guest.ext4").open("xb") as stream:
-        stream.truncate(96 * 1024**2)
-    run(["mkfs.ext4", "-q", "-F", "-d", str(guest), str(root / "guest.ext4")], root, "guest-image")
+    if not a.pvisor_only:
+        with (root / "guest.ext4").open("xb") as stream:
+            stream.truncate(96 * 1024**2)
+        run(
+            ["mkfs.ext4", "-q", "-F", "-d", str(guest), str(root / "guest.ext4")],
+            root,
+            "guest-image",
+        )
     if a.library_rootfs:
         shutil.copytree(a.library_rootfs, root / "python-root", symlinks=True)
         library = root / "libraries"
@@ -262,13 +281,12 @@ def main():
         "probe",
         "daemon",
         "firmware",
-        "kernel",
-        "firecracker",
         "worker",
         "worker.rs",
         "root/worker",
-        "guest.ext4",
     ]
+    if not a.pvisor_only:
+        runtime += ["kernel", "firecracker", "guest.ext4"]
     runtime += extras
     if a.library_rootfs:
         runtime += [
@@ -304,9 +322,14 @@ def main():
         dependency_scope="external Cargo registry cache and separate libkrunfw source not archived; firmware bytes frozen",
         compiler=subprocess.check_output(["rustc", "-Vv"], text=True),
         preparation_sha256={f.name: digest(f) for f in harness.iterdir()},
-        fc_version=subprocess.check_output([str(root / "firecracker"), "--version"], text=True),
-        fc_kernel="retained reference kernel; differs from pVisor firmware",
     )
+    if a.pvisor_only:
+        receipt["profile"] = "pvisor-only"
+    else:
+        receipt["fc_version"] = subprocess.check_output(
+            [str(root / "firecracker"), "--version"], text=True
+        )
+        receipt["fc_kernel"] = "retained reference kernel; differs from pVisor firmware"
     if a.firecracker_build_receipt:
         receipt["firecracker_build"] = json.loads(
             (root / "firecracker-build-receipt.json").read_text()

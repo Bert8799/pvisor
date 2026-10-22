@@ -90,7 +90,8 @@ def main():
         print(destination)
         return 0
     output.mkdir()
-    require_default_ksm(kernel_state())
+    if any(VARIANTS[variant][0] == "pvisor-ksm" for variant in variants):
+        require_default_ksm(kernel_state())
     receipt = json.loads((inputs / "receipt.json").read_text())
     required = (
         "library.ext4",
@@ -136,7 +137,13 @@ def main():
         benchmark_id="B-MEMORY-SCALE",
         role="engineering A/B",
         campaign="library",
-        primary_baseline="firecracker-block",
+        primary_baseline=(
+            "firecracker-block"
+            if "firecracker-block" in variants
+            else "pvisor-rootfs-off"
+            if "pvisor-rootfs-off" in variants
+            else variants[0]
+        ),
         preflight=args.preflight,
         samples=1 if args.preflight else args.samples,
         arms=variants,

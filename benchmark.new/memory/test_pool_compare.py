@@ -3,8 +3,10 @@
 import copy
 import errno
 import importlib.util
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -126,6 +128,38 @@ class CurveEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             subject.validate_worker(raw, cfg)
 
+    def test_ksm_default_is_required_only_for_ksm_arm(self):
+        self.assertFalse(subject.requires_default_ksm(["pvisor-off", "pvisor-physical"]))
+        self.assertTrue(subject.requires_default_ksm(["pvisor-ksm"]))
+        self.assertEqual(subject.primary_baseline(["pvisor-off", "pvisor-physical"]), "pvisor-off")
+        self.assertEqual(subject.primary_baseline(["firecracker", "pvisor-off"]), "firecracker")
+
+    def test_non_ksm_arm_allows_disabled_ksm(self):
+        raw, cfg = fixture()
+        for state in (raw["kernel_before"], raw["kernel_after"]):
+            state["files"]["run"] = "0"
+        subject.validate_worker(raw, cfg)
+
+    def test_missing_cpu_controller_has_actionable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            group = Path(directory)
+            with self.assertRaisesRegex(ValueError, "cpu.max"):
+                subject.require_cpu_controller(group)
+            (group / "cpu.max").write_text("max 100000\n")
+            subject.ensure_cpu_quota(group)
+            self.assertEqual((group / "cpu.max").read_text().strip(), subject.CPU_QUOTA)
+
+    def test_ksm_arm_still_requires_default_ksm(self):
+        raw, cfg = fixture()
+        cfg["arm"] = "pvisor-ksm"
+        for phase in raw["phases"]:
+            for process in phase["processes"]:
+                process["mapping_evidence"]["mergeable_bytes"] = 4096
+        for state in (raw["kernel_before"], raw["kernel_after"]):
+            state["files"]["run"] = "0"
+        with self.assertRaisesRegex(ValueError, "default-parameter KSM"):
+            subject.validate_worker(raw, cfg)
+
     def test_removed_arm_cannot_be_validated_or_enter_the_matrix(self):
         self.assertEqual(len(subject.ARMS), 7)
         raw, cfg = fixture()
@@ -200,6 +234,56 @@ class CurveEvidenceTests(unittest.TestCase):
     Path("/proc/self/smaps_rollup").exists() and hasattr(os, "WNOWAIT"),
     "requires Linux procfs and waitid without reaping",
 )
+class BaselineCoordinatorTests(unittest.TestCase):
+    def test_baseline_guard_and_frozen_input_checks_both_run(self):
+        import baseline_evidence
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            (inputs / "receipt.json").write_text(json.dumps({"hashes": {"probe": "hash"}}))
+            state = root / "state.json"
+            state.write_text("{}")
+            output = root / "output"
+            argv = [
+                "pool_compare.py",
+                "--inputs",
+                str(inputs),
+                "--output",
+                str(output),
+                "--preflight",
+                "--arms",
+                "pvisor-off",
+                "--patterns",
+                "repeated",
+                "--baseline-state",
+                str(state),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(subject, "digest", return_value="hash"),
+                patch.object(subject, "verify_harness", return_value=True),
+                patch.object(subject, "expected", return_value="oracle"),
+                patch.object(subject, "host_identity", return_value={}),
+                patch.object(subject.shutil, "copy2"),
+                patch.object(
+                    subject,
+                    "attempt",
+                    return_value={
+                        "arm": "pvisor-off",
+                        "pattern": "repeated",
+                        "status": "successful",
+                    },
+                ) as attempt,
+                patch.object(baseline_evidence, "verify") as guard,
+            ):
+                self.assertEqual(subject.main(), 0)
+            self.assertEqual(guard.call_count, 2)
+            self.assertEqual(attempt.call_count, 1)
+            self.assertTrue(json.loads((output / "report.json").read_text())["complete"])
+
+
 class PssSamplingTests(unittest.TestCase):
     def test_exited_process_with_proc_entry_does_not_invalidate_live_pss(self):
         with tempfile.TemporaryDirectory() as directory:
