@@ -363,7 +363,7 @@ Successful `baseline.json` is published only after evidence and environment chec
 sudo sh -c 'echo 1 > /sys/kernel/mm/ksm/run'
 sg kvm -c 'python3 benchmark.new/memory/baseline.py \
   --profile full \
-  --inputs target/tmp/pvisor-only-20261021/inputs'
+  --inputs target/tmp/inputs'
 # Restore the original KSM state, including after measurement failure:
 sudo sh -c 'echo 0 > /sys/kernel/mm/ksm/run'
 ```
@@ -431,7 +431,7 @@ frozen supporting harnesses and the hashes of monitor, PSS and guard observation
 
 ## Published curves and archived history
 
-The [local startup-to-steady baseline](LOCAL_BASELINE.md) records the
+The [local startup-to-steady baseline](../../target/tmp/full-20261022-1/README.md) records the
 2026-10-22 pVisor-only full preflight and separate quick repeat. It retains
 observed convergence, nonconverged compression curves, CPU/readback/write
 costs and local artifact links. Its EPYC/Linux 6.8 environment is separate
@@ -452,3 +452,63 @@ The documentation before cleanup is preserved in
 Original reports, failed attempts, frozen sources and raw curves remain in their
 own directories. Historical and incomplete measurements are excluded from the
 current comparison. This documentation cleanup starts no new measurements.
+
+## Physical-pool descriptor validation experiment
+
+`baseline.py --profile quick --shared-file-cache 0|1` retains the P0 matrix,
+resources, startup observation and steady-state rule. Only the physical-pool
+arm switches its descriptor authority cache. The cache is off by default.
+Use the same frozen binary inputs for both settings and separate real run
+directories. The flag is recorded in the manifest, coordinator report, command
+and per-condition configuration; the worker explicitly sets the private VM
+variable, overriding inherited environment. It is not an extra memory mode.
+
+This tests removal of repeated immutable descriptor checks, not VMA coalescing.
+Compare startup-to-steady, steady charge/range, CPU, peak and access/write
+costs for the same physical-pool content. Off/KSM remain environment controls.
+Each quick run is N=1 per condition; retain all results, and use full conditions
+or further paired rounds before choosing a default. P0 raw evidence remains
+unchanged. Keep the experiment in B-MEMORY-SCALE engineering records.
+
+Store local experiment notes alongside each run's artifacts in `README.md`.
+See [P1 experiment results](../../target/tmp/quick-20261022-3/README.md) for data and limitations.
+
+## Physical-pool anonymous-zero experiment
+
+`baseline.py --profile quick --arms pvisor-physical --zero-pages 0|1` runs an
+explicit two-condition engineering subset, not a complete six-condition quick
+baseline. The manifest/status marks `profile_subset=true`, retains the actual
+arms and condition matrix, and scales only the time estimate. No `--arms` flag
+keeps the original full/quick matrices unchanged. Both settings use the same
+frozen binary inputs; keep the descriptor cache disabled to change one variable.
+
+The question is whether bypassing pool slots for barrier-verified zero pages
+reduces startup-to-steady time, charged steady memory, VMA count and slab costs
+without increasing CPU or readback/write costs. Keep P0's four-VM resource budget,
+60-second idle, complete integrity checks and 30-second post-write window.
+The flag is frozen in the manifest, exact command, coordinator and worker
+condition; the guest runner environment is explicitly set from that condition.
+Run per-setting N=1 as screening only, then extend affected conditions before
+choosing a default. Store all results and analysis under the run's target folder.
+
+## Firmware layout experiment
+
+The question is whether the existing flat firmware bundle shares enough initial
+kernel pages to reduce startup-to-steady memory relative to compact anonymous
+reconstruction. Use the same vmlinux and generator for both libraries; verify
+the complete ABI image hash, size, alignment, entry and guest load address before
+VM measurement. Keep the same probe/daemon/worker binaries and disable both
+physical-pool experimental switches. This concerns GNU dynamic firmware loading;
+the musl embedded-kernel path copies the image and is outside this comparison.
+
+`baseline.py --profile quick --arms pvisor-off,pvisor-physical
+--patterns random-shared --firmware-copy 1` selects two conditions explicitly.
+The default profiles remain unchanged. Firmware input auditing warms a source
+inode outside the measured group, so both layouts must copy the firmware to a
+new, non-reflinked inode inside each measured group after startup observation
+begins. Copy CPU, file cache, larger file size and subsequent VM loading are
+included. Keep the runtime copy, hash/inode receipt and VM mapping headers with
+the results. This protocol differs from P0's externally cached firmware;
+compare the new pair with each other, without claiming a speedup against P0.
+Keep N=1 screening distinct from repeated/full qualification and retain all
+integrity, private-write, peer, CPU, peak and readback checks.

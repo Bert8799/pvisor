@@ -375,8 +375,38 @@ def check_host(
         )
 
 
-def build_command(profile: str, inputs: Path, output: Path) -> list[str]:
-    arms, patterns = PROFILES[profile]
+def selected_arms(profile: str, selection: str | None) -> tuple[str, ...]:
+    allowed = PROFILES[profile][0]
+    if selection is None:
+        return allowed
+    arms = tuple(selection.split(","))
+    if not arms or len(set(arms)) != len(arms) or not set(arms) <= set(allowed):
+        raise BaselineError("arms must be a nonempty unique subset of the selected profile")
+    return arms
+
+
+def selected_patterns(profile: str, selection: str | None) -> tuple[str, ...]:
+    allowed = PROFILES[profile][1]
+    patterns = tuple(selection.split(",")) if selection is not None else allowed
+    if not patterns or len(set(patterns)) != len(patterns) or not set(patterns) <= set(allowed):
+        raise BaselineError("patterns must be a nonempty unique subset of the selected profile")
+    return patterns
+
+
+def build_command(
+    profile: str,
+    inputs: Path,
+    output: Path,
+    *,
+    shared_file_cache: bool = False,
+    zero_pages: bool = False,
+    arms: tuple[str, ...] | None = None,
+    patterns: tuple[str, ...] | None = None,
+    firmware_copy: bool = False,
+) -> list[str]:
+    profile_arms, _ = PROFILES[profile]
+    arms = selected_arms(profile, ",".join(arms)) if arms is not None else profile_arms
+    patterns = selected_patterns(profile, ",".join(patterns) if patterns is not None else None)
     return [
         sys.executable,
         str(HERE / "pool_compare.py"),
@@ -391,6 +421,12 @@ def build_command(profile: str, inputs: Path, output: Path) -> list[str]:
         ",".join(patterns),
         "--baseline-state",
         str(output.parent / "guard-state.json"),
+        "--shared-file-cache",
+        str(int(shared_file_cache)),
+        "--zero-pages",
+        str(int(zero_pages)),
+        "--firmware-copy",
+        str(int(firmware_copy)),
     ]
 
 
@@ -408,13 +444,45 @@ def main() -> int:
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
+        "--arms", help="explicit engineering subset of profile arms; not a complete profile"
+    )
+    parser.add_argument("--patterns", help="explicit engineering subset of profile patterns")
+    parser.add_argument(
+        "--firmware-copy",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="copy firmware to a fresh inode inside the measured group",
+    )
+    parser.add_argument(
+        "--zero-pages",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="experimental anonymous-zero replacement for the physical pool",
+    )
+    parser.add_argument(
+        "--shared-file-cache",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="experimental physical-pool descriptor authority cache A/B",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="write manifest and print command only"
     )
     parser.add_argument("--require-governor", help="reject if CPUs 0-3 use another governor")
     parser.add_argument("--require-boost", help="reject if cpufreq boost differs")
     args = parser.parse_args()
 
-    arms, patterns = PROFILES[args.profile]
+    try:
+        arms = selected_arms(args.profile, args.arms)
+        patterns = selected_patterns(args.profile, args.patterns)
+    except BaselineError as error:
+        parser.error(str(error))
+    profile_arms, profile_patterns = PROFILES[args.profile]
+    fraction = len(arms) * len(patterns) / (len(profile_arms) * len(profile_patterns))
+    subset = fraction != 1
     inputs = args.inputs.expanduser().resolve()
     if args.output:
         output = args.output.expanduser().resolve()
@@ -452,12 +520,27 @@ def main() -> int:
         (output / "source.patch").write_bytes(
             subprocess.check_output(["git", "-C", str(REPO), "diff", "--binary", "HEAD"])
         )
-        command = build_command(args.profile, inputs, output / "cohort")
+        command = build_command(
+            args.profile,
+            inputs,
+            output / "cohort",
+            shared_file_cache=bool(args.shared_file_cache),
+            zero_pages=bool(args.zero_pages),
+            arms=arms,
+            patterns=patterns,
+            firmware_copy=bool(args.firmware_copy),
+        )
         manifest = {
             "schema": "pvisor-memory-baseline/v2",
             "created_utc": utc_stamp_ns(),
             "profile": args.profile,
-            "estimated_minutes": ESTIMATED_MINUTES[args.profile],
+            "shared_file_cache": bool(args.shared_file_cache),
+            "zero_pages": bool(args.zero_pages),
+            "firmware_copy": bool(args.firmware_copy),
+            "profile_subset": subset,
+            "estimated_minutes": [
+                max(1, round(minutes * fraction)) for minutes in ESTIMATED_MINUTES[args.profile]
+            ],
             "arms": arms,
             "patterns": patterns,
             "fixed": FIXED,
@@ -496,6 +579,7 @@ def main() -> int:
                 "complete": False,
                 "evidence_valid": False,
                 "status": "prepared" if args.dry_run else "running",
+                "profile_subset": subset,
             },
         )
         print(f"baseline: {output}", file=sys.stderr)
@@ -522,6 +606,7 @@ def main() -> int:
                 "complete": True,
                 "evidence_valid": True,
                 "host_stable": True,
+                "profile_subset": subset,
                 "status": "valid",
                 "summary_sha256": digest(output / "summary.json"),
             },
@@ -531,7 +616,13 @@ def main() -> int:
     except (ValueError, BaselineError, OSError, subprocess.SubprocessError) as error:
         save(
             output / "baseline.json",
-            {"complete": False, "evidence_valid": False, "status": "failed", "error": str(error)},
+            {
+                "complete": False,
+                "evidence_valid": False,
+                "status": "failed",
+                "error": str(error),
+                "profile_subset": subset,
+            },
         )
         save(output / "error.json", {"error": str(error)})
         print(str(error), file=sys.stderr)

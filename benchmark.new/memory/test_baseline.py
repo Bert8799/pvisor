@@ -72,6 +72,25 @@ class BaselineContractTests(unittest.TestCase):
         self.assertIn("repeated,random-shared", command)
         self.assertEqual(command[command.index("--output") + 1], "/tmp/output/cohort")
 
+    def test_shared_file_cache_is_bound_to_the_recorded_command(self):
+        for enabled in (False, True):
+            command = subject.build_command(
+                "quick", Path("/tmp/inputs"), Path("/tmp/cohort"), shared_file_cache=enabled
+            )
+            self.assertEqual(command[command.index("--shared-file-cache") + 1], str(int(enabled)))
+
+    def test_engineering_arm_subset_is_explicit_and_cannot_expand_the_profile(self):
+        arms = subject.selected_arms("quick", "pvisor-physical")
+        command = subject.build_command(
+            "quick", Path("/tmp/inputs"), Path("/tmp/cohort"), arms=arms, zero_pages=True
+        )
+        self.assertEqual(command[command.index("--arms") + 1], "pvisor-physical")
+        self.assertEqual(command[command.index("--patterns") + 1], "repeated,random-shared")
+        self.assertEqual(command[command.index("--zero-pages") + 1], "1")
+        for selection in ("", "pvisor-local", "pvisor-physical,pvisor-physical", "firecracker"):
+            with self.subTest(selection=selection), self.assertRaises(subject.BaselineError):
+                subject.selected_arms("quick", selection)
+
     def test_fixed_budget_is_the_registered_four_cpu_layout(self):
         self.assertEqual(subject.FIXED["vms"], 4)
         self.assertEqual(subject.FIXED["memory_mib"], 256)
@@ -80,6 +99,17 @@ class BaselineContractTests(unittest.TestCase):
         self.assertEqual(subject.FIXED["cpu_quota"], "400000 100000")
         self.assertEqual(subject.FIXED["idle_seconds"], 60)
         self.assertEqual(subject.FIXED["post_write_seconds"], 30)
+
+    def test_layout_subset_and_cache_accounting_are_explicit(self):
+        patterns = subject.selected_patterns("quick", "random-shared")
+        command = subject.build_command(
+            "quick", Path("/tmp/inputs"), Path("/tmp/cohort"), patterns=patterns, firmware_copy=True
+        )
+        self.assertEqual(command[command.index("--patterns") + 1], "random-shared")
+        self.assertEqual(command[command.index("--firmware-copy") + 1], "1")
+        for selection in ("", "random-unique", "repeated,repeated"):
+            with self.subTest(selection=selection), self.assertRaises(subject.BaselineError):
+                subject.selected_patterns("quick", selection)
 
     def test_final_validation_failure_never_publishes_success(self):
         import baseline_evidence

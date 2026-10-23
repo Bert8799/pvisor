@@ -135,6 +135,7 @@ def verify_harness(files):
 
 def mapping_evidence(proc):
     mergeable, pooled, count, ksm_bytes, header, size = 0, 0, 0, 0, "", 0
+    firmware_mappings = []
     with (proc / "smaps").open() as stream:
         for line in stream:
             if line.startswith("VmFlags:") and "mg" in line.split()[1:]:
@@ -145,11 +146,17 @@ def mapping_evidence(proc):
                 header = line
                 low, high = (int(x, 16) for x in line.split()[0].split("-"))
                 size = high - low
+                if header.split()[-1].endswith("/runtime-firmware"):
+                    firmware_mappings.append(header.strip())
                 if "memfd:pvisor-shared-ram" in header:
                     pooled += size
                     count += 1
     return dict(
-        mergeable_bytes=mergeable, pool_mapping_bytes=pooled, pool_vmas=count, ksm_bytes=ksm_bytes
+        mergeable_bytes=mergeable,
+        pool_mapping_bytes=pooled,
+        pool_vmas=count,
+        ksm_bytes=ksm_bytes,
+        firmware_mappings=firmware_mappings,
     )
 
 
@@ -273,6 +280,41 @@ def snapshot(root, name, guests, pool_pid=None, *, group=None):
     return result
 
 
+def copy_firmware(inputs, root):
+    """Charge a new firmware inode in the worker group, including copying CPU.
+
+    The input inode may have been cached by the external input audit. Reading it
+    does not establish ownership of its cache. Writing a distinct inode here
+    ensures the runtime firmware cache is first touched inside the product group.
+    Never reflink or reuse a previous condition's destination.
+    """
+    source, destination = inputs / "firmware", root / "runtime-firmware"
+    expected = json.loads((inputs / "receipt.json").read_text())["hashes"]["firmware"]
+    import hashlib
+
+    checksum = hashlib.sha256()
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        while chunk := reader.read(65536):
+            checksum.update(chunk)
+            writer.write(chunk)
+    if checksum.hexdigest() != expected:
+        raise ValueError("runtime firmware copy does not match frozen input")
+    metadata = destination.stat()
+    receipt = dict(
+        path=str(destination),
+        sha256=checksum.hexdigest(),
+        bytes=metadata.st_size,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        source_device=source.stat().st_dev,
+        source_inode=source.stat().st_ino,
+    )
+    if (metadata.st_dev, metadata.st_ino) == (source.stat().st_dev, source.stat().st_ino):
+        raise ValueError("runtime firmware must have an independent inode")
+    save(root / "runtime-firmware.json", receipt)
+    return destination, receipt
+
+
 def internal(path):
     cfg = json.loads(path.read_text())
     if cfg["arm"] not in ARMS:
@@ -310,6 +352,11 @@ def internal(path):
         if cfg["arm"] == "pvisor-ksm":
             require_default_ksm(state)
         result["kernel_before"] = state
+        firmware = inputs / "firmware"
+        if cfg.get("firmware_copy"):
+            if not cfg["arm"].startswith("pvisor-"):
+                raise ValueError("firmware-copy requires pVisor arms")
+            firmware, result["runtime_firmware"] = copy_firmware(inputs, root)
         if cfg["arm"] == "docker-rootless":
             from docker_support import Engine
 
@@ -401,7 +448,7 @@ def internal(path):
                     "--worker",
                     str(inputs / "worker"),
                     "--firmware",
-                    str(inputs / "firmware"),
+                    str(firmware),
                     "--stage",
                     str(root / f"vm{identity}"),
                     "--mode",
@@ -413,6 +460,10 @@ def internal(path):
                 ]
                 if socket:
                     command += ["--pool-socket", str(socket)]
+            guest_environment["PVISOR_MEMORY_SHARED_FILE_CACHE"] = str(
+                int(cfg.get("shared_file_cache", False))
+            )
+            guest_environment["PVISOR_MEMORY_ZERO_PAGES"] = str(int(cfg.get("zero_pages", False)))
             error = (root / f"vm{identity}.stderr").open("wb")
             log = (root / f"vm{identity}.stdout").open("wb")
             handles.extend([error, log])
@@ -581,6 +632,44 @@ def validate_worker(raw, cfg):
         raise ValueError("unsupported condition schema")
     if raw.get("status") != "passed" or raw.get("condition") != cfg:
         raise ValueError("worker/condition mismatch")
+    if cfg.get("firmware_copy"):
+        if not cfg["arm"].startswith("pvisor-"):
+            raise ValueError("firmware-copy requires pVisor arms")
+        runtime = Path(cfg["root"]) / "runtime-firmware"
+        receipt = raw.get("runtime_firmware", {})
+        source = (Path(cfg["inputs"]) / "firmware").stat()
+        expected = json.loads((Path(cfg["inputs"]) / "receipt.json").read_text())["hashes"][
+            "firmware"
+        ]
+        metadata = runtime.stat()
+        if (
+            receipt.get("path") != str(runtime)
+            or receipt.get("sha256") != expected
+            or digest(runtime) != expected
+            or receipt.get("bytes") != metadata.st_size
+            or receipt.get("inode") != metadata.st_ino
+            or receipt.get("device") != metadata.st_dev
+            or (receipt.get("source_device"), receipt.get("source_inode"))
+            != (source.st_dev, source.st_ino)
+            or (receipt["device"], receipt["inode"])
+            == (receipt.get("source_device"), receipt.get("source_inode"))
+        ):
+            raise ValueError("runtime firmware identity/hash mismatch")
+        for phase in raw.get("phases", []):
+            processes = {p["pid"]: p for p in phase["processes"]}
+            for pid in phase["guest_pids"]:
+                mappings = processes[pid]["mapping_evidence"].get("firmware_mappings", [])
+                matched = []
+                for header in mappings:
+                    fields = header.split()
+                    major, minor = (int(v, 16) for v in fields[3].split(":"))
+                    if (os.makedev(major, minor), int(fields[4])) == (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        matched.append(fields)
+                if not matched or not any(fields[1] == "rw-p" for fields in matched):
+                    raise ValueError("missing VM private writable runtime firmware mapping")
     phases = raw.get("phases", [])
     names = [f"idle-{n}" for n in BOUNDARIES] + ["readback", "cow-25", "cow-100"]
     if cfg.get("schema") in WRITE_SCHEMAS:
@@ -723,6 +812,9 @@ def attempt(
     library_variant=None,
     docker_inputs=None,
     baseline_state=None,
+    shared_file_cache=False,
+    zero_pages=False,
+    firmware_copy=False,
 ):
     root.mkdir()
     row = dict(arm=arm, pattern=pattern, status="failed")
@@ -746,6 +838,9 @@ def attempt(
         pattern=pattern,
         hashes=hashes,
         harness_files=harness,
+        shared_file_cache=bool(shared_file_cache),
+        zero_pages=bool(zero_pages),
+        firmware_copy=bool(firmware_copy),
     )
     if baseline_state is not None:
         cfg["baseline_state"] = str(baseline_state)
@@ -953,6 +1048,15 @@ def main():
     p.add_argument("--samples", type=int, default=5)
     p.add_argument("--arms", default=",".join(ARMS))
     p.add_argument("--patterns", default=",".join(PATTERNS))
+    p.add_argument(
+        "--shared-file-cache",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="experimental physical-pool descriptor validation cache A/B",
+    )
+    p.add_argument("--zero-pages", type=int, choices=(0, 1), default=0)
+    p.add_argument("--firmware-copy", type=int, choices=(0, 1), default=0)
     p.add_argument("--baseline-state", type=Path, help="frozen local baseline guard state")
     a = p.parse_args()
     if a.internal:
@@ -964,6 +1068,8 @@ def main():
         p.error("invalid arm selection")
     if len(patterns) != len(set(patterns)) or not set(patterns) <= set(PATTERNS):
         p.error("invalid pattern selection")
+    if a.firmware_copy and any(not arm.startswith("pvisor-") for arm in arms):
+        p.error("firmware-copy requires pVisor arms")
     if not a.preflight and (
         a.samples < 5 or set(arms) != set(ARMS) or set(patterns) != set(PATTERNS)
     ):
@@ -986,6 +1092,14 @@ def main():
             a.arms,
             "--patterns",
             a.patterns,
+        ]
+        command += [
+            "--shared-file-cache",
+            str(a.shared_file_cache),
+            "--zero-pages",
+            str(a.zero_pages),
+            "--firmware-copy",
+            str(a.firmware_copy),
         ]
         if a.preflight:
             command.append("--preflight")
@@ -1057,6 +1171,9 @@ def main():
         samples=1 if a.preflight else a.samples,
         arms=arms,
         patterns=patterns,
+        shared_file_cache=bool(a.shared_file_cache),
+        zero_pages=bool(a.zero_pages),
+        firmware_copy=bool(a.firmware_copy),
         receipt=receipt,
         harness_sha256=digest(Path(__file__)),
         attempts=[],
@@ -1102,6 +1219,9 @@ def main():
                 harness,
                 docker_inputs=docker_inputs,
                 baseline_state=a.baseline_state,
+                shared_file_cache=bool(a.shared_file_cache),
+                zero_pages=bool(a.zero_pages),
+                firmware_copy=bool(a.firmware_copy),
             )
             row["round"] = r
             if a.baseline_state:

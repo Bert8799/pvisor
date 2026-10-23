@@ -2,6 +2,7 @@
 
 import copy
 import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,6 +18,66 @@ spec = importlib.util.spec_from_file_location(
 )
 subject = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(subject)
+
+
+class FirmwareCopyTests(unittest.TestCase):
+    def test_audit_rejects_changed_firmware_or_shared_writable_mappings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, run = root / "inputs", root / "run"
+            inputs.mkdir()
+            run.mkdir()
+            data = b"firmware"
+            (inputs / "firmware").write_bytes(data)
+            (inputs / "receipt.json").write_text(
+                json.dumps({"hashes": {"firmware": hashlib.sha256(data).hexdigest()}})
+            )
+            path, receipt = subject.copy_firmware(inputs, run)
+            raw, cfg = fixture()
+            cfg.update(arm="pvisor-off", firmware_copy=True, root=str(run), inputs=str(inputs))
+            raw["runtime_firmware"] = receipt
+            device = f"{os.major(receipt['device']):02x}:{os.minor(receipt['device']):02x}"
+            header = f"1000-2000 rw-p 00000000 {device} {receipt['inode']} {path}"
+            for phase in raw["phases"]:
+                for process in phase["processes"]:
+                    process["mapping_evidence"]["firmware_mappings"] = [header]
+            subject.validate_worker(raw, cfg)
+            for failure in ("inode", "source_inode", "mapping", "bytes"):
+                with self.subTest(failure=failure):
+                    changed = copy.deepcopy(raw)
+                    if failure == "mapping":
+                        changed["phases"][0]["processes"][0]["mapping_evidence"][
+                            "firmware_mappings"
+                        ] = [header.replace("rw-p", "rw-s")]
+                    else:
+                        changed["runtime_firmware"][failure] += 1
+                    with self.assertRaises(ValueError):
+                        subject.validate_worker(changed, cfg)
+            path.write_bytes(b"modified")
+            with self.assertRaisesRegex(ValueError, "identity/hash"):
+                subject.validate_worker(raw, cfg)
+
+    def test_copy_is_hash_bound_and_never_reuses_a_cached_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, run = root / "inputs", root / "run"
+            inputs.mkdir()
+            run.mkdir()
+            data = b"firmware" * 16384
+            (inputs / "firmware").write_bytes(data)
+            (inputs / "receipt.json").write_text(
+                json.dumps({"hashes": {"firmware": hashlib.sha256(data).hexdigest()}})
+            )
+            path, receipt = subject.copy_firmware(inputs, run)
+            self.assertEqual(path.read_bytes(), data)
+            self.assertNotEqual(receipt["source_inode"], receipt["inode"])
+            with self.assertRaises(FileExistsError):
+                subject.copy_firmware(inputs, run)
+            other = root / "other"
+            other.mkdir()
+            (inputs / "firmware").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "frozen input"):
+                subject.copy_firmware(inputs, other)
 
 
 def fixture():

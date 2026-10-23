@@ -24,6 +24,7 @@ const BLOCK: usize = 64 * 1024;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_PRESENT: u8 = 1;
 const PAGE_FILE: u8 = 2;
+const PAGE_EXCLUSIVE: u8 = 4;
 // Keep only these two state bits. PFNs and unrelated pagemap data never escape.
 fn pagemap_flags(bits: u64) -> u8 {
     let present = if bits & (1 << 63) != 0 {
@@ -279,6 +280,81 @@ fn file_hint_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
         )),
     }
 }
+// One pinned Arc<File>, not a raw fd/inode cache: descriptor reuse cannot
+// inherit authority. Access mode is fixed for an open file description and
+// F_SEAL_GROW/SHRINK can only be added, so successful checks stay valid.
+#[derive(Default)]
+struct SharedFileAuthority(Option<Arc<std::fs::File>>);
+impl SharedFileAuthority {
+    fn check(&mut self, file: &Arc<std::fs::File>) -> io::Result<()> {
+        if self
+            .0
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(cached, file))
+        {
+            return Ok(());
+        }
+        validate_shared_file(file)?;
+        self.0 = Some(file.clone());
+        Ok(())
+    }
+}
+fn validate_shared_file(file: &std::fs::File) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if flags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+        || seals < 0
+        || seals & (libc::F_SEAL_GROW | libc::F_SEAL_SHRINK)
+            != libc::F_SEAL_GROW | libc::F_SEAL_SHRINK
+    {
+        return Err(io::Error::other(
+            "shared mapping must be read-only and size-sealed",
+        ));
+    }
+    Ok(())
+}
+fn shared_file_cache_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "0" => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PVISOR_MEMORY_SHARED_FILE_CACHE must be 0 or 1",
+        )),
+    }
+}
+// Only physical zero-page experiments allocate this one-bit-per-page hint.
+// It is scheduling metadata, never authority to discard live bytes.
+struct ZeroPages(Vec<u64>);
+impl ZeroPages {
+    fn new(pages: usize) -> Self {
+        Self(vec![0; pages.div_ceil(64)])
+    }
+    fn contains(&self, index: usize) -> bool {
+        self.0[index / 64] & (1 << (index % 64)) != 0
+    }
+    fn set(&mut self, index: usize, value: bool) {
+        let mask = 1 << (index % 64);
+        if value {
+            self.0[index / 64] |= mask;
+        } else {
+            self.0[index / 64] &= !mask;
+        }
+    }
+}
+fn zero_page_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "0" => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PVISOR_MEMORY_ZERO_PAGES must be 0 or 1",
+        )),
+    }
+}
 struct Pager<S: ColdRamStore> {
     // Pins every pointer, even while VM/device owners are shutting down.
     memory: GuestMemoryMmap,
@@ -290,6 +366,9 @@ struct Pager<S: ColdRamStore> {
     shared_scan: Option<scan::Scanner>,
     read_hints: Option<Arc<ReadHints>>,
     file_hint_candidates: u64,
+    shared_file_authority: Option<SharedFileAuthority>,
+    zero_pages: Option<ZeroPages>,
+    zero_remaps: u64,
     cursor: usize,
     restored: u64,
     discarded: u64,
@@ -618,7 +697,14 @@ impl<S: ColdRamStore> Pager<S> {
             .as_chunks::<8>()
             .0
             .iter()
-            .map(|entry| pagemap_flags(u64::from_ne_bytes(*entry)))
+            .map(|entry| {
+                let bits = u64::from_ne_bytes(*entry);
+                let mut flags = pagemap_flags(bits);
+                if self.zero_pages.is_some() && bits & (1 << 56) != 0 {
+                    flags |= PAGE_EXCLUSIVE;
+                }
+                flags
+            })
             .collect())
     }
     fn hinted_candidates(&mut self, limit: usize, now: Instant) -> Vec<usize> {
@@ -704,6 +790,13 @@ impl<S: ColdRamStore> Pager<S> {
                     continue;
                 }
                 if page.cold.is_some() && bits & PAGE_FILE != 0 {
+                    continue;
+                }
+                // Untouched anonymous zero PTEs need no repeated publication.
+                // Exclusive is merely a rescan hint: every replacement still
+                // compares all live bytes under the CPU/device barrier.
+                if self.zero_pages.as_ref().is_some_and(|zero| zero.contains(index))
+                    && bits & PAGE_EXCLUSIVE == 0 {
                     continue;
                 }
                 candidates.push(index);
@@ -799,6 +892,58 @@ impl<S: ColdRamStore> Pager<S> {
         }
         batch
     }
+    // Caller holds the same second CPU/device barrier as ordinary commit.
+    // No pool object is required for anonymous zero RAM; a later write obtains
+    // private memory through the kernel's normal anonymous fault path.
+    fn commit_zero(&mut self, snapshot: &Snapshot) -> io::Result<Option<S::Object>> {
+        let range = self.pages.range(snapshot.index);
+        if !self.share_resident
+            || self.zero_pages.is_none()
+            || range.len != 4096
+            || snapshot.bytes.len() != 4096
+            || snapshot.bytes.iter().any(|byte| *byte != 0)
+        {
+            return Err(io::Error::other("invalid zero-page replacement"));
+        }
+        let live = unsafe { std::slice::from_raw_parts(range.start as *const u8, 4096) };
+        if live != snapshot.bytes {
+            self.pages[snapshot.index].eligible_at =
+                deadline(Instant::now() + Duration::from_secs(30));
+            self.rejected += 1;
+            self.shared_scan
+                .as_mut()
+                .unwrap()
+                .invalidated(snapshot.index);
+            return Ok(None);
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                range.start as *mut libc::c_void,
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // Preserve base-page writes even when adjacent anonymous VMAs merge.
+        // On kernels without THP the valid aligned advice returns EINVAL.
+        if unsafe { libc::madvise(mapped, 4096, libc::MADV_NOHUGEPAGE) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error);
+            }
+        }
+        self.zero_pages.as_mut().unwrap().set(snapshot.index, true);
+        self.shared_scan.as_mut().unwrap().merged(snapshot.index);
+        self.discarded += 4096;
+        self.zero_remaps += 1;
+        // Keep old authority until replacement, then release outside the barrier.
+        Ok(self.pages[snapshot.index].cold.take().map(|object| *object))
+    }
     fn commit(&mut self, snapshot: &Snapshot, object: S::Object) -> io::Result<Option<S::Object>> {
         let range = self.pages.range(snapshot.index);
         let page = &mut self.pages[snapshot.index];
@@ -833,17 +978,10 @@ impl<S: ColdRamStore> Pager<S> {
             if bytes != snapshot.bytes.as_slice() {
                 return Err(io::Error::other("shared mapping content mismatch"));
             }
-            let flags = unsafe { libc::fcntl(mapping.file.as_raw_fd(), libc::F_GETFL) };
-            let seals = unsafe { libc::fcntl(mapping.file.as_raw_fd(), libc::F_GET_SEALS) };
-            if flags < 0
-                || flags & libc::O_ACCMODE != libc::O_RDONLY
-                || seals < 0
-                || seals & (libc::F_SEAL_GROW | libc::F_SEAL_SHRINK)
-                    != libc::F_SEAL_GROW | libc::F_SEAL_SHRINK
-            {
-                return Err(io::Error::other(
-                    "shared mapping must be read-only and size-sealed",
-                ));
+            if let Some(authority) = &mut self.shared_file_authority {
+                authority.check(&mapping.file)?;
+            } else {
+                validate_shared_file(&mapping.file)?;
             }
             // CPU/device access is drained, bytes were rechecked, and the pool
             // reference pins this slot. Linux invalidates KVM secondary mappings
@@ -867,6 +1005,7 @@ impl<S: ColdRamStore> Pager<S> {
                 std::ptr::read_volatile(mapped.cast::<u8>());
             }
             let previous = page.cold.replace(Box::new(object));
+            if let Some(zero) = &mut self.zero_pages { zero.set(snapshot.index, false); }
             let scanner = self.shared_scan.as_mut().unwrap();
             scanner.merged(snapshot.index);
             if previous.is_some() {
@@ -1019,6 +1158,14 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
     } else {
         None
     };
+    let shared_file_authority = if options.share_resident
+        && shared_file_cache_setting(std::env::var_os("PVISOR_MEMORY_SHARED_FILE_CACHE"))? {
+        Some(SharedFileAuthority::default())
+    } else {
+        None
+    };
+    let zero_pages_enabled = options.share_resident
+        && zero_page_setting(std::env::var_os("PVISOR_MEMORY_ZERO_PAGES"))?;
     let (memory, mappings, kernel) = {
         let _transition = handle
             .transition
@@ -1114,6 +1261,9 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
                 .then(|| pages.shared_scanner(rand::random())),
             read_hints,
             file_hint_candidates: 0,
+            shared_file_authority,
+            zero_pages: zero_pages_enabled.then(|| ZeroPages::new(pages.len())),
+            zero_remaps: 0,
             pages,
             store: Arc::new(Mutex::new(store)),
             uffd,
@@ -1265,12 +1415,20 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
             };
             let mut objects = Vec::new();
             let mut put_rejections = 0;
+            let zero_pages_enabled = worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned"))
+                .zero_pages.is_some();
             for snapshot in &batch.0 {
+                // Zero snapshots need no IPC or pool slot, but still require
+                // the full live recheck in the second barrier below.
+                if zero_pages_enabled && snapshot.bytes.iter().all(|byte| *byte == 0) {
+                    objects.push((snapshot, None, true));
+                    continue;
+                }
                 // Neither VMM/barrier nor pager state is held during publication.
                 let object = publish_snapshot(&worker_pager, &pool, snapshot)
                     .unwrap_or_else(|error| fatal(error));
                 if let Some(object) = object {
-                    objects.push((snapshot, Some(object)));
+                    objects.push((snapshot, Some(object), false));
                 } else {
                     put_rejections += 1;
                 }
@@ -1278,16 +1436,18 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
             worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned")).put_rejections += put_rejections;
             let committed = quiesce_nonempty(&mut objects, |objects| handle.ram_quiesced(|_| {
                 let mut pager = worker_pager.lock().map_err(|_| "pager poisoned")?;
-                for (snapshot, object) in objects {
+                for (snapshot, object, zero) in objects {
                     // Successful publication still needs the live-byte recheck
                     // under the second barrier before destructive discard.
-                    if let Some(published) = object.take() {
+                    if *zero {
+                        *object = pager.commit_zero(snapshot).map_err(|error| error.to_string())?;
+                    } else if let Some(published) = object.take() {
                         *object = pager.commit(snapshot, published).map_err(|error| error.to_string())?;
                     }
                 }
                 Ok(())
             }));
-            for object in objects.into_iter().filter_map(|(_, object)| object) {
+            for object in objects.into_iter().filter_map(|(_, object, _)| object) {
                 pool.lock().unwrap_or_else(|_| fatal("store poisoned")).release(object).unwrap_or_else(|error| fatal(error));
             }
             match committed {
@@ -1307,8 +1467,8 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
                     batch.0.len(), stats.encoded_bytes, stats.objects, stats.session_references,
                     stats.cross_session_objects, std::process::id());
                 if let Some(scanner) = &pager.shared_scan {
-                    eprintln!("pvisor-shared-scan regions_by_level={:?} probed_pages_total={} successful_merges_total={} cow_breaks_total={} unstable_total={} file_hint_candidates_total={} pid={}",
-                        scanner.levels(), scanner.probes, scanner.merges, scanner.cow_breaks, scanner.unstable, pager.file_hint_candidates, std::process::id());
+                    eprintln!("pvisor-shared-scan regions_by_level={:?} probed_pages_total={} successful_merges_total={} cow_breaks_total={} unstable_total={} file_hint_candidates_total={} zero_remaps_total={} pid={}",
+                        scanner.levels(), scanner.probes, scanner.merges, scanner.cow_breaks, scanner.unstable, pager.file_hint_candidates, pager.zero_remaps, std::process::id());
                 }
             }
         }
@@ -1460,6 +1620,9 @@ mod tests {
             shared_scan: Some(pages.shared_scanner(0)),
             read_hints: Some(Arc::new(ReadHints::default())),
             file_hint_candidates: 0,
+            shared_file_authority: None,
+            zero_pages: None,
+            zero_remaps: 0,
             pages,
             store: Arc::new(Mutex::new(SharedStore::default())),
             uffd: None,
@@ -1598,7 +1761,15 @@ mod tests {
     }
     #[test]
     fn shared_reads_keep_pool_pages_and_writes_are_isolated_cow() {
+        shared_read_write_contract(false);
+    }
+    #[test]
+    fn cached_shared_authority_preserves_reads_and_private_cow() {
+        shared_read_write_contract(true);
+    }
+    fn shared_read_write_contract(cached: bool) {
         let mut pager = shared_pager();
+        pager.shared_file_authority = cached.then(SharedFileAuthority::default);
         let batch = pager.sample();
         assert_eq!(batch.0.len(), 2);
         for snapshot in &batch.0 {
@@ -1640,6 +1811,134 @@ mod tests {
         assert_eq!(pager.restore_count, 0);
         pager.shutdown().unwrap();
     }
+    #[test]
+    fn shared_authority_pins_its_exact_readonly_descriptor_and_rejects_replacements() {
+        let mut store = SharedStore::default();
+        let readonly = store.put(&[0x5a; 4096]).unwrap();
+        let weak = Arc::downgrade(&readonly);
+        let mut authority = SharedFileAuthority::default();
+        authority.check(&readonly).unwrap();
+        authority.check(&readonly).unwrap();
+        let writable = Arc::new(OpenOptions::new().read(true).write(true)
+            .open(format!("/proc/self/fd/{}", readonly.as_raw_fd())).unwrap());
+        assert!(authority.check(&writable).is_err());
+        assert!(Arc::ptr_eq(authority.0.as_ref().unwrap(), &readonly));
+        let other = Arc::new(std::fs::File::open("/dev/zero").unwrap());
+        assert!(authority.check(&other).is_err());
+        drop(readonly);
+        drop(store);
+        assert!(weak.upgrade().is_some(), "cached descriptors cannot be closed and reused");
+        drop(authority);
+        assert!(weak.upgrade().is_none());
+        assert!(!shared_file_cache_setting(None).unwrap());
+        assert!(shared_file_cache_setting(Some("1".into())).unwrap());
+        assert!(!shared_file_cache_setting(Some("0".into())).unwrap());
+        assert!(shared_file_cache_setting(Some("true".into())).is_err());
+    }
+
+    #[test]
+    fn anonymous_zero_pages_remove_pool_vmas_and_keep_private_writes() {
+        use vm_memory::GuestAddress;
+        let count = 32;
+        let mut pager = shared_pager_with_size(count * 4096);
+        pager.zero_pages = Some(ZeroPages::new(pager.pages.len()));
+        pager
+            .memory
+            .write_slice(&vec![0; count * 4096], GuestAddress(0))
+            .unwrap();
+        let zero = |index| Snapshot {
+            index,
+            bytes: vec![0; 4096],
+        };
+        for index in 0..count {
+            let snapshot = zero(index);
+            let object = pager.store.lock().unwrap().put(&snapshot.bytes).unwrap();
+            pager.commit(&snapshot, object).unwrap();
+        }
+        let range = pager.pages.range(0);
+        let mappings = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    let (start, end) = line
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let start = u64::from_str_radix(start, 16).unwrap();
+                    let end = u64::from_str_radix(end, 16).unwrap();
+                    start < range.start + (count * 4096) as u64 && end > range.start
+                })
+                .count()
+        };
+        assert!(
+            mappings() >= count,
+            "equal file offsets require separate VMAs"
+        );
+        for index in 0..count {
+            let old = pager.commit_zero(&zero(index)).unwrap().unwrap();
+            pager.store.lock().unwrap().release(old).unwrap();
+        }
+        assert!(
+            mappings() <= 2,
+            "adjacent anonymous zero mappings should coalesce"
+        );
+        assert!(pager.pages.iter().all(|page| page.cold.is_none()));
+        assert_eq!(pager.store.lock().unwrap().releases, count);
+        assert_eq!(pager.zero_remaps, count as u64);
+        let mut bytes = vec![1; count * 4096];
+        pager
+            .memory
+            .read_slice(&mut bytes, GuestAddress(0))
+            .unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert!(
+            pager.shared_candidates().is_empty(),
+            "read-only zero PTEs stay lazy"
+        );
+        pager.memory.write_slice(&[0x73], GuestAddress(0)).unwrap();
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            selected.extend(pager.shared_candidates());
+        }
+        assert!(
+            selected.contains(&0),
+            "private writes reenter normal scanning"
+        );
+        assert!(selected.iter().all(|index| *index == 0));
+        assert_eq!(pager.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x73);
+        assert_eq!(pager.memory.read_obj::<u8>(GuestAddress(4096)).unwrap(), 0);
+    }
+
+    #[test]
+    fn zero_commit_rejects_live_changes_without_dropping_old_authority() {
+        use vm_memory::GuestAddress;
+        let mut pager = shared_pager();
+        pager.zero_pages = Some(ZeroPages::new(pager.pages.len()));
+        pager
+            .memory
+            .write_slice(&[0; 4096], GuestAddress(0))
+            .unwrap();
+        let snapshot = Snapshot {
+            index: 0,
+            bytes: vec![0; 4096],
+        };
+        let old = pager.store.lock().unwrap().put(&snapshot.bytes).unwrap();
+        pager.commit(&snapshot, old.clone()).unwrap();
+        pager.memory.write_slice(&[9], GuestAddress(0)).unwrap();
+        assert!(pager.commit_zero(&snapshot).unwrap().is_none());
+        assert!(Arc::ptr_eq(pager.pages[0].cold.as_ref().unwrap(), &old));
+        assert_eq!(pager.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 9);
+        assert_eq!(pager.zero_remaps, 0);
+        assert_eq!(pager.rejected, 1);
+        assert!(!zero_page_setting(None).unwrap());
+        assert!(zero_page_setting(Some("1".into())).unwrap());
+        assert!(!zero_page_setting(Some("0".into())).unwrap());
+        assert!(zero_page_setting(Some("invalid".into())).is_err());
+    }
+
     #[test]
     fn shared_residency_bitmap_preserves_sparse_pages() {
         let mut pager = shared_pager();
@@ -1872,6 +2171,9 @@ mod tests {
             shared_scan: None,
             read_hints: None,
             file_hint_candidates: 0,
+            shared_file_authority: None,
+            zero_pages: None,
+            zero_remaps: 0,
             pages,
             store: Arc::new(Mutex::new(CompressedStore::default())),
             uffd: Some(Arc::new(uffd)),
