@@ -242,13 +242,14 @@ impl<O> std::ops::DerefMut for Pages<O> {
     }
 }
 impl<O> Pages<O> {
-    fn shared_scanner(&self, seed: u64) -> scan::Scanner {
+    fn shared_scanner(&self, seed: u64, order: ScanOrder) -> scan::Scanner {
         debug_assert_eq!(self.block_bytes, 4096);
-        scan::Scanner::new(
-            self.regions.iter()
-                .map(|(first, range)| *first..*first + (range.len as usize).div_ceil(4096)),
-            seed,
-        )
+        let mappings = self.regions.iter()
+            .map(|(first, range)| *first..*first + (range.len as usize).div_ceil(4096));
+        match order {
+            ScanOrder::Random => scan::Scanner::new(mappings, seed),
+            ScanOrder::Adaptive => scan::Scanner::adaptive(mappings, seed),
+        }
     }
     fn enable_checksums(&mut self) {
         self.checksums.resize(self.states.len(), [0; 32]);
@@ -322,6 +323,17 @@ fn zero_page_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
             io::ErrorKind::InvalidInput,
             "PVISOR_MEMORY_ZERO_PAGES must be 0 or 1",
         )),
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanOrder { Random, Adaptive }
+fn scan_order_setting(value: Option<std::ffi::OsString>) -> io::Result<ScanOrder> {
+    match value {
+        None => Ok(ScanOrder::Random),
+        Some(value) if value == "random" => Ok(ScanOrder::Random),
+        Some(value) if value == "adaptive" => Ok(ScanOrder::Adaptive),
+        Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "PVISOR_MEMORY_SCAN_ORDER must be random or adaptive")),
     }
 }
 fn batch_put_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
@@ -1164,6 +1176,9 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
     };
     let zero_pages_enabled = options.share_resident
         && zero_page_setting(std::env::var_os("PVISOR_MEMORY_ZERO_PAGES"))?;
+    let scan_order = if options.share_resident {
+        scan_order_setting(std::env::var_os("PVISOR_MEMORY_SCAN_ORDER"))?
+    } else { ScanOrder::Random };
     let batch_put = options.share_resident
         && batch_put_setting(std::env::var_os("PVISOR_MEMORY_BATCH_PUT"))?;
     let (memory, mappings, kernel) = {
@@ -1258,7 +1273,7 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
             memory,
             shared_scan: options
                 .share_resident
-                .then(|| pages.shared_scanner(rand::random())),
+                .then(|| pages.shared_scanner(rand::random(), scan_order)),
             read_hints,
             file_hint_candidates: 0,
             zero_pages: zero_pages_enabled.then(|| ZeroPages::new(pages.len())),
@@ -1650,6 +1665,16 @@ mod tests {
     fn shared_pager() -> Pager<SharedStore> {
         shared_pager_with_size(8192)
     }
+    #[test]
+    fn scan_order_preserves_default_and_rejects_ambiguous_values() {
+        assert_eq!(scan_order_setting(None).unwrap(), ScanOrder::Random);
+        for (name, order) in [("random", ScanOrder::Random), ("adaptive", ScanOrder::Adaptive)] {
+            assert_eq!(scan_order_setting(Some(name.into())).unwrap(), order);
+        }
+        for value in ["true", "linear", "clustered"] {
+            assert!(scan_order_setting(Some(value.into())).is_err());
+        }
+    }
     fn shared_pager_with_size(size: usize) -> Pager<SharedStore> {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), size)]).unwrap();
         memory
@@ -1658,7 +1683,7 @@ mod tests {
         let pages = host_sorted_pages(&ranges(&memory, u64::MAX).unwrap(), Instant::now(), 4096);
         Pager {
             memory,
-            shared_scan: Some(pages.shared_scanner(0)),
+            shared_scan: Some(pages.shared_scanner(0, ScanOrder::Random)),
             read_hints: Some(Arc::new(ReadHints::default())),
             file_hint_candidates: 0,
             zero_pages: None,

@@ -15,6 +15,7 @@ use std::ops::Range;
 const REGION_PAGES: usize = 512;
 const QUOTAS: [usize; 4] = [16, 64, 256, 512];
 const VISIT_PAGES: usize = 64;
+const CLUSTER_PAGES: usize = 4;
 
 struct Region {
     pages: Range<usize>,
@@ -27,6 +28,7 @@ struct Region {
     level: usize,
     visited: u16,
     quiet_left: u8,
+    clustered: bool,
 }
 
 pub(super) struct Visit {
@@ -37,6 +39,7 @@ pub(super) struct Visit {
 }
 
 pub(super) struct Scanner {
+    adaptive: bool,
     regions: Vec<Region>,
     cursor: usize,
     unfinished: usize,
@@ -47,6 +50,14 @@ pub(super) struct Scanner {
 }
 
 impl Scanner {
+    /// Keep random exploration until a full region earns its ordinary quota
+    /// promotion from sampled and successfully committed pages. Switch at most
+    /// once per region; low-yield regions retain the original seeded walk.
+    pub(super) fn adaptive(mappings: impl Iterator<Item = Range<usize>>, seed: u64) -> Self {
+        let mut scanner = Self::new(mappings, seed);
+        scanner.adaptive = true;
+        scanner
+    }
     pub(super) fn new(mappings: impl Iterator<Item = Range<usize>>, seed: u64) -> Self {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         use rand::{Rng, SeedableRng};
@@ -71,11 +82,13 @@ impl Scanner {
                     level: 0,
                     visited: 0,
                     quiet_left: 0,
+                    clustered: false,
                 });
             }
         }
         let unfinished = regions.len();
         Self {
+            adaptive: false,
             regions,
             cursor: 0,
             unfinished,
@@ -104,6 +117,14 @@ impl Scanner {
             } else {
                 region.level.saturating_sub(1)
             };
+            if self.adaptive && region.level > 0 && !region.clustered
+                && region.pages.len() == REGION_PAGES {
+                // Restart coverage for the new permutation rather than count
+                // old random probes as coverage of the clustered walk. Each
+                // fixed walk keeps its 32-round bound; a one-time transition
+                // has a conservative 64-round bound across both walks.
+                region.enable_clusters();
+            }
             if region.level == 0
                 && region.pages.len() == REGION_PAGES
                 && usize::from(region.visited) == REGION_PAGES
@@ -147,7 +168,16 @@ impl Scanner {
             let mut pages = Vec::with_capacity(count);
             for _ in 0..count {
                 pages.push(region.pages.start + region.offset);
-                region.offset = (region.offset + region.stride) % region.pages.len();
+                region.offset = if region.clustered {
+                    if (region.offset + 1).is_multiple_of(CLUSTER_PAGES) {
+                        ((region.offset / CLUSTER_PAGES + region.stride)
+                            % (REGION_PAGES / CLUSTER_PAGES)) * CLUSTER_PAGES
+                    } else {
+                        region.offset + 1
+                    }
+                } else {
+                    (region.offset + region.stride) % region.pages.len()
+                };
             }
             region.remaining -= count;
             region.visited = (usize::from(region.visited) + count).min(REGION_PAGES) as u16;
@@ -200,6 +230,19 @@ impl Scanner {
     }
 }
 
+impl Region {
+    fn enable_clusters(&mut self) {
+        debug_assert_eq!(self.pages.len(), REGION_PAGES);
+        self.clustered = true;
+        self.offset = self.offset / CLUSTER_PAGES * CLUSTER_PAGES;
+        // Both page and cluster counts are powers of two: an odd stride stays
+        // nonzero and coprime after reducing it to the cluster count.
+        self.stride %= REGION_PAGES / CLUSTER_PAGES;
+        self.visited = 0;
+        self.quiet_left = 0;
+    }
+}
+
 fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
         (a, b) = (b, a % b);
@@ -211,6 +254,93 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn adaptive_without_merges_preserves_the_original_walk_and_quotas() {
+        for seed in 0..8 {
+            let mut original = Scanner::new(std::iter::once(0..1301), seed);
+            let mut adaptive = Scanner::adaptive(std::iter::once(0..1301), seed);
+            for _ in 0..64 {
+                original.begin_round();
+                adaptive.begin_round();
+                loop {
+                    match (original.next(7), adaptive.next(7)) {
+                        (Some(a), Some(b)) => {
+                            assert_eq!(a.region, b.region);
+                            assert_eq!(a.pages, b.pages);
+                            for page in a.pages {
+                                original.sampled(page);
+                                adaptive.sampled(page);
+                            }
+                        }
+                        (None, None) => break,
+                        _ => panic!("low-yield adaptive scanning changed the original quota"),
+                    }
+                }
+                assert_eq!(original.levels(), adaptive.levels());
+                assert!(adaptive.regions.iter().all(|region| !region.clustered));
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_requires_sufficient_commits_and_rejects_churn() {
+        for (samples, merges, churn, expected) in
+            [(7, 7, 0, false), (16, 1, 0, false), (16, 8, 4, false), (16, 8, 0, true)]
+        {
+            let mut scanner = Scanner::adaptive(std::iter::once(0..1024), 7);
+            while let Some(visit) = scanner.next(16) {
+                if visit.region.start != 0 { continue; }
+                for (n, page) in visit.pages.into_iter().enumerate() {
+                    if n < samples { scanner.sampled(page); }
+                    if n < merges { scanner.merged(page); }
+                    if n < churn { scanner.cow(page); }
+                }
+            }
+            scanner.begin_round();
+            assert_eq!(scanner.regions[0].clustered, expected);
+            assert!(!scanner.regions[1].clustered);
+            if expected {
+                let visit = scanner.next(64).unwrap();
+                assert_eq!(visit.pages.len(), 64);
+                for group in visit.pages.as_chunks::<4>().0 {
+                    assert_eq!(group[0] % 4, 0);
+                    assert_eq!(group, &[group[0], group[0]+1, group[0]+2, group[0]+3]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_promotion_keeps_tail_fairness_and_bounded_transition_coverage() {
+        let ranges = [3..532, 1000..1511];
+        let expected: BTreeSet<_> = ranges.clone().into_iter().flatten().collect();
+        for seed in 0..8 {
+            let mut scanner = Scanner::adaptive(ranges.clone().into_iter(), seed);
+            let mut rounds = Vec::new();
+            for round in 0..70 {
+                scanner.begin_round();
+                let mut seen = Vec::new();
+                while let Some(visit) = scanner.next(7) {
+                    assert!(visit.pages.iter().all(|p| visit.region.contains(p)));
+                    for page in visit.pages {
+                        scanner.sampled(page);
+                        if round == 0 && visit.region.len() == REGION_PAGES {
+                            scanner.merged(page);
+                        }
+                        seen.push(page);
+                    }
+                }
+                rounds.push(seen);
+            }
+            assert!(scanner.regions[0].clustered);
+            assert!(scanner.regions[1..].iter().all(|region| !region.clustered));
+            for window in rounds.windows(64) {
+                let seen: BTreeSet<_> = window.iter().flatten().copied().collect();
+                assert_eq!(seen, expected);
+            }
+        }
+    }
 
     #[test]
     fn poor_regions_eventually_visit_every_page_including_non_power_of_two_tails() {
