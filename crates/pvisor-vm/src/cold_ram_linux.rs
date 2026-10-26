@@ -245,8 +245,7 @@ impl<O> Pages<O> {
     fn shared_scanner(&self, seed: u64) -> scan::Scanner {
         debug_assert_eq!(self.block_bytes, 4096);
         scan::Scanner::new(
-            self.regions
-                .iter()
+            self.regions.iter()
                 .map(|(first, range)| *first..*first + (range.len as usize).div_ceil(4096)),
             seed,
         )
@@ -325,6 +324,16 @@ fn zero_page_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
         )),
     }
 }
+fn batch_put_setting(value: Option<std::ffi::OsString>) -> io::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "0" => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "PVISOR_MEMORY_BATCH_PUT must be 0 or 1")),
+    }
+}
+
 struct Pager<S: ColdRamStore> {
     // Pins every pointer, even while VM/device owners are shutting down.
     memory: GuestMemoryMmap,
@@ -508,6 +517,26 @@ fn publish_snapshot<S: ColdRamStore>(
     pool: &Mutex<S>,
     snapshot: &Snapshot,
 ) -> io::Result<Option<S::Object>> {
+    retire_snapshot(pager, pool, snapshot)?;
+    let object = {
+        let mut store = pool.lock().map_err(|_| io::Error::other("store poisoned"))?;
+        match store.put(&snapshot.bytes) {
+            Ok(object) => Some(object),
+            Err(error) => {
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    store.stats().map_err(|_| error)?;
+                }
+                None
+            }
+        }
+    };
+    if object.is_none() { defer_snapshot(pager, snapshot)?; }
+    Ok(object)
+}
+
+fn retire_snapshot<S: ColdRamStore>(
+    pager: &Mutex<Pager<S>>, pool: &Mutex<S>, snapshot: &Snapshot,
+) -> io::Result<()> {
     // Only a present anonymous PTE proves COW. A missing file PTE can still
     // fault back to its old slot, which must stay pinned until replacement.
     // Drop proven COW references even when the new contents are unique.
@@ -532,25 +561,11 @@ fn publish_snapshot<S: ColdRamStore>(
             .map_err(|_| io::Error::other("store poisoned"))?
             .release(object)?;
     }
-    let object = {
-        let mut store = pool
-            .lock()
-            .map_err(|_| io::Error::other("store poisoned"))?;
-        match store.put(&snapshot.bytes) {
-            Ok(object) => Some(object),
-            Err(error) => {
-                // A healthy capacity rejection preserves RAM; a broken store
-                // must not silently strand references to existing cold objects.
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    store.stats().map_err(|_| error)?;
-                }
-                None
-            }
-        }
-    };
+    Ok(())
+}
+fn defer_snapshot<S: ColdRamStore>(pager: &Mutex<Pager<S>>, snapshot: &Snapshot) -> io::Result<()> {
     // Fault recovery locks pager before store. Release store before taking
     // pager here, including the incompressible/capacity rejection path.
-    if object.is_none() {
         let mut state = pager
             .lock()
             .map_err(|_| io::Error::other("pager poisoned"))?;
@@ -560,8 +575,32 @@ fn publish_snapshot<S: ColdRamStore>(
             Duration::from_secs(30)
         };
         state.pages[snapshot.index].eligible_at = deadline(Instant::now() + retry);
+    Ok(())
+}
+fn publish_snapshots<S: ColdRamStore>(
+    pager: &Mutex<Pager<S>>, pool: &Mutex<S>, snapshots: &[&Snapshot],
+) -> io::Result<Vec<Option<S::Object>>> {
+    if snapshots.is_empty() || snapshots.len() > crate::api::COLD_RAM_MAX_BATCH_PAGES
+        || snapshots.iter().any(|snapshot| snapshot.bytes.len() != 4096) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid physical publication batch"));
     }
-    Ok(object)
+    for snapshot in snapshots { retire_snapshot(pager, pool, snapshot)?; }
+    let objects = {
+        let mut store = pool.lock().map_err(|_| io::Error::other("store poisoned"))?;
+        let pages: Vec<_> = snapshots.iter().map(|snapshot| snapshot.bytes.as_slice()).collect();
+        let objects = store.put_batch(&pages)?;
+        if objects.len() != snapshots.len() {
+            // No returned object has been mapped; consume every known reference
+            // before rejecting a broken adapter's cardinality contract.
+            for object in objects.into_iter().flatten() { store.release(object)?; }
+            return Err(io::Error::other("store returned invalid publication batch length"));
+        }
+        objects
+    };
+    for (snapshot, object) in snapshots.iter().zip(&objects) {
+        if object.is_none() { defer_snapshot(pager, snapshot)?; }
+    }
+    Ok(objects)
 }
 
 impl<S: ColdRamStore> Pager<S> {
@@ -1125,6 +1164,8 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
     };
     let zero_pages_enabled = options.share_resident
         && zero_page_setting(std::env::var_os("PVISOR_MEMORY_ZERO_PAGES"))?;
+    let batch_put = options.share_resident
+        && batch_put_setting(std::env::var_os("PVISOR_MEMORY_BATCH_PUT"))?;
     let (memory, mappings, kernel) = {
         let _transition = handle
             .transition
@@ -1375,20 +1416,41 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
             let mut put_rejections = 0;
             let zero_pages_enabled = worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned"))
                 .zero_pages.is_some();
-            for snapshot in &batch.0 {
-                // Zero snapshots need no IPC or pool slot, but still require
-                // the full live recheck in the second barrier below.
-                if zero_pages_enabled && snapshot.bytes.iter().all(|byte| *byte == 0) {
-                    objects.push((snapshot, None, true));
-                    continue;
+            if batch_put {
+                for chunk in batch.0.chunks(crate::api::COLD_RAM_MAX_BATCH_PAGES) {
+                    let kinds: Vec<_> = chunk.iter().map(|snapshot| {
+                        (snapshot, zero_pages_enabled && snapshot.bytes.iter().all(|byte| *byte == 0))
+                    }).collect();
+                    let ordinary: Vec<_> = kinds.iter()
+                        .filter_map(|(snapshot, zero)| (!*zero).then_some(*snapshot)).collect();
+                    let mut published = if ordinary.is_empty() {
+                        Vec::new()
+                    } else {
+                        publish_snapshots(&worker_pager, &pool, &ordinary)
+                            .unwrap_or_else(|error| fatal(error))
+                    }.into_iter();
+                    for (snapshot, zero) in kinds {
+                        if zero { objects.push((snapshot, None, true)); }
+                        else if let Some(object) = published.next().expect("batch cardinality validated") {
+                            objects.push((snapshot, Some(object), false));
+                        } else { put_rejections += 1; }
+                    }
                 }
-                // Neither VMM/barrier nor pager state is held during publication.
-                let object = publish_snapshot(&worker_pager, &pool, snapshot)
-                    .unwrap_or_else(|error| fatal(error));
-                if let Some(object) = object {
-                    objects.push((snapshot, Some(object), false));
-                } else {
-                    put_rejections += 1;
+            } else {
+                for snapshot in &batch.0 {
+                    // Zero snapshots still require the second-barrier recheck.
+                    if zero_pages_enabled && snapshot.bytes.iter().all(|byte| *byte == 0) {
+                        objects.push((snapshot, None, true));
+                        continue;
+                    }
+                    // No VMM/barrier or pager state is held during publication.
+                    let object = publish_snapshot(&worker_pager, &pool, snapshot)
+                        .unwrap_or_else(|error| fatal(error));
+                    if let Some(object) = object {
+                        objects.push((snapshot, Some(object), false));
+                    } else {
+                        put_rejections += 1;
+                    }
                 }
             }
             worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned")).put_rejections += put_rejections;
@@ -1465,6 +1527,9 @@ mod tests {
     }
     impl ColdRamStore for CompressedStore {
         type Object = Vec<u8>;
+        fn put_batch(&mut self, _: &[&[u8]]) -> io::Result<Vec<Option<Self::Object>>> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "compressed test store"))
+        }
         fn shared_mapping(&self, _: &Self::Object) -> Option<crate::api::SharedRamMapping> {
             None
         }
@@ -1507,9 +1572,27 @@ mod tests {
         files: std::collections::BTreeMap<Vec<u8>, Arc<std::fs::File>>,
         releases: usize,
         reject_new: bool,
+        batch_calls: usize,
+        extra_batch_object: bool,
     }
     impl ColdRamStore for SharedStore {
         type Object = Arc<std::fs::File>;
+        fn put_batch(&mut self, pages: &[&[u8]]) -> io::Result<Vec<Option<Self::Object>>> {
+            if pages.is_empty() || pages.len() > crate::api::COLD_RAM_MAX_BATCH_PAGES
+                || pages.iter().any(|page| page.len() != 4096) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid test batch"));
+            }
+            self.batch_calls += 1;
+            let mut objects = Vec::new();
+            for page in pages {
+                objects.push(if self.reject_new && !self.files.contains_key(*page) { None }
+                             else { Some(self.put(page)?) });
+            }
+            if self.extra_batch_object {
+                objects.push(objects.iter().find_map(|object| object.clone()));
+            }
+            Ok(objects)
+        }
         fn put(&mut self, bytes: &[u8]) -> io::Result<Self::Object> {
             use std::os::unix::fs::FileExt;
             if let Some(file) = self.files.get(bytes) {
@@ -2083,6 +2166,90 @@ mod tests {
             .read_slice(&mut bytes, GuestAddress(0))
             .unwrap();
         assert_eq!(bytes, [0xa3]);
+    }
+    #[test]
+    fn batched_publication_keeps_second_barrier_recheck_and_private_cow() {
+        let mut state = shared_pager();
+        let batch = state.sample();
+        assert_eq!(batch.0.len(), 2);
+        let store = state.store.clone();
+        let pager = Mutex::new(state);
+        let snapshots: Vec<_> = batch.0.iter().collect();
+        let mut objects = publish_snapshots(&pager, &store, &snapshots).unwrap();
+        assert_eq!(store.lock().unwrap().batch_calls, 1);
+        let mut state = pager.lock().unwrap();
+        state.memory.write_slice(&[0xa3], GuestAddress(0)).unwrap();
+        let unused = state.commit(snapshots[0], objects[0].take().unwrap()).unwrap().unwrap();
+        assert!(state.commit(snapshots[1], objects[1].take().unwrap()).unwrap().is_none());
+        assert!(!state.file_page(state.pages.range(0)).unwrap());
+        let mapping = state.pages[1].cold.as_ref().unwrap().clone();
+        state.memory.write_slice(&[0x91], GuestAddress(4096)).unwrap();
+        let mut byte = [0];
+        state.memory.read_slice(&mut byte, GuestAddress(0)).unwrap();
+        assert_eq!(byte, [0xa3]);
+        use std::os::unix::fs::FileExt;
+        mapping.read_exact_at(&mut byte, 0).unwrap();
+        assert_eq!(byte, [0x5a], "guest writes must not modify the shared slot");
+        drop(state);
+        store.lock().unwrap().release(unused).unwrap();
+    }
+
+    #[test]
+    fn batch_rejection_retires_only_proven_cow_and_keeps_absent_file_authority() {
+        let mut state = shared_pager();
+        let initial = state.sample();
+        for snapshot in &initial.0 {
+            let object = state.store.lock().unwrap().put(&snapshot.bytes).unwrap();
+            state.commit(snapshot, object).unwrap();
+        }
+        state.memory.write_slice(&[0x72], GuestAddress(0)).unwrap();
+        let changed = state.sample().0.remove(0);
+        let unchanged = &initial.0[1];
+        let range = state.pages.range(1);
+        assert_eq!(unsafe { libc::madvise(range.start as *mut _, 4096, libc::MADV_DONTNEED) }, 0);
+        let store = state.store.clone();
+        store.lock().unwrap().reject_new = true;
+        let pager = Mutex::new(state);
+        let mut result = publish_snapshots(&pager, &store, &[&changed, unchanged]).unwrap();
+        assert!(result[0].is_none());
+        assert!(result[1].is_some());
+        assert_eq!(store.lock().unwrap().releases, 1);
+        let state = pager.lock().unwrap();
+        assert!(state.pages[0].cold.is_none());
+        assert!(state.pages[1].cold.is_some());
+        assert!(!state.file_page(range).unwrap());
+        drop(state);
+        store.lock().unwrap().release(result[1].take().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_batch_adapter_releases_all_returned_objects_without_remapping() {
+        let mut state = shared_pager();
+        let batch = state.sample();
+        let store = state.store.clone();
+        store.lock().unwrap().extra_batch_object = true;
+        let pager = Mutex::new(state);
+        assert!(publish_snapshots(&pager, &store, &[&batch.0[0]]).is_err());
+        assert_eq!(store.lock().unwrap().releases, 2);
+        let state = pager.lock().unwrap();
+        assert!(!state.file_page(state.pages.range(0)).unwrap());
+    }
+
+    #[test]
+    fn batch_put_is_opt_in_and_validates_before_publication() {
+        assert!(!batch_put_setting(None).unwrap());
+        assert!(!batch_put_setting(Some("0".into())).unwrap());
+        assert!(batch_put_setting(Some("1".into())).unwrap());
+        assert!(batch_put_setting(Some("true".into())).is_err());
+        let mut state = shared_pager();
+        let batch = state.sample();
+        let store = state.store.clone();
+        let pager = Mutex::new(state);
+        assert!(publish_snapshots(&pager, &store, &[]).is_err());
+        let oversized = vec![&batch.0[0]; crate::api::COLD_RAM_MAX_BATCH_PAGES+1];
+        assert!(publish_snapshots(&pager, &store, &oversized).is_err());
+        assert_eq!(store.lock().unwrap().batch_calls, 0);
+        assert_eq!(store.lock().unwrap().releases, 0);
     }
     fn pager(blocks: usize, real: bool) -> Pager<CompressedStore> {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), blocks * BLOCK)]).unwrap();

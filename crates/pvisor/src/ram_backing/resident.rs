@@ -294,6 +294,12 @@ impl LocalColdRamStore {
 
 impl pvisor_vm::api::ColdRamStore for LocalColdRamStore {
     type Object = LocalColdRamObject;
+    fn put_batch(&mut self, _: &[&[u8]]) -> io::Result<Vec<Option<Self::Object>>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "local compression has no physical batch publication",
+        ))
+    }
 
     fn shared_mapping(&self, _: &Self::Object) -> Option<pvisor_vm::api::SharedRamMapping> {
         None

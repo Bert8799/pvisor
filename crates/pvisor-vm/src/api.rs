@@ -713,6 +713,9 @@ pub struct MachineRestore {
     pub ram_file: Arc<File>,
 }
 
+/// Maximum physical-page publication batch: sixteen 4 KiB pages (64 KiB).
+pub const COLD_RAM_MAX_BATCH_PAGES: usize = 16;
+
 /// Immutable block storage supplied by the host's pool/service adapter.
 /// Object references belong to one store session; successful `put` acquires one
 /// reference, and `release` consumes it. `restore` must verify the entire block
@@ -723,6 +726,21 @@ pub struct MachineRestore {
 pub trait ColdRamStore: Send {
     type Object: Send;
     fn put(&mut self, bytes: &[u8]) -> io::Result<Self::Object>;
+    /// Publish 1..=COLD_RAM_MAX_BATCH_PAGES independent, exactly 4096-byte pages.
+    /// Supported adapters validate the entire request before I/O or acquisition;
+    /// invalid shape returns InvalidInput without changing existing references.
+    /// Success returns exactly one ordered entry per input: Some acquires one
+    /// session reference; None certifies healthy admission rejection and acquires
+    /// none. Every Some has the same immutable-content/slot authority as put.
+    /// The caller must release each accepted object, even when another is rejected.
+    /// Unsupported adapters return Unsupported without touching store state.
+    /// Errors after publication starts are terminal: no partial result is usable or retried;
+    /// adapters must release undisclosed acquisitions or retain them until the
+    /// owning process exits. Existing mappings/references remain pinned. Callers
+    /// must terminate the dependent VM/session, never infer zero effects or fall
+    /// back to individual puts after an uncertain exchange. No VM pointers cross
+    /// this boundary and the caller must not hold a VM barrier while publishing.
+    fn put_batch(&mut self, pages: &[&[u8]]) -> io::Result<Vec<Option<Self::Object>>>;
     fn restore(&mut self, object: &Self::Object, output: &mut [u8]) -> io::Result<()>;
     fn release(&mut self, object: Self::Object) -> io::Result<()>;
     fn stats(&mut self) -> io::Result<ColdRamPoolStats>;

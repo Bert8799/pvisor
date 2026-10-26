@@ -189,6 +189,12 @@ impl SealedClient {
 
 impl pvisor_vm::api::ColdRamStore for SealedClient {
     type Object = SealedReference;
+    fn put_batch(&mut self, _: &[&[u8]]) -> io::Result<Vec<Option<Self::Object>>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sealed compression has no physical batch publication",
+        ))
+    }
     fn put(&mut self, bytes: &[u8]) -> io::Result<Self::Object> {
         self.put(bytes)
     }

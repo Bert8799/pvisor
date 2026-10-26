@@ -206,6 +206,9 @@ pub(super) fn start_if_requested(
 
 impl pvisor_vm::api::ColdRamStore for PoolClient {
     type Object = RemoteObject;
+    fn put_batch(&mut self, pages: &[&[u8]]) -> io::Result<Vec<Option<Self::Object>>> {
+        PoolClient::put_duplicate_batch(self, pages)
+    }
     fn shared_mapping(&self, object: &Self::Object) -> Option<pvisor_vm::api::SharedRamMapping> {
         PoolClient::shared_mapping(self, object)
     }

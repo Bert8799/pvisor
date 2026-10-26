@@ -418,6 +418,19 @@ Client publication validation, live-RAM revalidation and checksum-verified
 restore remain required. This removes redundant server work without treating
 a matching digest as proof of equal contents.
 
+The default-off physical publication experiment `PVISOR_MEMORY_BATCH_PUT=1`
+uses an explicitly negotiated batch operation, with at most sixteen independent
+4 KiB pages with up to 64 KiB of page data per request. The server reads the bounded body before replying;
+each accepted page gets its own session token, and rejected pages acquire no
+reference. Reference and payload budgets remain unchanged. Client validation
+checks ordered result count, fresh tokens, full digest/length, aligned in-range
+offsets and every file byte. One absolute deadline includes negotiation and all
+body/reply I/O. Malformed/partial replies close the session without partial
+results or automatic replay; server references remain pinned until process exit.
+Old peers without this capability fail the opt-in path explicitly. Default
+single-page publication remains available. Local/sealed compression adapters
+return Unsupported for the VM API's batch operation without changing references.
+
 Pool sessions also maintain bounded per-object local reference counts as PUT and
 RELEASE complete. STATS reads these counts through weak object observers, without
 rebuilding an index of every token. Local aliases are not counted as cross-session

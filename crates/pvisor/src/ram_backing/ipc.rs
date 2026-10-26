@@ -30,6 +30,9 @@ const MAPPING: u8 = 6;
 const PUT_DUPLICATE: u8 = 7;
 const SEALED: u8 = 8;
 const PUT_SEALED: u8 = 9;
+const BATCH_CAPABILITY: u8 = 10;
+const PUT_DUPLICATE_BATCH: u8 = 11;
+const BATCH_PAGES: usize = pvisor_vm::api::COLD_RAM_MAX_BATCH_PAGES;
 
 /// A connection-owned reference, not an object ID that grants global access.
 pub struct RemoteObject {
@@ -47,6 +50,47 @@ impl RemoteObject {
     pub fn length(&self) -> usize {
         self.length
     }
+}
+fn read_object(
+    stream: &mut impl Read,
+    bytes: &[u8],
+    expected: ImageId,
+    session: &Arc<[u8; 16]>,
+    file: Option<&Arc<std::fs::File>>,
+    last_token: &mut u64,
+) -> io::Result<RemoteObject> {
+    let token = read_u64(stream)?;
+    let mut id = [0; 32];
+    stream.read_exact(&mut id)?;
+    let length = read_u32(stream)? as usize;
+    if token <= *last_token || id != expected || length != bytes.len() {
+        return Err(invalid("invalid pool object reply"));
+    }
+    let offset = if let Some(file) = file {
+        let offset = read_u64(stream)?;
+        let file_len = file.metadata()?.len();
+        if !offset.is_multiple_of(4096) || offset.checked_add(4096).is_none_or(|end| end > file_len)
+        {
+            return Err(invalid("invalid shared page offset"));
+        }
+        use std::os::unix::fs::FileExt;
+        let mut actual = [0; 4096];
+        file.read_exact_at(&mut actual, offset)?;
+        if actual != bytes {
+            return Err(invalid("shared page publication content mismatch"));
+        }
+        std::num::NonZeroU64::new(offset + 1)
+    } else {
+        None
+    };
+    *last_token = token;
+    Ok(RemoteObject {
+        session: session.clone(),
+        token,
+        id,
+        length,
+        offset,
+    })
 }
 #[derive(Debug, Clone, Copy)]
 pub struct PoolStats {
@@ -320,6 +364,8 @@ fn serve_inner(mut stream: UnixStream, pool: Owner, max_references: usize) -> io
     stream.write_all(&session)?;
     let mut references: BTreeMap<u64, Reference> = BTreeMap::new();
     let mut local_counts: BTreeMap<ImageId, LocalReferenceCount> = BTreeMap::new();
+    let mapping_sent = std::cell::Cell::new(false);
+    let mut batch_ready = false;
     let result = (|| {
         let mut next = 0u64;
         loop {
@@ -331,6 +377,76 @@ fn serve_inner(mut stream: UnixStream, pool: Owner, max_references: usize) -> io
                 Err(error) => return Err(error),
             }
             match operation[0] {
+                BATCH_CAPABILITY => {
+                    if pool.is_shared() && mapping_sent.get() {
+                        batch_ready = true;
+                        stream.write_all(&[0])?;
+                    } else {
+                        reject(&mut stream, "batch publication requires physical mapping")?;
+                    }
+                }
+                PUT_DUPLICATE_BATCH => {
+                    let count = read_u32(&mut stream)? as usize;
+                    if count == 0 || count > BATCH_PAGES {
+                        return Err(invalid("invalid shared batch count"));
+                    }
+                    // Consume the bounded body before producing a reply. This
+                    // avoids write-all/read-all pipelining deadlocks on small
+                    // socket buffers and creates no references on short input.
+                    let mut bytes = vec![0; count * 4096];
+                    stream.read_exact(&mut bytes)?;
+                    if !batch_ready {
+                        reject(&mut stream, "physical batch capability not negotiated")?;
+                        continue;
+                    }
+                    let mut reply = Vec::with_capacity(5 + count * 53);
+                    reply.push(0);
+                    reply.extend_from_slice(&(count as u32).to_le_bytes());
+                    for page in bytes.as_chunks::<4096>().0 {
+                        if references.len() >= max_references || next == u64::MAX {
+                            reply.push(1);
+                            continue;
+                        }
+                        let object = match pool.intern(page, true, session) {
+                            Ok(object) => object,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
+                                ) =>
+                            {
+                                reply.push(1);
+                                continue;
+                            }
+                            // An internal error is not a healthy page rejection.
+                            // Acquired references are retained by session cleanup.
+                            Err(error) => return Err(error),
+                        };
+                        next += 1;
+                        let id = object.id();
+                        reply.push(0);
+                        reply.extend_from_slice(&next.to_le_bytes());
+                        reply.extend_from_slice(&id);
+                        reply.extend_from_slice(&4096u32.to_le_bytes());
+                        reply.extend_from_slice(
+                            &object
+                                .offset()
+                                .ok_or_else(|| invalid("batch object lacks shared offset"))?
+                                .to_le_bytes(),
+                        );
+                        local_counts
+                            .entry(id)
+                            .and_modify(|entry| entry.count += 1)
+                            .or_insert_with(|| LocalReferenceCount {
+                                count: 1,
+                                object: object.observe(),
+                            });
+                        references.insert(next, object);
+                    }
+                    // All accepted references belong to the session before any
+                    // response is sent, including on a partial response failure.
+                    stream.write_all(&reply)?;
+                }
                 PUT | PUT_SHARED | PUT_DUPLICATE | PUT_SEALED => {
                     let size = read_u32(&mut stream)? as usize;
                     if size == 0 || size > BLOCK_BYTES {
@@ -398,6 +514,7 @@ fn serve_inner(mut stream: UnixStream, pool: Owner, max_references: usize) -> io
                             .readonly_file();
                         stream.write_all(&[0])?;
                         send_mapping_fd(&stream, file.as_raw_fd())?;
+                        mapping_sent.set(true);
                         continue;
                     }
                     reject(&mut stream, "physical sharing unsupported by this pool")?;
@@ -508,6 +625,8 @@ pub struct PoolClient {
     session: Arc<[u8; 16]>,
     timeout: Duration,
     shared_file: Option<Arc<std::fs::File>>,
+    batch_ready: bool,
+    last_token: u64,
 }
 // One absolute deadline covers partial writes and trickling replies. Nonblocking
 // I/O plus poll avoids relying on per-syscall Unix socket timeout semantics.
@@ -651,6 +770,8 @@ impl PoolClient {
             session: Arc::new(session),
             timeout,
             shared_file: None,
+            batch_ready: false,
+            last_token: 0,
         })
     }
     fn exchange<T>(
@@ -680,6 +801,85 @@ impl PoolClient {
     pub fn put_duplicate(&mut self, bytes: &[u8]) -> io::Result<RemoteObject> {
         self.put_inner(bytes, self.shared_file.is_some())
     }
+    /// Publish at most sixteen independent 4 KiB physical duplicate candidates.
+    /// The complete input is validated before I/O. Each ordered Some owns one
+    /// reference; None is a healthy page rejection. The negotiated mapping must
+    /// already exist. One absolute deadline covers capability negotiation, body
+    /// and every reply. Transport/validation errors poison this session; any
+    /// undisclosed server references remain pinned until this process exits.
+    /// There is no replay or automatic single-page fallback after failure.
+    pub fn put_duplicate_batch(
+        &mut self,
+        pages: &[&[u8]],
+    ) -> io::Result<Vec<Option<RemoteObject>>> {
+        if pages.is_empty()
+            || pages.len() > BATCH_PAGES
+            || pages.iter().any(|page| page.len() != 4096)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared batch requires 1..=16 independent 4 KiB pages",
+            ));
+        }
+        let file = self.shared_file.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "batch publication requires a negotiated physical mapping",
+            )
+        })?;
+        let expected: Vec<_> = pages.iter().map(|page| identity(page)).collect();
+        let session = self.session.clone();
+        let mut last_token = self.last_token;
+        let mut ready = self.batch_ready;
+        let result = self.exchange(|stream| {
+            if !ready {
+                stream.write_all(&[BATCH_CAPABILITY])?;
+                if let Some(error) = status(stream)? {
+                    return Ok(Err(io::Error::new(io::ErrorKind::Unsupported, error)));
+                }
+                ready = true;
+            }
+            let mut frame = Vec::with_capacity(5 + pages.len() * 4096);
+            frame.push(PUT_DUPLICATE_BATCH);
+            frame.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+            for page in pages {
+                frame.extend_from_slice(page);
+            }
+            stream.write_all(&frame)?;
+            if let Some(error) = status(stream)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("negotiated shared batch rejected: {error}"),
+                ));
+            }
+            if read_u32(stream)? as usize != pages.len() {
+                return Err(invalid("shared batch reply count mismatch"));
+            }
+            let mut objects = Vec::with_capacity(pages.len());
+            for (page, expected) in pages.iter().zip(expected) {
+                let mut accepted = [0];
+                stream.read_exact(&mut accepted)?;
+                objects.push(match accepted[0] {
+                    0 => Some(read_object(
+                        stream,
+                        page,
+                        expected,
+                        &session,
+                        Some(&file),
+                        &mut last_token,
+                    )?),
+                    1 => None,
+                    _ => return Err(invalid("invalid shared batch item status")),
+                });
+            }
+            Ok(Ok(objects))
+        });
+        self.batch_ready = ready;
+        if result.is_ok() {
+            self.last_token = last_token;
+        }
+        result
+    }
     fn put_inner(&mut self, bytes: &[u8], duplicate: bool) -> io::Result<RemoteObject> {
         if bytes.is_empty() || bytes.len() > BLOCK_BYTES {
             return Err(invalid("invalid pool input length"));
@@ -687,10 +887,11 @@ impl PoolClient {
         let session = self.session.clone();
         let expected = identity(bytes);
         let shared_file = self.shared_file.clone();
+        let mut last_token = self.last_token;
         if shared_file.is_some() && bytes.len() != 4096 {
             return Err(invalid("shared pool requires 4 KiB pages"));
         }
-        self.exchange(|stream| {
+        let result = self.exchange(|stream| {
             let operation = if duplicate {
                 PUT_DUPLICATE
             } else if shared_file.is_some() {
@@ -707,39 +908,19 @@ impl PoolClient {
                 // The complete rejection frame proves the connection is healthy.
                 return Ok(Err(io::Error::new(io::ErrorKind::WouldBlock, error)));
             }
-            let token = read_u64(stream)?;
-            let mut id = [0; 32];
-            stream.read_exact(&mut id)?;
-            let length = read_u32(stream)? as usize;
-            if token == 0 || id != expected || length != bytes.len() {
-                return Err(invalid("invalid pool object reply"));
-            }
-            let offset = if let Some(file) = &shared_file {
-                let offset = read_u64(stream)?;
-                let file_len = file.metadata()?.len();
-                if !offset.is_multiple_of(4096)
-                    || offset.checked_add(4096).is_none_or(|end| end > file_len)
-                {
-                    return Err(invalid("invalid shared page offset"));
-                }
-                use std::os::unix::fs::FileExt;
-                let mut actual = [0; 4096];
-                file.read_exact_at(&mut actual, offset)?;
-                if actual != bytes {
-                    return Err(invalid("shared page publication content mismatch"));
-                }
-                std::num::NonZeroU64::new(offset + 1)
-            } else {
-                None
-            };
-            Ok(Ok(RemoteObject {
-                session,
-                token,
-                id,
-                length,
-                offset,
-            }))
-        })
+            Ok(Ok(read_object(
+                stream,
+                bytes,
+                expected,
+                &session,
+                shared_file.as_ref(),
+                &mut last_token,
+            )?))
+        });
+        if result.is_ok() {
+            self.last_token = last_token;
+        }
+        result
     }
     #[cfg(target_os = "linux")]
     pub fn enable_shared_mapping(&mut self) -> io::Result<()> {
@@ -841,6 +1022,306 @@ impl PoolClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    fn mock_mapping_client(
+        file: Arc<std::fs::File>,
+        body: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (PoolClient, std::thread::JoinHandle<()>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let thread = std::thread::spawn(move || {
+            server.write_all(MAGIC).unwrap();
+            server.write_all(&[9; 16]).unwrap();
+            let mut operation = [0];
+            server.read_exact(&mut operation).unwrap();
+            assert_eq!(operation, [MAPPING]);
+            server.write_all(&[0]).unwrap();
+            send_mapping_fd(&server, file.as_raw_fd()).unwrap();
+            body(server);
+        });
+        let mut client = PoolClient::new(client, Duration::from_secs(3)).unwrap();
+        client.enable_shared_mapping().unwrap();
+        (client, thread)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_batch_request(server: &mut UnixStream, negotiate: bool) -> Vec<u8> {
+        let mut operation = [0];
+        server.read_exact(&mut operation).unwrap();
+        if negotiate {
+            assert_eq!(operation, [BATCH_CAPABILITY]);
+            server.write_all(&[0]).unwrap();
+            server.read_exact(&mut operation).unwrap();
+        }
+        assert_eq!(operation, [PUT_DUPLICATE_BATCH]);
+        let count = read_u32(server).unwrap() as usize;
+        assert!(count > 0 && count <= BATCH_PAGES);
+        let mut bytes = vec![0; count * 4096];
+        server.read_exact(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_uses_one_bounded_exchange_and_keeps_healthy_rejections() {
+        let pool = super::super::shared::SharedPool::new(4096, 1).unwrap();
+        let (mut client, thread) = mock_mapping_client(pool.readonly_file(), |mut server| {
+            for round in 0..2 {
+                let bytes = read_batch_request(&mut server, round == 0);
+                assert_eq!(bytes, vec![0x45; BATCH_PAGES * 4096]);
+                let mut reply = vec![0];
+                reply.extend_from_slice(&(BATCH_PAGES as u32).to_le_bytes());
+                reply.extend(std::iter::repeat_n(1, BATCH_PAGES));
+                server.write_all(&reply).unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let result = client
+                .put_duplicate_batch(&[&[0x45; 4096][..]; BATCH_PAGES])
+                .unwrap();
+            assert_eq!(result.len(), BATCH_PAGES);
+            assert!(result.iter().all(Option::is_none));
+        }
+        drop(client);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_requires_peer_support_without_replaying_single_page_puts() {
+        for legacy_disconnect in [false, true] {
+            let pool = super::super::shared::SharedPool::new(4096, 1).unwrap();
+            let (mut client, thread) =
+                mock_mapping_client(pool.readonly_file(), move |mut server| {
+                    let mut op = [0];
+                    server.read_exact(&mut op).unwrap();
+                    assert_eq!(op, [BATCH_CAPABILITY]);
+                    if legacy_disconnect {
+                        return;
+                    }
+                    reject(&mut server, "batch unavailable").unwrap();
+                    server.read_exact(&mut op).unwrap();
+                    assert_eq!(
+                        op,
+                        [STATS],
+                        "unsupported batch must not replay as individual PUTs"
+                    );
+                    server.write_all(&[0; 33]).unwrap();
+                });
+            let error = client.put_duplicate_batch(&[&[0; 4096]]).err().unwrap();
+            if legacy_disconnect {
+                assert!(client.stats().is_err());
+            } else {
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                assert_eq!(client.stats().unwrap().session_references, 0);
+            }
+            drop(client);
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_server_rejects_invalid_or_short_bodies_before_acquiring_references() {
+        for count in [0, BATCH_PAGES as u32 + 1, 2] {
+            let pool = Arc::new(Mutex::new(
+                super::super::shared::SharedPool::new(4096, 1).unwrap(),
+            ));
+            let owner = pool.clone();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let thread = std::thread::spawn(move || serve_shared(server, owner, 8));
+            client.read_exact(&mut [0; 24]).unwrap();
+            client.write_all(&[PUT_DUPLICATE_BATCH]).unwrap();
+            client.write_all(&count.to_le_bytes()).unwrap();
+            if count == 2 {
+                client.write_all(&[0; 4096]).unwrap();
+            }
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(thread.join().unwrap().is_err());
+            assert_eq!(pool.lock().unwrap().object_count(), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_validates_input_without_touching_the_wire() {
+        let pool = super::super::shared::SharedPool::new(4096, 1).unwrap();
+        let (mut client, thread) = mock_mapping_client(pool.readonly_file(), |mut server| {
+            assert_eq!(read_batch_request(&mut server, true).len(), 4096);
+            server.write_all(&[0, 1, 0, 0, 0, 1]).unwrap();
+        });
+        for pages in [
+            vec![],
+            vec![&[0; 4096][..]; BATCH_PAGES + 1],
+            vec![&[0; 4095][..]],
+        ] {
+            assert_eq!(
+                client.put_duplicate_batch(&pages).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(client.put_duplicate_batch(&[&[0; 4096]]).unwrap()[0].is_none());
+        drop(client);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_damaged_or_partial_reply_is_terminal_without_partial_results() {
+        for failure in [
+            "count", "status", "token", "hash", "length", "offset", "content", "partial",
+        ] {
+            let mut pool = super::super::shared::SharedPool::new(8192, 2).unwrap();
+            let data = [0x64; 4096];
+            let object = pool
+                .intern(if failure == "content" {
+                    &[0x65; 4096]
+                } else {
+                    &data
+                })
+                .unwrap();
+            let offset = object.offset();
+            let (mut client, thread) =
+                mock_mapping_client(pool.readonly_file(), move |mut server| {
+                    assert_eq!(read_batch_request(&mut server, true).len(), 8192);
+                    let mut reply = vec![0];
+                    reply.extend_from_slice(
+                        &(if failure == "count" { 3u32 } else { 2 }).to_le_bytes(),
+                    );
+                    for index in 0..2 {
+                        if failure == "partial" && index == 1 {
+                            break;
+                        }
+                        reply.push(if failure == "status" { 2 } else { 0 });
+                        reply.extend_from_slice(
+                            &(if failure == "token" { 1u64 } else { index + 1 }).to_le_bytes(),
+                        );
+                        let mut id = identity(&data);
+                        if failure == "hash" {
+                            id[0] ^= 1;
+                        }
+                        reply.extend_from_slice(&id);
+                        reply.extend_from_slice(
+                            &(if failure == "length" { 4095u32 } else { 4096 }).to_le_bytes(),
+                        );
+                        reply.extend_from_slice(
+                            &(if failure == "offset" {
+                                offset + 1
+                            } else {
+                                offset
+                            })
+                            .to_le_bytes(),
+                        );
+                    }
+                    server.write_all(&reply).unwrap();
+                    if failure == "partial" {
+                        return;
+                    }
+                    let mut byte = [0];
+                    match server.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                        other => panic!("failed client must close, not replay: {other:?}"),
+                    }
+                });
+            assert!(
+                client.put_duplicate_batch(&[&data, &data]).is_err(),
+                "{failure}"
+            );
+            assert!(client.stats().is_err(), "{failure}: failed session reused");
+            drop(client);
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_deadline_covers_negotiation_and_body_together() {
+        let pool = super::super::shared::SharedPool::new(4096, 1).unwrap();
+        let (mut client, thread) = mock_mapping_client(pool.readonly_file(), |mut server| {
+            let mut op = [0];
+            server.read_exact(&mut op).unwrap();
+            assert_eq!(op, [BATCH_CAPABILITY]);
+            std::thread::sleep(Duration::from_millis(70));
+            if server.write_all(&[0]).is_err() {
+                return;
+            }
+            if server.read_exact(&mut op).is_err() {
+                return;
+            }
+            assert_eq!(op, [PUT_DUPLICATE_BATCH]);
+            assert_eq!(read_u32(&mut server).unwrap(), 1);
+            server.read_exact(&mut [0; 4096]).unwrap();
+            std::thread::sleep(Duration::from_millis(70));
+            let _ = server.write_all(&[0, 1, 0, 0, 0, 1]);
+        });
+        client.timeout = Duration::from_millis(100);
+        assert_eq!(
+            client
+                .put_duplicate_batch(&[&[0; 4096]])
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(client.stats().is_err());
+        drop(client);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_small_socket_buffers_and_reference_budget_preserve_session() {
+        let pool = Arc::new(Mutex::new(
+            super::super::shared::SharedPool::new(16 * 4096, 16).unwrap(),
+        ));
+        let (a, b) = UnixStream::pair().unwrap();
+        for socket in [&a, &b] {
+            let bytes = 4096i32;
+            for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            socket.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            option,
+                            (&bytes as *const i32).cast(),
+                            std::mem::size_of_val(&bytes) as _,
+                        )
+                    },
+                    0
+                );
+            }
+        }
+        let owner = pool.clone();
+        let thread = std::thread::spawn(move || serve_shared(b, owner, 32));
+        let mut client = PoolClient::new(a, Duration::from_secs(3)).unwrap();
+        client.enable_shared_mapping().unwrap();
+        let pages: Vec<_> = (0..16u8).map(|byte| vec![byte; 4096]).collect();
+        let mut originals = Vec::new();
+        for page in &pages {
+            originals.push(client.put(page).unwrap());
+        }
+        let pages: Vec<_> = pages.iter().map(Vec::as_slice).collect();
+        let published = client.put_duplicate_batch(&pages).unwrap();
+        assert!(published.iter().all(Option::is_some));
+        assert!(
+            client
+                .put_duplicate_batch(&pages)
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(client.stats().unwrap().session_references, 32);
+        for object in originals.into_iter().chain(published.into_iter().flatten()) {
+            client.release(object).unwrap();
+        }
+        assert_eq!(client.stats().unwrap().objects, 0);
+        drop(client);
+        thread.join().unwrap().unwrap();
+    }
     #[test]
     fn cached_session_counts_distinguish_local_aliases_from_other_connections() {
         let pool = Arc::new(Mutex::new(CompressedPool::new(65536, 4)));
@@ -945,6 +1426,21 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn disconnected_mapping_is_pinned_until_peer_process_exits() {
+        disconnected_mapping_case(
+            false,
+            "disconnected_mapping_is_pinned_until_peer_process_exits",
+        );
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_batch_disconnected_references_are_pinned_until_peer_process_exits() {
+        disconnected_mapping_case(
+            true,
+            "shared_batch_disconnected_references_are_pinned_until_peer_process_exits",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    fn disconnected_mapping_case(batch: bool, test_name: &str) {
         use std::io::BufRead;
         const CHILD: &str = "PVISOR_SHARED_LIFETIME_CHILD";
         if let Some(socket) = std::env::var_os(CHILD) {
@@ -952,7 +1448,20 @@ mod tests {
                 PoolClient::new(UnixStream::connect(socket).unwrap(), Duration::from_secs(5))
                     .unwrap();
             client.enable_shared_mapping().unwrap();
-            let object = client.put(&[7; 4096]).unwrap();
+            let seed = client.put(&[7; 4096]).unwrap();
+            let object = if batch {
+                let mut published = client
+                    .put_duplicate_batch(&[&[7; 4096], &[7; 4096]])
+                    .unwrap();
+                client.release(seed).unwrap();
+                // Dropping a local handle is not a RELEASE or proof that no
+                // mapping escaped. Both batch references must stay budgeted.
+                let object = published[0].take().unwrap();
+                drop(published);
+                object
+            } else {
+                seed
+            };
             let mapping = client.shared_mapping(&object).unwrap();
             let ptr = unsafe {
                 libc::mmap(
@@ -997,8 +1506,7 @@ mod tests {
                 worker.join().unwrap().unwrap();
             }
         });
-        let name = module_path!().split_once("::").unwrap().1.to_owned()
-            + "::disconnected_mapping_is_pinned_until_peer_process_exits";
+        let name = module_path!().split_once("::").unwrap().1.to_owned() + "::" + test_name;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &name, "--nocapture"])
             .env(CHILD, &socket)
@@ -1020,6 +1528,14 @@ mod tests {
         )
         .unwrap();
         observer.enable_shared_mapping().unwrap();
+        if batch {
+            let probe = pool.lock().unwrap().intern(&[7; 4096]).unwrap();
+            assert_eq!(
+                Arc::strong_count(&probe),
+                4,
+                "canonical plus both batch references plus probe"
+            );
+        }
         assert_eq!(observer.stats().unwrap().objects, 1);
         assert!(observer.put(&[9; 4096]).is_err());
         child.stdin.take().unwrap().write_all(&[1]).unwrap();
