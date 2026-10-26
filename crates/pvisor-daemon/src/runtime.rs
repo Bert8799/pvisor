@@ -18,8 +18,9 @@
 //! unsupported option; native OverlayNet supplies the VM's outbound network.
 //!
 //! A required delegated cgroup v2 caps the entire supervisor/VM process tree.
-//! Pause/resume uses RunHandle's acknowledged vCPU controls, not cgroup freeze,
-//! checkpoint/restore, or rebuilding a VM. Loss of IPC never means Missing.
+//! Pause uses the identity's acknowledged vCPU or live-RAM offload policy; resume
+//! continues the same Attempt, without cgroup freeze or rebuilding a VM. Loss of
+//! IPC never means Missing.
 //! Crash cleanup uses an inode-bound cgroup.kill, never a persisted PID. Durable
 //! deletion intent and the supervisor's exclusive lock fence late child launch.
 //! A pre-exec callback enters the bound cgroup before supervisor/Tokio allocations.
@@ -29,6 +30,8 @@
 //! service probes or full cgroup-limit reconciliation. Create, Inspect and resume
 //! retain those checks; connection failures belong to the API adapter. Native
 //! observation.json caches are neither written nor used as liveness proof.
+
+mod memory_observation;
 
 use std::{
     collections::BTreeMap,
@@ -193,6 +196,36 @@ impl fmt::Display for CreateError {
 }
 impl std::error::Error for CreateError {}
 
+/// Memory action used for explicit sandbox pause. Selected by the node operator
+/// for new sandboxes and persisted with their native identity across restarts.
+/// Neither policy changes admission reservations or the sandbox's hard limits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum PauseMemoryPolicy {
+    /// Park vCPUs while retaining resident RAM. Also the legacy identity default.
+    #[default]
+    Vcpu,
+    /// Park vCPUs and reclaim the existing live file-backed RAM through
+    /// RunOffload. Shared-pool and snapshot-COW RAM are unsupported; native
+    /// executor capability checks reject unsupported backing without fallback.
+    Offload,
+}
+
+impl PauseMemoryPolicy {
+    fn command(self, shared_pool: bool) -> Result<pvisor_core::OperationKind> {
+        match self {
+            Self::Vcpu => Ok(pvisor_core::OperationKind::RunPause),
+            Self::Offload => {
+                ensure!(
+                    !shared_pool,
+                    "offload pause does not support shared-pool RAM"
+                );
+                Ok(pvisor_core::OperationKind::RunOffload { file: None })
+            }
+        }
+    }
+}
+
 /// All paths must be absolute and persist unchanged across daemon restarts.
 #[derive(Clone)]
 pub struct NativeRuntimeConfig {
@@ -243,6 +276,8 @@ struct Identity {
     boot_id: String,
     #[serde(default)]
     memory_pool: Option<PathBuf>,
+    #[serde(default)]
+    pause_memory_policy: PauseMemoryPolicy,
 }
 
 /// Durable proof published only with exclusive ownership and an empty native
@@ -345,6 +380,7 @@ fn validate_reply(identity: &Identity, request: &Request, response: Response) ->
 
 pub struct NativeRuntime {
     memory_pool: Option<PathBuf>,
+    pause_memory_policy: PauseMemoryPolicy,
     config: NativeRuntimeConfig,
     operations: SandboxLocks,
 }
@@ -389,6 +425,7 @@ impl NativeRuntime {
         }
         Ok(Self {
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
             config,
             operations: SandboxLocks::default(),
         })
@@ -397,6 +434,15 @@ impl NativeRuntime {
     pub fn with_memory_pool(mut self, socket: Option<PathBuf>) -> Self {
         self.memory_pool = socket;
         self
+    }
+
+    /// Select the pause action for subsequently created sandboxes. Existing
+    /// identities retain their persisted policy. Shared pools reject Offload;
+    /// errors consume this builder and leave live sandboxes untouched.
+    pub fn with_pause_memory_policy(mut self, policy: PauseMemoryPolicy) -> Result<Self> {
+        policy.command(self.memory_pool.is_some())?;
+        self.pause_memory_policy = policy;
+        Ok(self)
     }
 
     fn directory(&self, id: &str) -> Result<PathBuf> {
@@ -661,6 +707,8 @@ impl Runtime for NativeRuntime {
     }
 
     async fn preflight(&self) -> Result<()> {
+        self.pause_memory_policy
+            .command(self.memory_pool.is_some())?;
         ensure!(
             cfg!(all(target_os = "linux", target_arch = "x86_64")),
             "unsupported native VM platform"
@@ -707,6 +755,8 @@ impl Runtime for NativeRuntime {
 
     async fn create(&self, spec: &RuntimeSpec) -> Result<()> {
         validate_spec(spec)?;
+        self.pause_memory_policy
+            .command(self.memory_pool.is_some())?;
         let _lease = self.operations.lock(&spec.id).await?;
         let directory = self.directory(&spec.id)?;
         ensure!(
@@ -743,6 +793,7 @@ impl Runtime for NativeRuntime {
                 cgroup_inode: 0,
                 boot_id: current_boot_id()?,
                 memory_pool: self.memory_pool.clone(),
+                pause_memory_policy: self.pause_memory_policy,
             };
             make_run_spec(&identity)?;
             publish_new(&directory.join("preparing.json"), &identity)?;
@@ -1137,16 +1188,27 @@ async fn execute_control(
     ensure_not_deleting(directory)?;
     let command = match operation {
         Operation::Pause => HostAttemptCommand::Operation {
-            kind: pvisor_core::OperationKind::RunPause,
+            kind: identity
+                .pause_memory_policy
+                .command(identity.memory_pool.is_some())?,
         },
         Operation::Resume => HostAttemptCommand::Operation {
             kind: pvisor_core::OperationKind::RunResume,
         },
         _ => HostAttemptCommand::Status,
     };
+    let observation = matches!(operation, Operation::Pause | Operation::Resume)
+        .then(|| {
+            memory_observation::Observation::begin(
+                identity,
+                directory,
+                operation == Operation::Pause,
+            )
+        })
+        .transpose()?;
     let result = timeout(CONTROL_TIMEOUT, service.dispatch(command)).await??;
     let state = native_status(result.status)?;
-    observe_control(
+    let observed = observe_control(
         directory,
         client,
         endpoints,
@@ -1158,7 +1220,11 @@ async fn execute_control(
                 .verify_limits(&identity.spec)
         },
     )
-    .await
+    .await?;
+    if let Some(observation) = observation {
+        observation.finish(directory, observed.0)?;
+    }
+    Ok(observed)
 }
 
 // The supervisor authenticates each request before this path. Endpoint resolves
@@ -2135,6 +2201,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pause_policy_preserves_legacy_identities_and_is_frozen_per_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut identity, directory) = identity_fixture(temp.path());
+        let mut legacy = serde_json::to_value(&identity).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("pause_memory_policy");
+        publish_new(&directory.join("preparing.json"), &legacy).unwrap();
+        let runtime = runtime_fixture(&identity, &directory);
+        assert_eq!(
+            runtime.identity(ID).unwrap().unwrap().pause_memory_policy,
+            PauseMemoryPolicy::Vcpu
+        );
+
+        identity.pause_memory_policy = PauseMemoryPolicy::Offload;
+        publish_new(&directory.join("identity.json"), &identity).unwrap();
+        // A daemon restarted with its default policy must not rewrite identities.
+        assert_eq!(runtime.pause_memory_policy, PauseMemoryPolicy::Vcpu);
+        let recovered = runtime.identity(ID).unwrap().unwrap();
+        assert_eq!(recovered.pause_memory_policy, PauseMemoryPolicy::Offload);
+        assert!(matches!(
+            recovered.pause_memory_policy.command(false).unwrap(),
+            pvisor_core::OperationKind::RunOffload { file: None }
+        ));
+    }
+
+    #[test]
+    fn offload_policy_rejects_shared_ram_without_silent_vcpu_fallback() {
+        assert!(PauseMemoryPolicy::Offload.command(true).is_err());
+        assert!(matches!(
+            PauseMemoryPolicy::Vcpu.command(true).unwrap(),
+            pvisor_core::OperationKind::RunPause
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let (identity, directory) = identity_fixture(temp.path());
+        let runtime = runtime_fixture(&identity, &directory);
+        let runtime = runtime.with_memory_pool(Some(temp.path().join("pool.sock")));
+        assert!(
+            runtime
+                .with_pause_memory_policy(PauseMemoryPolicy::Offload)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_pool_after_policy_still_rejects_before_native_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let (identity, directory) = identity_fixture(temp.path());
+        let runtime = runtime_fixture(&identity, &directory)
+            .with_pause_memory_policy(PauseMemoryPolicy::Offload)
+            .unwrap()
+            .with_memory_pool(Some(temp.path().join("pool.sock")));
+        for error in [
+            runtime.preflight().await.unwrap_err(),
+            runtime.create(&spec()).await.unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not support shared-pool RAM")
+            );
+        }
+        assert!(!directory.join("preparing.json").exists());
+        assert!(!directory.join("started").exists());
+    }
+
     #[tokio::test]
     async fn supervisor_builder_disables_auto_endpoint_and_rejects_custom_socket() {
         let temp = tempfile::tempdir().unwrap();
@@ -2185,21 +2319,29 @@ mod tests {
         assert_eq!(native_status(status.status).unwrap(), RuntimeState::Running);
         assert_eq!(native_state(&service).unwrap(), RuntimeState::Running);
 
-        let (identity, _) = identity_fixture(temp.path());
-        let error = execute_control(
-            &service,
-            &identity,
-            temp.path(),
-            &health_client(None).unwrap(),
-            &BTreeMap::new(),
-            Operation::Pause,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<AgentCtlHostError>().unwrap().code,
-            AgentCtlHostErrorCode::Unavailable
-        );
+        let (mut identity, _) = identity_fixture(temp.path());
+        for policy in [PauseMemoryPolicy::Vcpu, PauseMemoryPolicy::Offload] {
+            identity.pause_memory_policy = policy;
+            let error = execute_control(
+                &service,
+                &identity,
+                temp.path(),
+                &health_client(None).unwrap(),
+                &BTreeMap::new(),
+                Operation::Pause,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<AgentCtlHostError>().unwrap().code,
+                AgentCtlHostErrorCode::Unavailable
+            );
+            let report: serde_json::Value =
+                read_json(&temp.path().join("memory-transition.json")).unwrap();
+            assert_eq!(report["completed"], false);
+            assert_eq!(report["measurement_valid"], false);
+            assert_eq!(report["admission_credit_bytes"], 0);
+        }
         // The same adapter must still fence admission after durable delete intent.
         mark(temp.path(), "deleting").unwrap();
         assert!(
@@ -2237,7 +2379,7 @@ mod tests {
             e2b: None,
         }
     }
-    fn identity_fixture(temp: &Path) -> (Identity, PathBuf) {
+    pub(super) fn identity_fixture(temp: &Path) -> (Identity, PathBuf) {
         let temp = temp.canonicalize().unwrap();
         let state = temp.join("state");
         private_directory(&state).unwrap();
@@ -2267,12 +2409,14 @@ mod tests {
             cgroup_inode: 1,
             boot_id: "32345678-1234-4234-8234-123456789abc".into(),
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
         };
         (identity, directory)
     }
     fn runtime_fixture(identity: &Identity, directory: &Path) -> NativeRuntime {
         NativeRuntime {
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
             config: NativeRuntimeConfig {
                 state_dir: directory.parent().unwrap().to_owned(),
                 owner: identity.owner.clone(),
@@ -2872,6 +3016,7 @@ mod tests {
         };
         let runtime = NativeRuntime {
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
             config: config.clone(),
             operations: SandboxLocks::default(),
         };
@@ -2879,6 +3024,7 @@ mod tests {
         assert_eq!(runtime.inspect(ID).await.unwrap(), RuntimeState::Missing);
         let recovered = NativeRuntime {
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
             config,
             operations: SandboxLocks::default(),
         };
@@ -2899,6 +3045,7 @@ mod tests {
         publish_new(&directory.join("preparing.json"), &identity).unwrap();
         let runtime = NativeRuntime {
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
             config: NativeRuntimeConfig {
                 state_dir: directory.parent().unwrap().to_owned(),
                 owner: identity.owner.clone(),
@@ -2933,6 +3080,7 @@ mod tests {
         .unwrap();
         let runtime = NativeRuntime {
             memory_pool: None,
+            pause_memory_policy: PauseMemoryPolicy::default(),
             config: NativeRuntimeConfig {
                 state_dir: directory.parent().unwrap().to_owned(),
                 owner: identity.owner.clone(),

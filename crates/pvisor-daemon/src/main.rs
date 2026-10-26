@@ -2,7 +2,7 @@ mod cache_component;
 use clap::{Parser, Subcommand};
 use pvisor_daemon::{
     daemon::{self, Config, Daemon},
-    runtime::{NativeRuntime, NativeRuntimeConfig, run_native_supervisor},
+    runtime::{NativeRuntime, NativeRuntimeConfig, PauseMemoryPolicy, run_native_supervisor},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -72,6 +72,9 @@ enum Command {
         /// Physical page sharing or sealed compression plus content deduplication.
         #[arg(long, value_enum, requires = "memory_pool")]
         memory_pool_mode: Option<pvisor_daemon::memory_pool::PoolMode>,
+        /// Pause vCPUs only (default), or offload live file-backed RAM. New sandboxes only.
+        #[arg(long, value_enum, requires = "sandbox")]
+        pause_memory_policy: Option<PauseMemoryPolicy>,
     },
     /// Print the fixed protocol baseline, not a claim of full API support.
     Protocol,
@@ -146,10 +149,16 @@ async fn run(command: Command) -> anyhow::Result<()> {
             max_timeout_seconds,
             memory_pool,
             memory_pool_mode,
+            pause_memory_policy,
         } => {
             anyhow::ensure!(
                 cache || sandbox,
                 "select at least one service: --cache or --sandbox"
+            );
+            let pause_memory_policy = pause_memory_policy.unwrap_or_default();
+            anyhow::ensure!(
+                !(memory_pool && pause_memory_policy == PauseMemoryPolicy::Offload),
+                "offload pause does not support --memory-pool"
             );
             // Prepare sandbox resources before starting optional components.
             let sandbox_service = if sandbox {
@@ -212,7 +221,11 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     } else {
                         None
                     };
-                    Ok(Arc::new(runtime.with_memory_pool(pool))
+                    Ok(Arc::new(
+                        runtime
+                            .with_memory_pool(pool)
+                            .with_pause_memory_policy(pause_memory_policy)?,
+                    )
                         as Arc<dyn pvisor_daemon::runtime::Runtime>)
                 })
                 .await?;
@@ -350,11 +363,43 @@ mod tests {
             vec!["--memory-bytes", "1073741824"],
             vec!["--max-timeout-seconds", "60"],
             vec!["--memory-pool"],
+            vec!["--pause-memory-policy", "offload"],
         ] {
             let mut args = vec!["pvisor-daemon", "serve", "--cache"];
             args.extend(options);
             assert!(Args::try_parse_from(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn pause_memory_policy_is_explicit_and_has_no_implicit_component_selection() {
+        let base = [
+            "pvisor-daemon",
+            "serve",
+            "--sandbox",
+            "--images-dir",
+            "/images",
+            "--cgroup-root",
+            "/groups",
+        ];
+        assert!(matches!(
+            Args::try_parse_from(base).unwrap().command,
+            Command::Serve {
+                pause_memory_policy: None,
+                ..
+            }
+        ));
+        let mut args = base.to_vec();
+        args.extend(["--pause-memory-policy", "offload"]);
+        assert!(matches!(
+            Args::try_parse_from(&args).unwrap().command,
+            Command::Serve {
+                pause_memory_policy: Some(PauseMemoryPolicy::Offload),
+                ..
+            }
+        ));
+        *args.last_mut().unwrap() = "checkpoint";
+        assert!(Args::try_parse_from(&args).is_err());
     }
 
     #[test]

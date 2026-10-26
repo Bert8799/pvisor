@@ -50,14 +50,14 @@ never follow upstream `main` or an image's `latest` tag automatically.
 | `GET /v1/sandboxes` | Repeated state filters, SDK-encoded metadata, page/pageSize |
 | `GET /v1/sandboxes/{id}` | Reconcile local native state; 200 JSON |
 | `DELETE /v1/sandboxes/{id}` | Confirm native deletion before releasing reservation; 204 |
-| `POST /v1/sandboxes/{id}/pause` and `/resume` | Acknowledged live vCPU pause/resume on the same Attempt; 202 empty body |
+| `POST /v1/sandboxes/{id}/pause` and `/resume` | Acknowledged live pause/resume on the same Attempt; optional file-backed RAM offload; 202 empty body |
 | `POST /v1/sandboxes/{id}/renew-expiration` | Future RFC3339 deadline, must extend existing TTL |
 | `GET /v1/sandboxes/{id}/endpoints/{port}` | Actual execd (44772) and egress (18080) publication |
 | Command, file, health and metrics data plane | Stream to the prepared image's real upstream service; not reimplemented |
 | Snapshots, templates/pools, metadata mutation, lifecycle hooks | Unsupported; rejected, not simulated |
 | Network policy, credential proxy, secure access, volumes, image auth | Unsupported creation options are rejected |
 | Arbitrary application ports, signed endpoints, WebSocket, CONNECT | Unsupported |
-| pVisor stage/apply, checkpoint/fork, offload | Not wired into this daemon backend |
+| pVisor stage/apply, checkpoint/fork, standalone offload | Not wired into this daemon backend |
 
 Lifecycle authentication is `OPEN-SANDBOX-API-KEY`. Successful and failed API
 responses receive `X-Request-ID`. Errors use `{code, message}`. Supported create
@@ -154,6 +154,58 @@ Loopback publications may be reachable by other local users: use real service
 authentication and host controls. Workload secrets stay out of supervisor argv
 and host environment, but persist in private records accessible to trusted owners.
 No security audit or hostile multi-user assurance is claimed.
+
+## Pause memory policy (experimental)
+
+The default pause policy, `vcpu`, parks vCPUs and retains resident RAM. To select
+live file-backed RAM reclamation for newly created sandboxes:
+
+```sh
+pvisor-daemon serve --sandbox --images-dir /srv/pvi \
+  --cgroup-root /sys/fs/cgroup/pvd --pause-memory-policy offload
+```
+
+The operator-selected `PauseMemoryPolicy` is persisted in each native identity.
+Existing identities without this field retain `vcpu`; changing the serve option
+only affects subsequently created sandboxes, including after daemon restart.
+`offload` dispatches `RunOffload { file: None }` against the existing live backing;
+resume dispatches `RunResume` on the same Attempt and repeats native enforcement
+and service-readiness checks. Offload is not checkpoint publication or VM rebuild.
+It can perform backing-file I/O and make resumed accesses fault pages back in.
+
+Shared-pool RAM is explicitly incompatible with offload pause, including when
+configured through the library. Other unsupported backing types are rejected by
+the native executor's capability checks; errors do not fall back to vCPU-only
+pause. Deletion, expiration and uncertain-control reconciliation retain their
+existing fences. A Paused observation proves execution state, not a measured
+amount of reclaimed physical memory; lost acknowledgements still require
+reconciliation.
+
+Each explicit native pause/resume writes the latest private
+`<sandbox-dir>/memory-transition.json` diagnostic record (0600). It binds the
+sandbox generation, Run/Attempt and cgroup device/inode to before/after
+`memory.current`, `memory.swap.current`, `memory.stat` and `memory.events`.
+The observer reads the identity-bound cgroup, never a client-supplied path.
+It records elapsed control/readiness time and observed charge reduction, with
+zero admission credit. Samples are sequential reads, not an atomic snapshot.
+This is a pair of immediate observations, not a steady-state curve, a proof of
+physical sharing, or an isolated attribution of offload savings. It includes
+supervisor/observer overhead and does not measure guest content correctness.
+
+A pending record replaces the previous observation before dispatch. Only an
+acknowledged desired state followed by enforcement and resume-readiness checks
+can complete it. Failed/lost acknowledgement or readiness leaves it pending;
+unavailable counters, swap or changed limit/OOM counters invalidate the
+measurement. Increasing charge yields zero reduction, with both raw values
+retained. Publication failure returns a control error, which may follow an
+applied native transition and must be reconciled. This diagnostic cache is
+never read as liveness or admission proof, including on daemon restart; the
+next explicit transition replaces it and confirmed deletion removes it.
+
+Both policies retain the entire CPU/memory admission reservation and hard limits.
+Measured quota release, resume admission and automatic idle pause are pending.
+No VM memory-savings or resume-latency result is claimed by the offline policy
+and dispatch tests.
 
 ## State, concurrency and failure behavior
 
