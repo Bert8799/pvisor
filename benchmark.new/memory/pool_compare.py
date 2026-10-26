@@ -27,12 +27,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "benchmark/pvisor"))
 from firecracker_ksm import Guest, expected, group_path  # noqa: E402
-from linux_cold_runtime import settle_unit  # noqa: E402
-from memory_savings import (  # noqa: E402 - import after module-loading setup
-    host_identity,
-    observer,
-    wait_for_quiet,
-)  # noqa: E402
+from linux_cold_runtime import competing_jobs, settle_unit  # noqa: E402
+from memory_savings import host_identity  # noqa: E402
+from memory_savings import observer as observe_memory  # noqa: E402
 from memory_savings import (  # noqa: E402 - import after module-loading setup
     validate_observation as validate_legacy_observation,
 )
@@ -49,13 +46,98 @@ ARMS = (
 )
 PATTERNS = ("repeated", "random-shared", "random-unique")
 BOUNDARIES = (0, 1, 2, 5, 10, 20, 40, 60)
+
+
+def requires_default_ksm(arms):
+    """Only the KSM arm needs the host's default-parameter scanner."""
+    return "pvisor-ksm" in arms
+
+
+def primary_baseline(arms):
+    """Keep pVisor-only reports from claiming a Firecracker baseline."""
+    if "firecracker" in arms:
+        return "firecracker"
+    if "pvisor-off" in arms:
+        return "pvisor-off"
+    return arms[0]
+
+
+CPU_QUOTA = "400000 100000"
+
+
+def require_cpu_controller(group):
+    """Fail early when the host user cgroup has no delegated CPU controller."""
+    if not (group / "cpu.max").is_file():
+        raise ValueError(
+            "benchmark cgroup lacks cpu.max; delegate the cgroup v2 cpu controller "
+            "to the user slice or run the benchmark under a system-level cgroup"
+        )
+
+
+def ensure_cpu_quota(group):
+    """Install the four-CPU quota before VMs start.
+
+    Some systemd --user versions expose cpu.max but do not apply CPUQuota to a
+    transient service. The service cgroup is owned by the invoking user, so the
+    benchmark can still install and verify the exact same quota before launch.
+    """
+    require_cpu_controller(group)
+    path = group / "cpu.max"
+    if path.read_text().strip() != CPU_QUOTA:
+        path.write_text(CPU_QUOTA + "\n")
+    if path.read_text().strip() != CPU_QUOTA:
+        raise ValueError("benchmark cgroup did not accept the four-CPU quota")
+
+
 POST_WRITE_BOUNDARIES = (1, 2, 5, 10, 20, 30)
 CURRENT_SCHEMA = "pvisor-pool-curve-condition/v4"
 WRITE_SCHEMAS = ("pvisor-pool-curve-condition/v3", CURRENT_SCHEMA)
 
 
+def observer(unit, stop, output):
+    return observe_memory(unit, stop, output, host_guard=competing_jobs)
+
+
+def validate_host_guards(guards, *, allow_jobs=False):
+    """Require retained inspection structure; FD errors are diagnostic only."""
+    if not isinstance(guards, list) or not guards:
+        raise ValueError("missing host process inspection")
+    for guard in guards:
+        if not isinstance(guard, dict) or any(
+            not isinstance(guard.get(key), list) for key in ("jobs", "inspection_errors")
+        ):
+            raise ValueError("incomplete host process inspection")
+        if guard["jobs"] and not allow_jobs:
+            raise ValueError("foreign VM/build during sampling")
+
+
+def wait_for_quiet(root, quiet_seconds=30, deadline_seconds=180):
+    """Wait for known competitors; retain unreadable-process diagnostics."""
+    deadline = time.monotonic() + deadline_seconds
+    quiet_since, rows = None, []
+    while True:
+        row = competing_jobs(Path("/sys/fs/cgroup/pvisor-no-owned-service"))
+        rows.append(row)
+        save(root / "prelaunch-wait.json", rows)
+        try:
+            validate_host_guards([row], allow_jobs=True)
+        except ValueError:
+            return False
+        now = time.monotonic()
+        if row["jobs"]:
+            quiet_since = None
+        elif quiet_since is None:
+            quiet_since = now
+        if quiet_since is not None and now - quiet_since >= quiet_seconds:
+            return True
+        if now >= deadline:
+            return False
+        time.sleep(min(1, deadline - now))
+
+
 def validate_observation(rows, guards, *, tasks_max=128):
     """Keep legacy budgets exact; v4 admits the same 256-task cap for every arm."""
+    validate_host_guards(guards)
     if tasks_max == 128:
         return validate_legacy_observation(rows, guards)
     if tasks_max != 256:
@@ -74,8 +156,6 @@ def validate_observation(rows, guards, *, tasks_max=128):
             or budget["pids.max"] != "256"
         ):
             raise ValueError("installed resource budget mismatch")
-    if not guards or any(item.get("jobs", []) for item in guards):
-        raise ValueError("foreign VM/build or missing host guard during sampling")
 
 
 def values(text):
@@ -106,7 +186,10 @@ def mapping_evidence(proc):
                     pooled += size
                     count += 1
     return dict(
-        mergeable_bytes=mergeable, pool_mapping_bytes=pooled, pool_vmas=count, ksm_bytes=ksm_bytes
+        mergeable_bytes=mergeable,
+        pool_mapping_bytes=pooled,
+        pool_vmas=count,
+        ksm_bytes=ksm_bytes,
     )
 
 
@@ -133,9 +216,30 @@ def pool_storage(pid):
     )
 
 
-def snapshot(root, name, guests, pool_pid=None, *, group=None):
+def owned_group_pids(group):
+    """Keep only processes whose effective UID matches the benchmark user.
+
+    A scope normally contains only the invoking user's processes; this guard
+    also keeps helper launchers out of PSS accounting if one appears.
+    """
     from docker_support import group_pids
 
+    for pid in group_pids(group):
+        try:
+            status = (Path("/proc") / str(pid) / "status").read_text()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        uid = next(
+            (int(line.split()[2]) for line in status.splitlines() if line.startswith("Uid:")),
+            None,
+        )
+        if uid == os.getuid():
+            yield pid
+
+
+def snapshot(root, name, guests, pool_pid=None, *, group=None):
+    if (root / "baseline-error.json").exists():
+        raise ValueError("baseline environment/source guard failed")
     group = group or group_path()
     counters = {
         n: (group / n).read_text()
@@ -155,7 +259,7 @@ def snapshot(root, name, guests, pool_pid=None, *, group=None):
         )
     }
     processes = []
-    for pid in group_pids(group):
+    for pid in owned_group_pids(group):
         word = str(pid)
         proc = Path("/proc") / word
         try:
@@ -221,8 +325,15 @@ def internal(path):
         group = Path(cfg["accounting_group"])
         if group_path().parent != group or group.name != cfg["docker_slice"]:
             raise ValueError("Docker controller escaped owned parent slice")
+    ensure_cpu_quota(group)
     result = dict(status="failed", condition=cfg, checks=[], phases=[], cleanup=[])
     try:
+        if cfg.get("baseline_state"):
+            deadline = time.monotonic() + 10
+            while not (root / "startup-observation.json").is_file():
+                if (root / "baseline-error.json").exists() or time.monotonic() >= deadline:
+                    raise ValueError("baseline startup observer did not become ready")
+                time.sleep(0.01)
         if not verify_harness(cfg["harness_files"]):
             raise ValueError("measurement source changed before VM start")
         initial = snapshot(root, "before", [], group=group)
@@ -236,8 +347,10 @@ def internal(path):
         ):
             raise ValueError("whole-group budget was not installed")
         state = kernel_state()
-        require_default_ksm(state)
+        if cfg["arm"] == "pvisor-ksm":
+            require_default_ksm(state)
         result["kernel_before"] = state
+        firmware = inputs / "firmware"
         if cfg["arm"] == "docker-rootless":
             from docker_support import Engine
 
@@ -329,7 +442,7 @@ def internal(path):
                     "--worker",
                     str(inputs / "worker"),
                     "--firmware",
-                    str(inputs / "firmware"),
+                    str(firmware),
                     "--stage",
                     str(root / f"vm{identity}"),
                     "--mode",
@@ -355,6 +468,10 @@ def internal(path):
             guests.append(guest)
             result.setdefault("commands", []).append(command)
             result["checks"].append(guest.ack("ready", 0, cfg["hashes"][f"{identity}:0"]))
+            if cfg.get("baseline_state"):
+                result.setdefault("ready_events", []).append(
+                    dict(instance=identity, pid=process.pid, monotonic_ns=time.monotonic_ns())
+                )
         origin = time.monotonic()
         result["all_ready_ns"] = time.monotonic_ns()
         for boundary in BOUNDARIES:
@@ -448,7 +565,8 @@ def internal(path):
         result["after"] = snapshot(root, "after", [], group=group)
         after = kernel_state()
         result["kernel_after"] = after
-        require_default_ksm(after)
+        if cfg["arm"] == "pvisor-ksm":
+            require_default_ksm(after)
         for phase in result["phases"]:
             events = values(phase["counters"]["memory.events"])
             if any(events.get(n, 0) for n in ("oom", "oom_kill", "max")):
@@ -556,7 +674,8 @@ def validate_worker(raw, cfg):
             if process["pss_bytes"] != values(process["smaps_rollup"])["Pss"] * 1024:
                 raise ValueError("PSS evidence mismatch")
         if cfg.get("schema") in ("pvisor-pool-curve-condition/v2", *WRITE_SCHEMAS):
-            require_default_ksm(phase["ksm"])
+            if cfg["arm"] == "pvisor-ksm":
+                require_default_ksm(phase["ksm"])
             if any(phase["ksm"]["files"][n] != raw["kernel_before"]["files"][n] for n in TUNABLES):
                 raise ValueError("KSM changed during observation")
             expected_group = phase["cgroup"].removeprefix("/sys/fs/cgroup")
@@ -582,8 +701,9 @@ def validate_worker(raw, cfg):
         raw["cleanup"]
     ) != 4:
         raise ValueError("native reaping incomplete")
-    for state in (raw["kernel_before"], raw["kernel_after"]):
-        require_default_ksm(state)
+    if cfg["arm"] == "pvisor-ksm":
+        for state in (raw["kernel_before"], raw["kernel_after"]):
+            require_default_ksm(state)
     if any(raw["kernel_before"]["files"][n] != raw["kernel_after"]["files"][n] for n in TUNABLES):
         raise ValueError("KSM configuration changed")
     for phase in phases:
@@ -597,11 +717,9 @@ def validate_worker(raw, cfg):
 
 def pss_sample(group):
     """Sample live members; retain read failures and identities that exited."""
-    from docker_support import group_pids
-
     row = dict(monotonic_ns=time.monotonic_ns(), processes=[], exited_pids=[])
     try:
-        for pid in group_pids(group):
+        for pid in owned_group_pids(group):
             try:
                 text = (Path("/proc") / str(pid) / "smaps_rollup").read_text()
                 row["processes"].append(dict(pid=int(pid), pss_bytes=values(text)["Pss"] * 1024))
@@ -636,7 +754,16 @@ def pss_observer(unit, stop, root):
 
 
 def attempt(
-    inputs, root, arm, pattern, hashes, harness, *, library_variant=None, docker_inputs=None
+    inputs,
+    root,
+    arm,
+    pattern,
+    hashes,
+    harness,
+    *,
+    library_variant=None,
+    docker_inputs=None,
+    baseline_state=None,
 ):
     root.mkdir()
     row = dict(arm=arm, pattern=pattern, status="failed")
@@ -650,7 +777,10 @@ def attempt(
             save(root / "result.json", row)
             return row
     if not wait_for_quiet(root):
-        row["error"] = "quiet admission failed"
+        row["error"] = (
+            "quiet admission failed: incomplete inspection or competing work; see prelaunch-wait.json"
+        )
+        save(root / "result.json", row)
         return row
     cfg = dict(
         schema=CURRENT_SCHEMA,
@@ -661,6 +791,8 @@ def attempt(
         hashes=hashes,
         harness_files=harness,
     )
+    if baseline_state is not None:
+        cfg["baseline_state"] = str(baseline_state)
     if library_variant is not None:
         from library_protocol import details
 
@@ -668,7 +800,7 @@ def attempt(
         details(cfg)
     if docker_inputs is not None:
         cfg["docker_inputs"] = str(docker_inputs)
-    unit = "pvisor-pool-curve-" + uuid.uuid4().hex + ".service"
+    unit = "pvisor-pool-curve-" + uuid.uuid4().hex + ".scope"
     service = unit
     extra = []
     if arm == "docker-rootless":
@@ -684,36 +816,58 @@ def attempt(
         extra = ["--slice=" + unit, "-p", "Delegate=yes"]
         cfg.update(accounting_group=str(group), docker_slice=unit)
     save(root / "config.json", cfg)
-    command = [
-        "systemd-run",
-        "--user",
-        "--quiet",
-        "--wait",
-        "--pipe",
-        "--collect",
-        "--unit=" + service,
-        *extra,
-        "-p",
-        "MemoryMax=2147483648",
-        "-p",
-        "MemorySwapMax=0",
-        "-p",
-        "CPUQuota=400%",
-        "-p",
-        "CPUAffinity=0 1 2 3",
-        "-p",
-        "TasksMax=256",
-        "-p",
-        "RuntimeMaxSec=180",
-        "-p",
-        "TimeoutStopSec=10",
-        "-p",
-        "KillMode=control-group",
+    internal = [
         sys.executable,
         str(Path(__file__).resolve()),
         "--internal",
         str(root / "config.json"),
     ]
+    if arm == "docker-rootless":
+        command = [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--unit=" + service,
+            *extra,
+            "-p",
+            "MemoryMax=2147483648",
+            "-p",
+            "MemorySwapMax=0",
+            "-p",
+            "CPUAffinity=0 1 2 3",
+            "-p",
+            "TasksMax=256",
+            "-p",
+            "RuntimeMaxSec=180",
+            "-p",
+            "TimeoutStopSec=10",
+            "-p",
+            "KillMode=control-group",
+            *internal,
+        ]
+    else:
+        # A scope keeps the invoking shell's kvm supplementary group. A
+        # transient service can drop it even when the device has no ACL.
+        command = [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--scope",
+            "--unit=" + unit,
+            "-p",
+            "MemoryMax=2147483648",
+            "-p",
+            "MemorySwapMax=0",
+            "-p",
+            "TasksMax=256",
+            "/usr/bin/taskset",
+            "-c",
+            "0-3",
+            *internal,
+        ]
     row["command"] = command
     stop = threading.Event()
     observers = [observer, pss_observer]
@@ -722,8 +876,51 @@ def attempt(
 
         observers.append(audit_observer)
     watches = [threading.Thread(target=f, args=(unit, stop, root)) for f in observers]
-    for watch in watches:
-        watch.start()
+
+    def start_observers_when_ready():
+        # The service may briefly exist with cpu.max=max before the internal
+        # process installs the quota. Do not record that startup row as a
+        # resource-budget failure.
+        deadline = time.monotonic() + 5
+        while not stop.is_set() and time.monotonic() < deadline:
+            shown = subprocess.run(
+                ["systemctl", "--user", "show", unit, "-p", "ControlGroup", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if shown.stdout.strip():
+                group = Path("/sys/fs/cgroup") / shown.stdout.strip().lstrip("/")
+                try:
+                    if (group / "cpu.max").read_text().strip() == CPU_QUOTA:
+                        break
+                except OSError:
+                    pass
+            time.sleep(0.05)
+        try:
+            if baseline_state is not None:
+                sample = pss_sample(group)
+                if sample is None or "error" in sample:
+                    raise ValueError("baseline initial PSS unavailable")
+                initial = dict(
+                    time_ns=time.monotonic_ns(),
+                    memory_current=int((group / "memory.current").read_text()),
+                    pss=sample,
+                )
+                from baseline_evidence import watch as baseline_watch
+
+                watches.append(
+                    threading.Thread(target=baseline_watch, args=(unit, stop, root, baseline_state))
+                )
+                # Publish readiness only after the initial observations are retained.
+                save(root / "startup-observation.json", initial)
+            for watch in watches:
+                watch.start()
+        except Exception as error:
+            save(root / "baseline-error.json", {"error": str(error)})
+
+    starter = threading.Thread(target=start_observers_when_ready)
+    starter.start()
     try:
         with (
             (root / "service.stdout").open("wb") as out,
@@ -749,8 +946,10 @@ def attempt(
     finally:
         row["unit_quiescent"] = settle_unit(unit, root)
         stop.set()
+        starter.join()
         for watch in watches:
-            watch.join()
+            if watch.is_alive():
+                watch.join()
         try:
             validate_observation(
                 json.loads((root / "monitor.json").read_text()),
@@ -764,11 +963,19 @@ def attempt(
             row.update(status="failed", error=str(error))
         if not row["unit_quiescent"]:
             row.update(status="failed", error="owned service cleanup unproven")
+        if (root / "baseline-error.json").exists():
+            row.update(status="failed", error=(root / "baseline-error.json").read_text())
     row["observation_hashes"] = {
         name: digest(root / name)
         for name in ("monitor.json", "pss.json", "guard.json")
         if (root / name).is_file()
     }
+    if baseline_state is not None:
+        row["baseline_evidence_hashes"] = {
+            n: digest(root / n)
+            for n in ("startup-observation.json", "baseline-guard.json")
+            if (root / n).is_file()
+        }
     if arm == "docker-rootless":
         row["docker_evidence_hashes"] = {
             path.name: digest(path) for path in root.glob("docker-*.json")
@@ -790,6 +997,7 @@ def main():
     p.add_argument("--samples", type=int, default=5)
     p.add_argument("--arms", default=",".join(ARMS))
     p.add_argument("--patterns", default=",".join(PATTERNS))
+    p.add_argument("--baseline-state", type=Path, help="frozen local baseline guard state")
     a = p.parse_args()
     if a.internal:
         return internal(a.internal)
@@ -823,6 +1031,7 @@ def main():
             "--patterns",
             a.patterns,
         ]
+        command += []
         if a.preflight:
             command.append("--preflight")
         if docker_inputs:
@@ -834,7 +1043,8 @@ def main():
         print(destination)
         return 0
     output.mkdir()
-    require_default_ksm(kernel_state())
+    if requires_default_ksm(arms):
+        require_default_ksm(kernel_state())
     receipt = json.loads((inputs / "receipt.json").read_text())
 
     def verify():
@@ -860,15 +1070,34 @@ def main():
             for n in ("firecracker_ksm.py", "memory_savings.py", "linux_cold_runtime.py")
         ),
     ]
+    if a.baseline_state:
+        harness_paths += [
+            Path(__file__).with_name(n)
+            for n in ("baseline.py", "baseline_analysis.py", "baseline_evidence.py", "plot_pool.py")
+        ]
     harness = {str(path.resolve()): digest(path) for path in harness_paths}
     frozen = output / "harness"
     frozen.mkdir()
     for path in harness_paths:
         shutil.copy2(path, frozen / path.name)
+    caveats = [
+        "compression changes block size and fault path; not pure codec attribution",
+        "ksmd is global, outside the product cgroup quota",
+        "scanner can run during sequential VM startup",
+    ]
+    if "firecracker" in arms:
+        caveats += [
+            "different kernels, block/virtio-fs root and guest supervisor",
+            "stock Firecracker has no validated KSM API here; do not label it FC+KSM",
+        ]
+    else:
+        caveats.append(
+            "pVisor-only cohort: no Firecracker or Docker baseline; do not pool with q8/l4"
+        )
     report = dict(
         benchmark_id="B-MEMORY-SCALE",
         role="engineering A/B",
-        primary_baseline="firecracker",
+        primary_baseline=primary_baseline(arms),
         preflight=a.preflight,
         samples=1 if a.preflight else a.samples,
         arms=arms,
@@ -879,13 +1108,7 @@ def main():
         complete=False,
         harness_files=harness,
         host=host_identity(),
-        caveats=[
-            "different kernels, block/virtio-fs root and guest supervisor",
-            "stock Firecracker has no validated KSM API here; do not label it FC+KSM",
-            "compression changes block size and fault path; not pure codec attribution",
-            "ksmd is global, outside the product cgroup quota",
-            "scanner can run during sequential VM startup",
-        ],
+        caveats=caveats,
     )
     if docker_inputs:
         from docker_support import verify_inputs as verify_docker_inputs
@@ -902,6 +1125,15 @@ def main():
         cells = [(pattern, arm) for pattern in patterns for arm in arms]
         random.Random(20261018 + r).shuffle(cells)
         for pattern, arm in cells:
+            if a.baseline_state:
+                from baseline_evidence import verify as verify_baseline
+
+                try:
+                    verify_baseline(json.loads(a.baseline_state.read_text()))
+                except Exception as error:
+                    report["error"] = str(error)
+                    save(output / "report.json", report)
+                    return 1
             if not verify_harness(harness) or not verify():
                 report["error"] = "source/input changed between conditions"
                 save(output / "report.json", report)
@@ -914,8 +1146,14 @@ def main():
                 hashes[pattern],
                 harness,
                 docker_inputs=docker_inputs,
+                baseline_state=a.baseline_state,
             )
             row["round"] = r
+            if a.baseline_state:
+                try:
+                    verify_baseline(json.loads(a.baseline_state.read_text()))
+                except Exception as error:
+                    row.update(status="failed", error=str(error))
             report["attempts"].append(row)
             save(output / "report.json", report)
             print(f"round={r} {pattern}/{arm}: {row['status']}", file=sys.stderr, flush=True)

@@ -113,6 +113,19 @@ class RegistryTests(unittest.TestCase):
                     "$ python3 @BATCH@/harness/user_workloads.py --measure @BATCH@",
                 ),
             }
+            if row["status"] == "explicit-python-local-steady-preflight":
+                self.assertEqual(row["benchmark_id"], "B-MEMORY-SCALE")
+                self.assertEqual(row["role"], "engineering A/B")
+                self.assertEqual(row["entry"], "memory/baseline.json")
+                self.assertEqual(
+                    table,
+                    {
+                        "local-steady-baseline": "$ python3 @REPO@/benchmark.new/memory/baseline.py "
+                        "--profile @PROFILE@ --inputs @INPUTS@ --output @OUTPUT@"
+                    },
+                )
+                self.assertTrue(path.with_suffix(".py").is_file())
+                continue
             if row["status"] == "explicit-python-paired-pool-curves":
                 self.assertEqual(row["benchmark_id"], "B-MEMORY-SCALE")
                 self.assertEqual(row["role"], "engineering A/B")

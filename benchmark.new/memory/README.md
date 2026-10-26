@@ -270,6 +270,133 @@ comparison. `just test-py discover -s benchmark.new/memory -p test_pool_compare.
 checks missing integrity acknowledgements, wrong digests, budget/swap failures,
 short scan windows, incomplete ownership and unexpected stock-Firecracker advice.
 
+### pVisor-only preflight
+
+For a pVisor-only trend check on the current host, omit the Firecracker and
+Docker arms and let the preparation helper skip their unused inputs:
+
+```sh
+python3 benchmark.new/memory/prepare_pool.py --pvisor-only \
+  --output /short/new-pvisor-inputs \
+  --firmware /absolute/libkrunfw.so.5
+python3 benchmark.new/memory/pool_compare.py \
+  --inputs /short/new-pvisor-inputs \
+  --output /short/new-pvisor-preflight \
+  --preflight \
+  --arms pvisor-off,pvisor-physical,pvisor-compressed,pvisor-local \
+  --patterns repeated,random-shared,random-unique
+```
+
+This mode omits `guest.ext4`, `kernel` and `firecracker` from the input receipt;
+those files are not used by the pVisor arms. The report uses `pvisor-off` as its
+primary baseline and cannot be pooled with a Firecracker/Docker cohort or with
+the historical q8/l4 preflights.
+
+`pvisor-off` and `pvisor-physical` need no KSM or userfaultfd. `pvisor-local`
+and `pvisor-compressed` require kernel-fault userfaultfd access (for example a
+`/dev/userfaultfd` ACL for the invoking user); do not change the global
+`vm.unprivileged_userfaultfd` setting. `pvisor-ksm` is separate: add it only when
+the host already has default-parameter KSM enabled. Non-KSM arms run with KSM
+disabled and do not require `run=1`. Keep KSM at `run=0` for non-KSM cohorts and
+do not use `run=2` during a shared-host campaign because it globally unmerges
+other KSM users' pages.
+
+### Fixed baseline wrapper
+
+`baseline.py` freezes the pVisor-only baseline contract and runs
+`pool_compare.py` with one of two profiles (default: `full`):
+
+| Profile | Arms | Patterns | Time |
+|---|---|---|---|
+| `quick` | off/physical/ksm | repeated, random-shared | 10–15 min |
+| `full` | five pVisor arms | all three patterns | 30–40 min |
+
+Profiles select conditions, not memory mechanisms: there is no `pvisor-quick`
+arm. Full plots have three content rows and two metric columns (charge/PSS),
+with five pVisor curves per panel. Quick plots have two rows and two columns,
+with off/physical/KSM curves; they are a separate repeat of six conditions.
+
+The initial local baseline uses `full`; a separate `quick` run checks
+repeatability without pooling samples. All profiles remain N=1 engineering
+preflights. They answer how soon pVisor reaches an observed steady footprint
+and how low that footprint is, without external-runtime or density claims.
+
+The frozen `pvisor-observed-steady/v1` rule selects the earliest suffix in
+the fixed window that lasts at least 10 seconds and whose charged-memory
+range is at most `max(4 MiB, 2% of its median)`. It must remain within that
+range through the end of the window. Report both group-start-to-steady and
+all-ready-to-steady time, median/min/max, Ready and 2/5/10/30/60-second memory,
+startup/whole-condition peaks, CPU, and memory-time integrals. An unreached
+suffix is `not_reached`, not zero or 60 seconds. The 128 MiB reclamation
+threshold is a separate diagnostic. Readback and post-write memory are
+reported separately, with a fresh steady-state check over the 30-second
+post-write window.
+
+Analysis clips window boundaries by linear interpolation between neighboring
+observations and integrates using actual timestamps. No interior gaps are
+filled. A charged-memory gap over 250 ms or PSS gap over 1.5 seconds makes
+the affected statistics insufficient evidence. Plots retain raw points.
+Before VM startup the parent records initial charge/PSS outside the measured
+group and releases the worker; each VM's Ready acknowledgement is timestamped.
+This preserves sharing that happened before all-ready.
+
+The wrapper requires KSM `run=1` with default parameters for the KSM arm,
+checks `/dev/userfaultfd` for local/compressed, checks `/dev/kvm`, and verifies
+the cgroup CPU controller. It records the host frequency/governor/boost,
+kernel, CPU, NUMA, page size, KSM/UFFD state, inputs and source/harness hashes
+to a real directory named `target/tmp/full-YYYYMMDD-N/` or
+`target/tmp/quick-YYYYMMDD-N/` (short enough for VM sockets). Each profile uses
+the UTC date and its own next available daily integer; no symlink is created.
+Source and input versions stay in `manifest.json`; status stays in `baseline.json`.
+The wrapper does not modify host settings. Product source must match the frozen build receipt. The source
+archive includes tracked and nonignored untracked files, with patch and manifest.
+The wrapper and analysis/supporting harness are retained too. An observer
+outside the measured cgroup checks source/input metadata and per-CPU policy,
+KSM, UFFD and controller configuration every second; full content hashes are
+checked at condition boundaries. A change stops only the owned scope and fails
+the batch. Instantaneous frequency is recorded but is not required to be constant.
+Successful `baseline.json` is published only after evidence and environment checks.
+
+```sh
+# With devices and CPU delegation already prepared and original KSM run=0:
+sudo sh -c 'echo 1 > /sys/kernel/mm/ksm/run'
+python3 benchmark.new/memory/baseline.py \
+  --profile full \
+  --inputs target/tmp/inputs
+# Restore the original KSM state, including after measurement failure:
+sudo sh -c 'echo 0 > /sys/kernel/mm/ksm/run'
+```
+
+Use `--dry-run` to write the manifest and print the exact `pool_compare`
+command without starting VMs; this records the current host without requiring
+its devices or KSM to be ready. Actual execution performs the mandatory checks.
+The wrapper refuses an existing output directory
+and refuses to run as root; run it as the benchmark user after the admin pre
+script.
+
+The output contains `analysis/summary.json`, `analysis/README.md` and SVG/PNG
+plots for startup-to-steady, idle, and readback/write. Open circles mark Ready;
+crosses and dotted bounds mark the charged-memory steady suffix. PSS stays a
+separate metric. Offline reanalysis writes a new directory and launches no VM:
+
+```sh
+python3 benchmark.new/memory/baseline_analysis.py /absolute/baseline/cohort \
+  --output /absolute/new-analysis
+just test-py discover -s benchmark.new/memory -p 'test_baseline*.py'
+```
+
+The runner cgroup must expose `cpu.max` for the four-CPU quota check. If
+`systemd-run --user` produces a cgroup with only `memory`/`pids`, delegate the
+cgroup v2 `cpu` controller to the user slice or run the harness under a
+system-level cgroup; the harness reports this as a missing `cpu.max` rather than
+sampling an unbounded run. The harness installs the exact `400000 100000` quota
+into its own service cgroup before launching VMs and verifies it. This avoids
+relying on a systemd `--user` version applying `CPUQuota`; it is the same
+four-CPU budget, not a relaxed check. Non-Docker arms run under
+`systemd-run --user --scope`, which keeps the invoking shell's `kvm`
+supplementary group; a transient service would otherwise start without it and
+fail to open `/dev/kvm`.
+
 `plot_pool.py` audits complete N=1 diagnostic cohorts. Historical cohorts with
 retired conditions require an explicit `--arms` selection of supported conditions.
 This produces a separate
@@ -302,6 +429,12 @@ separate metrics. Formal analysis also rechecks all input/build/source receipts,
 frozen supporting harnesses and the hashes of monitor, PSS and guard observations.
 
 ## Published curves and archived history
+
+The retained pVisor-only baseline is summarized in [BASELINE.md](../../target/BASELINE.md),
+including steady-state time, charged memory, PSS, first readback and CPU.
+Keep its raw records unchanged. Future roadmap work measures the new candidate's
+three content patterns and compares with these saved results; it does not rerun
+the five baseline modes.
 
 The [bilingual technical analysis](../../docs/src/zh/lab-notes/vm-memory-performance-analysis.md)
 uses only the complete `q8` and `l4` preflights. It publishes idle charged-memory

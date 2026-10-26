@@ -128,9 +128,21 @@ def validate_observation(rows, guards,allow_builds=False,memory_max=2147483648):
         raise ValueError('foreign VM/build or missing host guard during sampling')
 
 
-def observer(unit, stop, output):
+def observer(unit, stop, output, *, host_guard=None):
+    inspect_jobs = competing_jobs if host_guard is None else host_guard
     rows, guards, group = [], [], None
     last_guard = 0
+    guard_thread = None
+
+    def inspect_host():
+        while not stop.is_set():
+            try:
+                guards.append(inspect_jobs(group))
+            except Exception as error:
+                guards.append(dict(jobs=[], inspection_errors=[dict(error=str(error))]))
+            if stop.wait(0.5):
+                break
+
     try:
         while not stop.wait(0.05):
             now = time.monotonic()
@@ -153,13 +165,20 @@ def observer(unit, stop, output):
                     # reap. A read gap while the group still exists is invalid.
                     if group.exists():
                         rows.append(dict(error=str(error)))
-            if now - last_guard >= 0.5:
-                guards.append(competing_jobs(group or Path('/sys/fs/cgroup/pvisor-no-owned-service')))
+            if host_guard is not None:
+                if guard_thread is None and group is not None:
+                    guard_thread = threading.Thread(target=inspect_host)
+                    guard_thread.start()
+            elif now - last_guard >= 0.5:
+                guards.append(inspect_jobs(group or Path('/sys/fs/cgroup/pvisor-no-owned-service')))
                 last_guard = now
     except Exception as error:
         rows.append(dict(error=str(error)))
     finally:
-        guards.append(competing_jobs(group or Path('/sys/fs/cgroup/pvisor-no-owned-service')))
+        if guard_thread is not None:
+            stop.set()
+            guard_thread.join()
+        guards.append(inspect_jobs(group or Path('/sys/fs/cgroup/pvisor-no-owned-service')))
         (output/'monitor.json').write_text(json.dumps(rows)+'\n')
         (output/'guard.json').write_text(json.dumps(guards, indent=2)+'\n')
 

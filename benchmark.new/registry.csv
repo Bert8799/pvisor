@@ -26,6 +26,7 @@ B-VM-MEMORY,user-facing,memory/memory.json,requires-single-condition-command
 B-MEMORY-SCALE,engineering A/B,memory/scale.json,requires-single-condition-command
 B-MEMORY-SCALE,engineering A/B,memory/scanner_compare.json,explicit-python-paired-memory
 B-MEMORY-SCALE,engineering A/B,memory/pool_compare.json,explicit-python-paired-pool-curves
+B-MEMORY-SCALE,engineering A/B,memory/baseline.json,explicit-python-local-steady-preflight
 B-MEMORY-SCALE,engineering A/B,memory/library_compare.json,explicit-python-paired-library-curves
 B-MEMORY-DIAG,diagnostic,memory/diagnostic.json,requires-single-condition-command
 B-COLD-RUNTIME-ENG,engineering A/B,memory/cold_runtime.json,requires-single-condition-command

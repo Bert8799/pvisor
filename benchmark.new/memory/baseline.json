@@ -1,0 +1,3 @@
+{
+  "local-steady-baseline": "$ python3 @REPO@/benchmark.new/memory/baseline.py --profile @PROFILE@ --inputs @INPUTS@ --output @OUTPUT@"
+}
