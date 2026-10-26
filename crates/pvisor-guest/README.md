@@ -88,3 +88,54 @@ necessary for terminal, mount, networking and process-lifecycle behavior.
 Architecture guards keep spawning/signalling/reaping out of the transport
 adapter. Linux supervisor tests cover limits, exit statuses, orphan reaping and
 concurrent exec routing; native CLI acceptance exercises the same behavior in a VM.
+
+## Inert template handoff
+
+The optional boot document below initializes Linux virtual filesystems and
+console ports, then blocks on one task. It starts no workload, agent, sidecar,
+bridge, workload mount or network configuration before the handoff:
+
+```json
+{"template":{"version":1,"template_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdio_ports":[true,true,false]}}
+```
+
+The ordinary `GuestConfig` document remains supported. Template documents reject
+workload fields and credentials. The host binds the 64-digit content identity to
+its immutable inputs and machine topology; the guest verifies only syntax and
+the received task's matching identity. This is a separate template handoff
+protocol, not the existing port-1025 live-workload adapter.
+
+After setup the supervisor writes and flushes a framed `template::Ready` on
+stdout, then reads exactly one `template::Task` from stdin. Both use the existing
+four-byte big-endian length and bounded JSON framing (1 MiB maximum). This Ready
+means **waiting for a task**, not application readiness or `REFERENCE_READY`.
+The host must capture before sending any task bytes; capture admission, device
+drain, console state and restore compatibility still belong to the host/VMM.
+
+The task supplies complete command, environment, working directory and launch
+options, a new instance ID (up to 128 ASCII letters, digits, hyphens or
+underscores) and 32 fresh host-CSPRNG bytes generated for
+that restored instance. Before any task setup or process starts, PID 1 mixes the
+bytes into `/dev/urandom` and requires Linux `RNDRESEEDCRNG` to succeed. Unsupported
+or denied reseeding aborts launch; it never falls back to cloned random state.
+`PVISOR_INSTANCE_ID` is injected from the task and cannot be overridden by its
+environment. Initial stdin must be `Closed`, with no PTY: the handoff owns stdin.
+Stdout becomes ordinary workload output after the readiness frame. The host must
+consume that frame separately. No host environment is inherited or shell text
+evaluated by the handoff. Existing launch validation, supervision and final
+virtio-fs synchronization apply after receipt.
+
+Malformed, oversized, truncated, foreign-template or invalid tasks fail closed
+before reseeding. Failed reseeding returns no launch options. There is no second
+task, acknowledgement retry or instance recycling. The host owns timeouts,
+cancellation, instance uniqueness, seed quality and termination of abandoned VMs.
+
+This implements the guest half only. The executor and Daemon do not yet select
+this boot document, build/version/pin templates or hand off restored instances.
+Existing execution restore still retains the old guest task and excludes network
+devices; this protocol does not remove that restriction. It also does not reset
+arbitrary image/application identity, cached user-space randomness or existing
+network connections. Capture must precede application startup, and host-side
+VM-generation, private filesystem, network and credential isolation remain
+acceptance work. Protocol tests do not establish snapshot cloning, daemon
+isolation, startup gains or high-density deployment.

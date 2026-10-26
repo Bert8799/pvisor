@@ -412,6 +412,61 @@ savings; compressed exit still does not commit writes after the last resume.
 See the [CLI commands and limits](../../docs/src/en/reference/cli.md#vm-instance-control)
 and [configuration example](../../docs/src/en/reference/config.md#vm-control-memory).
 
+## Inert VM template generations
+
+`environment_snapshot::templates` owns a dedicated, private template catalog.
+`TemplateSpec` binds a fresh generation, source-image inventory, exact guest
+supervisor digest, CPU/RAM sizing, console topology and existing host/build/
+firmware compatibility, with the distinct `pvisor-inert-template-v1` profile.
+`prepare_rootfs` verifies and independently
+copies the source, then installs the supervisor and credential-free template
+boot document. Existing init/config files are never overwritten. The guest waits
+for a new task; no application process or per-instance credentials belong in
+the captured template.
+
+After observing the matching guest handoff Ready, the caller captures machine
+state and calls `TemplateCatalog::publish` inside the same full CPU/device/RAM
+freeze, before sending any task bytes. Publication copies raw RAM sparsely with
+bounded buffers and uses the existing sealed filesystem/snapshot validation.
+These storage APIs do not establish the VM barrier or validate opaque CPU/device
+bytes; those remain VMM/capture-owner responsibilities. A source must have no
+external writers and must not overlap the catalog.
+
+The version-1 recipe hash names an immutable generation. Updating an alias
+requires its expected old generation (None means create-only); competing
+builders cannot silently replace each other. Preparation and capture failures
+leave the selected alias unchanged until the final atomic selection step. An
+alias sync error can follow an applied selection: inspect `selected` rather
+than blindly replaying publication. Changing source, supervisor, compatibility,
+sizing or topology requires a new recipe and capture. Rebuilding identical
+inputs also needs a fresh build generation; published versions are never edited.
+
+`acquire` authenticates exact compatibility and returns a `TemplateLease` holding
+the published state and a generation-specific reader lock. Keep it through
+materialization and VM teardown. A new alias selection affects only subsequent
+acquisitions; existing owners retain the old template. Every restored VM gets
+its own materialized writable filesystem; raw snapshot RAM is supplied read-only
+for the VM runtime's private COW mapping. Callers rebind filesystem paths,
+install the matching machine topology and resume through the VM API, then send
+one fresh task with its instance identity and entropy.
+
+`remove` conditionally unselects an alias. Explicit `collect` reclaims only
+unselected generations without live leases; another generation's reader does
+not block that reclamation. Live builders are skipped, abandoned build/selection
+files and interrupted deletion tombstones are recoverable, and payload removal
+runs outside the catalog gate. No background scanner or resident VM is added.
+Errors may follow partial cleanup; retry collection after resolving the error.
+Empty generation lock markers remain as identity-reuse fences, without retaining
+RAM or filesystem payloads; reclaimed generations cannot be published again.
+Private state must remain host-owned, guest-inaccessible and externally unmodified.
+
+This is the template preparation/storage foundation. The Daemon creation path
+does not yet select these generations or hand off new tasks. Existing native
+execution restore retains its no-network restrictions; this API does not make
+network snapshots, application credentials/identity cloning or service readiness
+supported. A general prepared-rootfs catalog entry is a different object and
+cannot be used as a template generation.
+
 ## Resource ownership and local cold compression
 
 Native VM checkpoint admission fixes compatibility and the private snapshot-store

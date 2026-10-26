@@ -43,6 +43,7 @@ pub(crate) use store::{NativeLayerCapture, PrivateFilesystemOwner};
 mod lazy;
 mod owned;
 mod store;
+pub mod templates;
 pub use blocks::RamBlocks;
 pub(crate) use blocks::{PinnedRamBlocks, RamDelta};
 pub use lazy::{RawRamIndex, SnapshotRamMount, SnapshotRamReader};

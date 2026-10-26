@@ -1,4 +1,5 @@
 //! Minimal PID 1: initialize the guest, supervise its workload, and report exit.
+use pvisor_guest::template::BootConfig;
 use pvisor_guest::{CONFIG_PATH, GuestConfig, NetworkConfig};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -11,6 +12,16 @@ use std::time::{Duration, Instant};
 mod control;
 mod process;
 mod shares;
+
+fn reseed_template(entropy: &[u8; 32]) -> io::Result<()> {
+    // Mixing into the pool alone does not force an immediate CRNG update.
+    // RNDRESEEDCRNG is required before any task (or its sidecars) can run.
+    let mut random = OpenOptions::new().write(true).open("/dev/urandom")?;
+    random.write_all(entropy)?;
+    // Linux UAPI <linux/random.h>: _IO('R', 0x07). Not exported by libc.
+    const RNDRESEEDCRNG: u32 = 0x5207;
+    check(unsafe { libc::ioctl(random.as_raw_fd(), RNDRESEEDCRNG as _) })
+}
 
 fn check(result: libc::c_int) -> io::Result<()> {
     if result < 0 {
@@ -299,9 +310,23 @@ fn run() -> io::Result<i32> {
             "guest config exceeds 1 MiB",
         ));
     }
-    let config: GuestConfig = serde_json::from_slice(&bytes)?;
-    config.command()?; // Validate before any configuration side effects.
-    initialize(config.stdio_ports)?;
+    let boot: BootConfig = serde_json::from_slice(&bytes)?;
+    let config = match boot {
+        BootConfig::Workload(config) => {
+            config.command()?; // Validate before any configuration side effects.
+            initialize(config.stdio_ports)?;
+            *config
+        }
+        BootConfig::Template { template } => {
+            template.validate()?;
+            initialize(Some(template.stdio_ports))?;
+            template.receive(
+                &mut io::stdin().lock(),
+                &mut io::stdout().lock(),
+                reseed_template,
+            )?
+        }
+    };
     if let Some(scratch) = &config.temporary_filesystem {
         // Never cover image contents or an existing guest mount. Only this
         // newly created directory may become the private scratch filesystem.
