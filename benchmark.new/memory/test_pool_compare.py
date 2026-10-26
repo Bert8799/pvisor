@@ -22,6 +22,14 @@ spec.loader.exec_module(subject)
 
 
 class HostAdmissionTests(unittest.TestCase):
+    def test_latest_keeps_audited_configuration_and_does_not_expand_old_matrices(self):
+        cfg = dict(arm="pvisor-latest", scan_order="adaptive", batch_put=True, zero_pages=False)
+        self.assertEqual(subject.memory_mode(cfg), "physical")
+        self.assertNotIn("pvisor-latest", subject.ARMS)
+        for key, value in [("scan_order", "random"), ("batch_put", False), ("zero_pages", True)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                subject.memory_mode({**cfg, key: value})
+
     def test_unreadable_fds_are_diagnostic_without_hiding_known_competitors(self):
         diagnostics = [{"pid": 123, "error": "Permission denied"}]
         row = {"jobs": [], "inspection_errors": diagnostics}

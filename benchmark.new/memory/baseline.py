@@ -375,6 +375,8 @@ def check_host(
 
 
 def selected_arms(profile: str, selection: str | None) -> tuple[str, ...]:
+    if selection == "pvisor-latest":
+        return (selection,)
     allowed = PROFILES[profile][0]
     if selection is None:
         return allowed
@@ -397,12 +399,17 @@ def build_command(
     inputs: Path,
     output: Path,
     *,
+    zero_pages: bool = False,
     arms: tuple[str, ...] | None = None,
     patterns: tuple[str, ...] | None = None,
+    scan_order: str = "random",
+    batch_put: bool = False,
 ) -> list[str]:
     profile_arms, _ = PROFILES[profile]
     arms = selected_arms(profile, ",".join(arms)) if arms is not None else profile_arms
     patterns = selected_patterns(profile, ",".join(patterns) if patterns is not None else None)
+    if arms == ("pvisor-latest",):
+        zero_pages, scan_order, batch_put = False, "adaptive", True
     return [
         sys.executable,
         str(HERE / "pool_compare.py"),
@@ -417,6 +424,12 @@ def build_command(
         ",".join(patterns),
         "--baseline-state",
         str(output.parent / "guard-state.json"),
+        "--zero-pages",
+        str(int(zero_pages)),
+        "--scan-order",
+        scan_order,
+        "--batch-put",
+        str(int(batch_put)),
     ]
 
 
@@ -437,6 +450,15 @@ def main() -> int:
         "--arms", help="explicit engineering subset of profile arms; not a complete profile"
     )
     parser.add_argument("--patterns", help="explicit engineering subset of profile patterns")
+    parser.add_argument("--scan-order", choices=("random", "adaptive"), default="random")
+    parser.add_argument("--batch-put", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--zero-pages",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="experimental anonymous-zero replacement for the physical pool",
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="write manifest and print command only"
     )
@@ -449,6 +471,8 @@ def main() -> int:
         patterns = selected_patterns(args.profile, args.patterns)
     except BaselineError as error:
         parser.error(str(error))
+    if arms == ("pvisor-latest",):
+        args.zero_pages, args.scan_order, args.batch_put = 0, "adaptive", 1
     profile_arms, profile_patterns = PROFILES[args.profile]
     fraction = len(arms) * len(patterns) / (len(profile_arms) * len(profile_patterns))
     subset = fraction != 1
@@ -493,13 +517,19 @@ def main() -> int:
             args.profile,
             inputs,
             output / "cohort",
+            zero_pages=bool(args.zero_pages),
             arms=arms,
             patterns=patterns,
+            scan_order=args.scan_order,
+            batch_put=bool(args.batch_put),
         )
         manifest = {
             "schema": "pvisor-memory-baseline/v2",
             "created_utc": utc_stamp_ns(),
             "profile": args.profile,
+            "zero_pages": bool(args.zero_pages),
+            "scan_order": args.scan_order,
+            "batch_put": bool(args.batch_put),
             "profile_subset": subset,
             "estimated_minutes": [
                 max(1, round(minutes * fraction)) for minutes in ESTIMATED_MINUTES[args.profile]

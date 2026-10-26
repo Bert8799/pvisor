@@ -15,6 +15,34 @@ spec.loader.exec_module(subject)
 
 
 class BaselineContractTests(unittest.TestCase):
+    def test_latest_runs_only_the_candidate_with_fixed_settings(self):
+        arms = subject.selected_arms("full", "pvisor-latest")
+        command = subject.build_command("full", Path("/tmp/inputs"), Path("/tmp/cohort"), arms=arms)
+        self.assertEqual(command[command.index("--arms") + 1], "pvisor-latest")
+        self.assertEqual(
+            command[command.index("--patterns") + 1],
+            "repeated,random-shared,random-unique",
+        )
+        self.assertEqual(command[command.index("--scan-order") + 1], "adaptive")
+        self.assertEqual(command[command.index("--batch-put") + 1], "1")
+        self.assertEqual(command[command.index("--zero-pages") + 1], "0")
+        with self.assertRaises(subject.BaselineError):
+            subject.selected_arms("full", "pvisor-off,pvisor-latest")
+
+    def test_scan_order_and_batch_setting_are_bound_to_the_command(self):
+        for order in ("random", "adaptive"):
+            command = subject.build_command(
+                "quick",
+                Path("/tmp/inputs"),
+                Path("/tmp/cohort"),
+                scan_order=order,
+                batch_put=True,
+            )
+            self.assertEqual(command[command.index("--scan-order") + 1], order)
+            self.assertEqual(command[command.index("--batch-put") + 1], "1")
+        default = subject.build_command("quick", Path("/tmp/inputs"), Path("/tmp/cohort"))
+        self.assertEqual(default[default.index("--batch-put") + 1], "0")
+
     def manifest(self):
         return {
             "profile": "full",
@@ -75,10 +103,11 @@ class BaselineContractTests(unittest.TestCase):
     def test_engineering_arm_subset_is_explicit_and_cannot_expand_the_profile(self):
         arms = subject.selected_arms("quick", "pvisor-physical")
         command = subject.build_command(
-            "quick", Path("/tmp/inputs"), Path("/tmp/cohort"), arms=arms
+            "quick", Path("/tmp/inputs"), Path("/tmp/cohort"), arms=arms, zero_pages=True
         )
         self.assertEqual(command[command.index("--arms") + 1], "pvisor-physical")
         self.assertEqual(command[command.index("--patterns") + 1], "repeated,random-shared")
+        self.assertEqual(command[command.index("--zero-pages") + 1], "1")
         for selection in ("", "pvisor-local", "pvisor-physical,pvisor-physical", "firecracker"):
             with self.subTest(selection=selection), self.assertRaises(subject.BaselineError):
                 subject.selected_arms("quick", selection)

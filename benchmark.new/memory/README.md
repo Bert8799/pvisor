@@ -430,8 +430,8 @@ frozen supporting harnesses and the hashes of monitor, PSS and guard observation
 
 ## Published curves and archived history
 
-The retained pVisor-only baseline is summarized in [BASELINE.md](../../target/BASELINE.md),
-including steady-state time, charged memory, PSS, first readback and CPU.
+The retained pVisor-only baseline includes steady-state time, charged memory,
+PSS, first readback and CPU.
 Keep its raw records unchanged. Future roadmap work measures the new candidate's
 three content patterns and compares with these saved results; it does not rerun
 the five baseline modes.
@@ -451,3 +451,43 @@ The documentation before cleanup is preserved in
 Original reports, failed attempts, frozen sources and raw curves remain in their
 own directories. Historical and incomplete measurements are excluded from the
 current comparison. This documentation cleanup starts no new measurements.
+
+## Retained optimization settings
+
+`pvisor-latest` is a separate candidate name: physical pool, adaptive scan order,
+batch publication enabled, zero-page replacement disabled. The wrapper fixes
+those settings when selecting the candidate; it never adds the old five modes.
+To measure only its three content patterns with freshly prepared inputs:
+
+```sh
+python3 benchmark.new/memory/baseline.py --profile full \
+  --arms pvisor-latest --inputs /short/current-inputs
+```
+
+Compare with the saved baseline and keep new results with the run artifacts.
+The two named baseline profiles and the historical formal comparison matrix
+are unchanged.
+
+The implementation retains three physical-pool settings. Each is recorded in
+the manifest, command and worker configuration; the worker overrides inherited
+environment values so the selected configuration is reproducible.
+
+| Wrapper option | Runtime setting | Behavior |
+| --- | --- | --- |
+| `--zero-pages 0\|1` | `PVISOR_MEMORY_ZERO_PAGES` | Replace verified zero pages with private anonymous zero mappings. |
+| `--batch-put 0\|1` | `PVISOR_MEMORY_BATCH_PUT` | Publish up to sixteen independent pages per exchange. |
+| `--scan-order random\|adaptive` | `PVISOR_MEMORY_SCAN_ORDER` | Keep random scanning or adjust order after a region shows sharing benefits. |
+
+All retain full byte checks, private writes, reference ownership and the two VM
+barriers. Defaults remain zero replacement off, batch publication off and random
+order. These options configure the implementation; they do not establish a
+measured improvement by themselves.
+
+## Host process inspection
+
+Process/FD inspection is best effort. Unreadable descriptors and short-lived
+processes remain diagnostics and do not stop measurement by themselves. Known
+competing VM/build jobs still block measurement. Host inspection runs separately
+from memory sampling. Resource limits, content checks and source/input checks
+remain in place. An administrator prepares the required permissions before
+measurement.

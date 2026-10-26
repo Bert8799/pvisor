@@ -44,6 +44,8 @@ ARMS = (
     "pvisor-compressed",
     "pvisor-local",
 )
+LATEST_ARM = "pvisor-latest"
+SUPPORTED_ARMS = (*ARMS, LATEST_ARM)
 PATTERNS = ("repeated", "random-shared", "random-unique")
 BOUNDARIES = (0, 1, 2, 5, 10, 20, 40, 60)
 
@@ -60,6 +62,21 @@ def primary_baseline(arms):
     if "pvisor-off" in arms:
         return "pvisor-off"
     return arms[0]
+
+
+def memory_mode(cfg):
+    """Keep the candidate name separate from its fixed physical-pool settings."""
+    if cfg["arm"] != LATEST_ARM:
+        return cfg["arm"].removeprefix("pvisor-")
+    if (
+        cfg.get("scan_order") != "adaptive"
+        or cfg.get("batch_put") is not True
+        or cfg.get("zero_pages") is not False
+    ):
+        raise ValueError(
+            "pvisor-latest requires adaptive scanning, batch publication and zero-pages off"
+        )
+    return "physical"
 
 
 CPU_QUOTA = "400000 100000"
@@ -315,7 +332,7 @@ def snapshot(root, name, guests, pool_pid=None, *, group=None):
 
 def internal(path):
     cfg = json.loads(path.read_text())
-    if cfg["arm"] not in ARMS:
+    if cfg["arm"] not in SUPPORTED_ARMS:
         raise ValueError("unsupported arm")
     root, inputs = Path(cfg["root"]), Path(cfg["inputs"])
     guests, handles, pool = [], [], None
@@ -358,7 +375,7 @@ def internal(path):
             result["docker_info"] = engine.start()
             docker_receipt = json.loads((Path(cfg["docker_inputs"]) / "receipt.json").read_text())
             result["docker_image_id"] = docker_receipt["image_id"]
-        mode = cfg["arm"].removeprefix("pvisor-")
+        mode = memory_mode(cfg)
         socket = None
         if mode in ("physical", "compressed"):
             directory = root / "pool"
@@ -454,6 +471,9 @@ def internal(path):
                 ]
                 if socket:
                     command += ["--pool-socket", str(socket)]
+            guest_environment["PVISOR_MEMORY_ZERO_PAGES"] = str(int(cfg.get("zero_pages", False)))
+            guest_environment["PVISOR_MEMORY_SCAN_ORDER"] = cfg.get("scan_order", "random")
+            guest_environment["PVISOR_MEMORY_BATCH_PUT"] = str(int(cfg.get("batch_put", False)))
             error = (root / f"vm{identity}.stderr").open("wb")
             log = (root / f"vm{identity}.stdout").open("wb")
             handles.extend([error, log])
@@ -616,8 +636,9 @@ def expected_checks():
 def validate_worker(raw, cfg):
     from docker_support import belongs
 
-    if cfg["arm"] not in ARMS:
+    if cfg["arm"] not in SUPPORTED_ARMS:
         raise ValueError("unsupported arm")
+    memory_mode(cfg)
     if cfg.get("schema") not in (None, "pvisor-pool-curve-condition/v2", *WRITE_SCHEMAS):
         raise ValueError("unsupported condition schema")
     if raw.get("status") != "passed" or raw.get("condition") != cfg:
@@ -764,6 +785,9 @@ def attempt(
     library_variant=None,
     docker_inputs=None,
     baseline_state=None,
+    zero_pages=False,
+    scan_order="random",
+    batch_put=False,
 ):
     root.mkdir()
     row = dict(arm=arm, pattern=pattern, status="failed")
@@ -790,6 +814,9 @@ def attempt(
         pattern=pattern,
         hashes=hashes,
         harness_files=harness,
+        zero_pages=bool(zero_pages),
+        scan_order=scan_order,
+        batch_put=bool(batch_put),
     )
     if baseline_state is not None:
         cfg["baseline_state"] = str(baseline_state)
@@ -997,6 +1024,9 @@ def main():
     p.add_argument("--samples", type=int, default=5)
     p.add_argument("--arms", default=",".join(ARMS))
     p.add_argument("--patterns", default=",".join(PATTERNS))
+    p.add_argument("--zero-pages", type=int, choices=(0, 1), default=0)
+    p.add_argument("--scan-order", choices=("random", "adaptive"), default="random")
+    p.add_argument("--batch-put", type=int, choices=(0, 1), default=0)
     p.add_argument("--baseline-state", type=Path, help="frozen local baseline guard state")
     a = p.parse_args()
     if a.internal:
@@ -1004,7 +1034,7 @@ def main():
     if not a.inputs or not a.output:
         p.error("inputs and output required")
     arms, patterns = a.arms.split(","), a.patterns.split(",")
-    if len(arms) != len(set(arms)) or not set(arms) <= set(ARMS):
+    if len(arms) != len(set(arms)) or not set(arms) <= set(SUPPORTED_ARMS):
         p.error("invalid arm selection")
     if len(patterns) != len(set(patterns)) or not set(patterns) <= set(PATTERNS):
         p.error("invalid pattern selection")
@@ -1031,7 +1061,14 @@ def main():
             "--patterns",
             a.patterns,
         ]
-        command += []
+        command += [
+            "--zero-pages",
+            str(a.zero_pages),
+            "--scan-order",
+            a.scan_order,
+            "--batch-put",
+            str(a.batch_put),
+        ]
         if a.preflight:
             command.append("--preflight")
         if docker_inputs:
@@ -1102,6 +1139,9 @@ def main():
         samples=1 if a.preflight else a.samples,
         arms=arms,
         patterns=patterns,
+        zero_pages=bool(a.zero_pages),
+        scan_order=a.scan_order,
+        batch_put=bool(a.batch_put),
         receipt=receipt,
         harness_sha256=digest(Path(__file__)),
         attempts=[],
@@ -1147,6 +1187,9 @@ def main():
                 harness,
                 docker_inputs=docker_inputs,
                 baseline_state=a.baseline_state,
+                zero_pages=bool(a.zero_pages),
+                scan_order=a.scan_order,
+                batch_put=bool(a.batch_put),
             )
             row["round"] = r
             if a.baseline_state:

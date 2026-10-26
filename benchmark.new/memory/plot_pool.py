@@ -9,6 +9,7 @@ from pathlib import Path
 from pool_compare import (
     ARMS,
     CURRENT_SCHEMA,
+    LATEST_ARM,
     PATTERNS,
     digest,
     validate_observation,
@@ -76,6 +77,8 @@ def audit(root, *, formal=False, arms=None):
         if report.get("campaign", "static") != "static":
             raise ValueError("unknown campaign")
         wanted_arms, wanted_patterns = set(ARMS), set(PATTERNS)
+        if not formal:
+            wanted_arms.add(LATEST_ARM)
     if formal:
         if (
             report.get("preflight") is not False
