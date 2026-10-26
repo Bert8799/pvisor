@@ -130,6 +130,17 @@ EOF、错误、取消或越界完成数不登记。提示只包含宿主地址�
 诊断 `file_hint_candidates_total` 统计被选为优先候选的次数，包含重访，
 不代表实际成功合并、文件命中数或内存节省。
 
+物理池全零页替换是默认关闭的独立实验：`PVISOR_MEMORY_ZERO_PAGES=1` 开启，
+`0` 或未设置关闭，其余值在预留 pager 前拒绝。首次屏障捕获的全零 4 KiB 页不进入
+池 IPC；第二次 CPU/设备屏障完整复核 live bytes 后，以私有匿名零映射替换，
+保持惰性缺页和内核私有写入语义。不能对原私有文件页直接 DONTNEED，否则会恢复
+backing 内容。旧池引用在替换完成后、屏障外释放；写入竞争则保留原映射和 authority。
+每页一位的零页调度提示只在该实验分配（512 MiB RAM 为 16 KiB），不改变基础页状态布局。
+pagemap 的 exclusive 位只提示重新扫描已置零的页，不是零内容证明；解析不读取 PFN，
+参见 [内核 pagemap 文档](https://www.kernel.org/doc/html/latest/admin-guide/mm/pagemap.html)。
+所有实际替换仍依赖两次屏障与完整字节复核。诊断 `zero_remaps_total` 是累计替换页数，
+不是当前物理节省或仍为零的页数；压缩和 KSM 模式不读取此实验变量。
+
 物理页扫描借鉴 [UKSM 的区域分层设计](https://www.usenix.org/system/files/conference/fast18/fast18-xia.pdf)，
 由私有 `cold_ram_scan.rs` 调度，每个 RAM mapping 分成最多 2 MiB 的区域；
 区域不会跨越映射边界。四级配额为每轮 16/64/256/512 页，初始最低级；
