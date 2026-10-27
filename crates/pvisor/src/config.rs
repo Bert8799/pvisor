@@ -1111,6 +1111,7 @@ cpus = 4
 #[cfg(test)]
 mod session_policy_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn policy_defaults_keep_explicit_scopes_and_reject_invalid_rules() {
         let root = tempfile::tempdir().unwrap();
@@ -1118,6 +1119,9 @@ mod session_policy_tests {
         let user = root.path().join("user");
         std::fs::create_dir_all(workspace.join(".pvisor")).unwrap();
         std::fs::create_dir_all(user.join("pvisor")).unwrap();
+        for directory in [workspace.join(".pvisor"), user.join("pvisor")] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::write(
             user.join("pvisor/policy.toml"),
             "[filesystem]\ndeny = ['secrets/**']\n",
@@ -1128,6 +1132,12 @@ mod session_policy_tests {
             "[filesystem]\nallow = ['secrets/workspace']\n",
         )
         .unwrap();
+        for path in [
+            workspace.join(".pvisor/policy.toml"),
+            user.join("pvisor/policy.toml"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let mut config = RunConfig::default();
         config.policies.session.filesystem = Some(
             pvisor_core::FileAccessPolicy::new_with_allow(
@@ -1167,11 +1177,12 @@ mod session_policy_tests {
     }
     #[test]
     fn policy_defaults_reject_symlinks_special_files_and_unbounded_input() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let directory = workspace.join(".pvisor");
         std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.join("policy.toml");
         let source = root.path().join("external.toml");
         std::fs::write(&source, "[network]\nallow = [{ host = 'api.example' }]\n").unwrap();
@@ -1187,6 +1198,7 @@ mod session_policy_tests {
             .unwrap()
             .set_len(1024 * 1024 + 1)
             .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load().is_err());
         std::fs::copy(&source, &path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();

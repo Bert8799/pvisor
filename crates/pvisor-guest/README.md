@@ -130,12 +130,13 @@ before reseeding. Failed reseeding returns no launch options. There is no second
 task, acknowledgement retry or instance recycling. The host owns timeouts,
 cancellation, instance uniqueness, seed quality and termination of abandoned VMs.
 
-This implements the guest half only. The executor and Daemon do not yet select
-this boot document, build/version/pin templates or hand off restored instances.
-Existing execution restore still retains the old guest task and excludes network
-devices; this protocol does not remove that restriction. It also does not reset
-arbitrary image/application identity, cached user-space randomness or existing
-network connections. Capture must precede application startup, and host-side
-VM-generation, private filesystem, network and credential isolation remain
-acceptance work. Protocol tests do not establish snapshot cloning, daemon
-isolation, startup gains or high-density deployment.
+The native executor and Daemon's optional local template selection use this
+protocol with versioned catalog leases, shared read-only baselines, private
+writes and fresh network backends. Ordinary execution restore retains its
+separate original-task/no-network contract. The handoff does not reset arbitrary
+image/application identity, cached user-space randomness or existing network
+connections: capture must precede application startup, and images must contain
+no per-instance secrets. Bootstrap code must use the new instance identity and
+task credentials rather than treating shared image files or the fixed virtual
+MAC/IP/CID as globally unique identities. Protocol tests alone do not establish
+snapshot cloning, SDK conformance, startup gains or high-density deployment.

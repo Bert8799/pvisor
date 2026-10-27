@@ -466,6 +466,10 @@ Errors may follow partial cleanup; retry collection after resolving the error.
 Empty generation lock markers remain as identity-reuse fences, without retaining
 RAM or filesystem payloads; reclaimed generations cannot be published again.
 Private state must remain host-owned, guest-inaccessible and externally unmodified.
+Concurrent catalog opens and alias metadata transactions wait for the short
+catalog gate instead of failing on ordinary lock contention. Payload copying
+and retired-generation deletion remain outside that gate; live instance leases
+never retain it.
 
 `TemplateSpec::native_overlay` selects a capsule containing `rootfs/`, private
 `upper/` and `work/`, and the native resolver lower. The capsule is captured as
@@ -483,6 +487,15 @@ API's new backing lifetime; the runner enforces read-only host access to their
 sealed physical trees. Instance writes use copy-up into private upper/work.
 RAM remains a read-only baseline with private COW mappings;
 there is no per-instance eager RAM copy or resident prewarming VM.
+For indexed raw template RAM, every 64 KiB logical block is authenticated against
+the existing manifest's block digests before mapping the exact read-only inode.
+Linux `SEEK_DATA` may certify complete zero-filled holes; their expected digests
+are checked without rereading and rehashing zero bytes. Unsupported extent
+queries fall back to reading every block. Verification uses one 64 KiB buffer,
+adds no persistent RAM cache and retains the original baseline inode. Raw legacy
+snapshots without a block index keep full-file validation. Ordinary execution
+snapshot `ram_file()` validation remains unchanged. Published files must remain
+externally unmodified throughout their leases, as with the original restore path.
 
 The runner binds fresh network/vsock endpoints and sends one new task, with a
 new Attempt identity and host CSPRNG entropy, after restoring. Workload stdin

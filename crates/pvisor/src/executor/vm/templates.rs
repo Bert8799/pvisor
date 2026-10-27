@@ -122,7 +122,7 @@ pub(super) fn prepare(
     let source = PathBuf::from(std::ffi::OsStr::from_bytes(
         &lease.environment().manifest().source_root,
     ));
-    let ram = Arc::new(lease.environment().ram_file()?);
+    let ram = Arc::new(lease.environment().template_ram_file()?);
     // Path is used only for authority exclusions/physical observation. The exact
     // read-only inode is passed to the child by descriptor and mapped MAP_PRIVATE.
     let ram_path = fs::read_link(format!(

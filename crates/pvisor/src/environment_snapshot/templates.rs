@@ -218,6 +218,8 @@ pub struct TemplateCapture<'a> {
 /// Private, dedicated template catalog. Clone/open separate handles to use from
 /// concurrent callers. Operations use process-independent file locks, with no
 /// global memory cache or resident VM. It is not a general snapshot-store root.
+/// Catalog metadata transactions wait for each other; capture copies and retired
+/// payload deletion run outside that gate. Generation leases do not hold it.
 pub struct TemplateCatalog {
     root: PathBuf,
 }
@@ -593,7 +595,15 @@ impl TemplateCatalog {
         Ok(())
     }
     fn gate(&self, exclusive: bool) -> anyhow::Result<File> {
-        lock(&self.root.join("catalog.lock"), exclusive)
+        let file = private_file(&self.root.join("catalog.lock"), true)?;
+        // Contention between independent admissions or a short alias update is
+        // normal. Do not turn it into a spurious EWOULDBLOCK creation failure.
+        if exclusive {
+            fs2::FileExt::lock_exclusive(&file)?;
+        } else {
+            fs2::FileExt::lock_shared(&file)?;
+        }
+        Ok(file)
     }
     fn selection(&self, name: &str) -> anyhow::Result<Option<String>> {
         valid_name(name)?;

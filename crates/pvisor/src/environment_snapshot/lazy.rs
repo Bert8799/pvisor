@@ -67,6 +67,182 @@ impl RawRamIndex {
         }
         Ok(())
     }
+
+    /// Authenticate every logical block on the exact descriptor being mapped.
+    /// Kernel-reported holes are zero bytes, checked against the authenticated
+    /// index without reading or repeatedly hashing them. No extent information
+    /// is persisted. The caller excludes external writers throughout the lease.
+    pub(super) fn verify_file(&self, file: &File) -> anyhow::Result<()> {
+        self.verify_file_with(file, |offset| {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                let offset = libc::off_t::try_from(offset)
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+                if data >= 0 {
+                    Ok(Some(data as u64))
+                } else {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ENXIO) {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            Ok(Some(offset))
+        })
+    }
+
+    fn verify_file_with(
+        &self,
+        file: &File,
+        mut next_data: impl FnMut(u64) -> io::Result<Option<u64>>,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        self.validate()?;
+        let before = file.metadata()?;
+        ensure!(
+            before.is_file() && before.len() == self.length,
+            "RAM file size/type mismatch"
+        );
+        let mut buffer = vec![0u8; BLOCK_BYTES];
+        let zero_hash = hash(&buffer);
+        let mut sparse = true;
+        for (block, expected) in self.sha256.iter().enumerate() {
+            let offset = block as u64 * BLOCK_BYTES as u64;
+            let length = (self.length - offset).min(BLOCK_BYTES as u64) as usize;
+            let hole = if sparse {
+                match next_data(offset) {
+                    Ok(Some(data)) => {
+                        ensure!(
+                            data >= offset && data <= self.length,
+                            "invalid RAM data extent"
+                        );
+                        data >= offset + length as u64
+                    }
+                    Ok(None) => true,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::Unsupported
+                            || matches!(
+                                error.raw_os_error(),
+                                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+                            ) =>
+                    {
+                        sparse = false;
+                        false
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                false
+            };
+            let actual = if hole {
+                if length == BLOCK_BYTES {
+                    zero_hash.clone()
+                } else {
+                    // A short tail has a different digest from a full zero block.
+                    buffer[..length].fill(0);
+                    hash(&buffer[..length])
+                }
+            } else {
+                file.read_exact_at(&mut buffer[..length], offset)?;
+                hash(&buffer[..length])
+            };
+            ensure!(
+                &actual == expected,
+                "raw RAM block digest mismatch at block {block}"
+            );
+        }
+        let after = file.metadata()?;
+        ensure!(
+            (
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            ) == (
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            ),
+            "RAM file changed during verification"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod raw_index_tests {
+    use super::*;
+
+    fn sparse() -> (tempfile::NamedTempFile, RawRamIndex) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4 * BLOCK_BYTES as u64 + 17).unwrap();
+        // Includes a block boundary, two holes and a short, nonzero tail.
+        file.as_file()
+            .write_all_at(b"boundary", 2 * BLOCK_BYTES as u64 - 3)
+            .unwrap();
+        file.as_file()
+            .write_all_at(b"tail", 4 * BLOCK_BYTES as u64 + 13)
+            .unwrap();
+        let index = RawRamIndex::capture(file.as_file()).unwrap();
+        (file, index)
+    }
+
+    #[test]
+    fn sparse_ram_index_verifies_data_holes_and_short_tails() {
+        let (file, index) = sparse();
+        index.verify_file(file.as_file()).unwrap();
+        // Conservative filesystems may report all bytes as data.
+        index
+            .verify_file_with(file.as_file(), |offset| Ok(Some(offset)))
+            .unwrap();
+        // Lack of extent support must fall back to checking actual bytes once.
+        let mut probes = 0;
+        index
+            .verify_file_with(file.as_file(), |_| {
+                probes += 1;
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            })
+            .unwrap();
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn sparse_ram_index_rejects_changed_data_or_new_writes_into_holes() {
+        for offset in [0, 2 * BLOCK_BYTES as u64 - 3, 4 * BLOCK_BYTES as u64 + 16] {
+            let (file, index) = sparse();
+            file.as_file().write_all_at(b"X", offset).unwrap();
+            assert!(index.verify_file(file.as_file()).is_err());
+        }
+        let (file, mut index) = sparse();
+        // A real hole must match the expected zero block, not merely be skipped.
+        index.sha256[0] = hash(&vec![1; BLOCK_BYTES]);
+        assert!(index.verify_file(file.as_file()).is_err());
+    }
+
+    #[test]
+    fn sparse_ram_index_rejects_truncation_bad_inventory_and_extent_errors() {
+        let (file, mut index) = sparse();
+        assert!(
+            index
+                .verify_file_with(file.as_file(), |_| Err(io::Error::from_raw_os_error(
+                    libc::EIO
+                )))
+                .is_err()
+        );
+        file.as_file().set_len(index.length - 1).unwrap();
+        assert!(index.verify_file(file.as_file()).is_err());
+        file.as_file().set_len(index.length).unwrap();
+        index.sha256.pop();
+        assert!(index.verify_file(file.as_file()).is_err());
+    }
 }
 
 enum Backing {

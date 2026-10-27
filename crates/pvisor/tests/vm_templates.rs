@@ -345,6 +345,58 @@ fn competing_builders_cannot_silently_replace_the_same_alias() {
 }
 
 #[test]
+fn concurrent_consumers_wait_for_metadata_transactions_and_keep_independent_leases() {
+    use std::{sync::mpsc, time::Duration};
+    let (temp, catalog, spec, source, ram) = fixture();
+    let record = publish(&catalog, "shell", None, &spec, &source, &ram).unwrap();
+    let path = temp.path().join("catalog");
+    let transaction = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join("catalog.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&transaction).unwrap();
+    let (entered, entering) = mpsc::channel();
+    let (finished, finishing) = mpsc::channel();
+    let leases = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let entered = entered.clone();
+                let finished = finished.clone();
+                let path = &path;
+                let compatibility = &spec.compatibility;
+                scope.spawn(move || {
+                    entered.send(()).unwrap();
+                    let result = TemplateCatalog::new(path)
+                        .and_then(|catalog| catalog.acquire("shell", compatibility));
+                    finished.send(result.is_ok()).unwrap();
+                    result
+                })
+            })
+            .collect();
+        for _ in 0..4 {
+            entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let premature = finishing.recv_timeout(Duration::from_millis(100));
+        // Always release before asserting, so a failing test cannot deadlock its workers.
+        drop(transaction);
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        for _ in 0..4 {
+            assert!(finishing.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(leases.iter().all(|lease| lease.version().id == record.id));
+    catalog.remove("shell", &record.id).unwrap();
+    assert_eq!(catalog.collect().unwrap(), 0);
+    drop(leases);
+    assert_eq!(catalog.collect().unwrap(), 1);
+}
+
+#[test]
 fn interrupted_build_and_alias_publication_are_reclaimed_after_writer_exit() {
     use std::os::unix::fs::OpenOptionsExt;
     let (temp, catalog, _spec, _source, _ram) = fixture();

@@ -414,6 +414,7 @@ mod tests {
 
     #[test]
     fn workspace_launch_policy_blocks_new_ambient_defaults_and_preserves_scopes() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let user = root.path().join("user");
@@ -423,6 +424,14 @@ mod tests {
             "[network]\ndefault_action = 'deny'\n[filesystem]\ndeny = ['new-secret/**']\n";
         std::fs::write(workspace.join(".pvisor/policy.toml"), changed).unwrap();
         std::fs::write(user.join("pvisor/policy.toml"), changed).unwrap();
+        for directory in [workspace.join(".pvisor"), user.join("pvisor")] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(
+                directory.join("policy.toml"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
         let record = save(
             root.path(),
             spec(),

@@ -720,10 +720,7 @@ impl Runtime for NativeRuntime {
             .write(true)
             .open("/dev/kvm")
             .context("native VM requires usable /dev/kvm")?;
-        ensure!(
-            unsafe { libc::ioctl(kvm.as_raw_fd(), 0xAE00) } == 12,
-            "unsupported KVM API version"
-        );
+        verify_kvm_api(&kvm)?;
         Ok(())
     }
 
@@ -2099,6 +2096,17 @@ fn reject_occupied_unclaimed_registry(directory: &Path, owner: &str) -> Result<(
     Ok(())
 }
 
+fn verify_kvm_api(kvm: &File) -> Result<()> {
+    // KVM_GET_API_VERSION requires arg == 0. Omitting a C variadic argument
+    // leaves a register value here; Linux rejects nonzero values with EINVAL.
+    let version = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xAE00, 0 as libc::c_ulong) };
+    if version < 0 {
+        return Err(std::io::Error::last_os_error()).context("query KVM API version");
+    }
+    ensure!(version == 12, "unsupported KVM API version: {version}");
+    Ok(())
+}
+
 fn trusted_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
@@ -2379,6 +2387,32 @@ mod tests {
     }
 
     const ID: &str = "sb-12345678-1234-4234-8234-123456789abc";
+    #[test]
+    fn kvm_preflight_reports_ioctl_failure_without_claiming_an_unsupported_version() {
+        let device = File::open("/dev/null").unwrap();
+        let error = verify_kvm_api(&device).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOTTY)
+        );
+        assert_eq!(error.to_string(), "query KVM API version");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires read/write access to a real /dev/kvm"]
+    fn native_kvm_preflight_accepts_the_current_api_with_a_zero_ioctl_argument() {
+        let device = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .unwrap();
+        verify_kvm_api(&device).unwrap();
+    }
+
     fn spec() -> RuntimeSpec {
         RuntimeSpec {
             id: ID.into(),

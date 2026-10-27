@@ -1437,6 +1437,27 @@ impl PublishedEnvironment {
             Ok(File::open(self.path.join("ram.bin"))?)
         }
     }
+    /// Native templates already authenticate the manifest containing the raw
+    /// block index. Check every block against that index before returning the
+    /// same read-only inode, without a full zero-filled RAM read or another RAM
+    /// copy. Legacy snapshots retain the ordinary full-digest path. The lease
+    /// and exclusion of external writers must outlive the returned mapping.
+    pub(crate) fn template_ram_file(&self) -> anyhow::Result<File> {
+        ensure!(
+            self.manifest.compatibility.profile == super::templates::PROFILE
+                && self.manifest.ram_blocks.is_none(),
+            "indexed template RAM requires a raw inert template"
+        );
+        let Some(index) = &self.manifest.ram_index else {
+            return self.ram_file();
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.path.join("ram.bin"))?;
+        index.verify_file(&file)?;
+        Ok(file)
+    }
     /// Pin backing independently of the object/store gate. Deleting the saved
     /// environment remains safe while a restored VM faults in previously cold RAM.
     pub fn ram_reader(&self) -> anyhow::Result<SnapshotRamReader> {
