@@ -16,7 +16,7 @@ use crate::devices::Error as DeviceError;
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -68,6 +68,9 @@ pub enum VirtioNetBackend {
 }
 
 pub struct Net {
+    snapshot_enabled: bool,
+    frozen: bool,
+    worker: Option<super::snapshot::Worker>,
     id: String,
     pub cfg_backend: VirtioNetBackend,
 
@@ -99,6 +102,9 @@ impl Net {
         };
 
         Ok(Net {
+            snapshot_enabled: false,
+            frozen: false,
+            worker: None,
             id,
             cfg_backend,
 
@@ -119,9 +125,84 @@ impl Net {
     pub fn backend(&self) -> &VirtioNetBackend {
         &self.cfg_backend
     }
+
+    pub(crate) fn enable_snapshot_profile(&mut self) {
+        self.snapshot_enabled = true;
+    }
+
+    fn validate_inactive_backend(&self) -> std::result::Result<(), String> {
+        let VirtioNetBackend::UnixstreamFd(fd) = &self.cfg_backend else {
+            return Err("inactive network capture requires an owned Unix-stream backend".into());
+        };
+        if super::snapshot::backend_ready(fd.as_raw_fd()).map_err(|e| e.to_string())? {
+            return Err("network template backend became active".into());
+        }
+        Ok(())
+    }
 }
 
 impl VirtioDevice for Net {
+    fn freeze(&mut self) -> std::result::Result<bool, String> {
+        if !self.snapshot_enabled
+            || !matches!(
+                self.cfg_backend,
+                VirtioNetBackend::UnixstreamFd(_) | VirtioNetBackend::UnixstreamPath(_)
+            )
+        {
+            return Err("network capture requires a pristine Unix-stream template profile".into());
+        }
+        if let Some(worker) = &mut self.worker {
+            if !worker.freeze()? {
+                return Ok(false);
+            }
+        } else {
+            self.validate_inactive_backend()?;
+        }
+        self.frozen = true;
+        Ok(true)
+    }
+    fn thaw(&mut self) -> std::result::Result<(), String> {
+        if let Some(worker) = &mut self.worker {
+            worker.thaw()?;
+        }
+        self.frozen = false;
+        Ok(())
+    }
+    fn capture_state(&self) -> std::result::Result<super::super::DeviceSnapshot, String> {
+        if !self.frozen {
+            return Err("network device must be frozen".into());
+        }
+        if self.worker.is_none() {
+            self.validate_inactive_backend()?;
+        }
+        Ok(super::super::DeviceSnapshot {
+            queues: self.worker.as_ref().map(|w| w.capture()).transpose()?,
+            state: super::super::DeviceSnapshotState::PristineNet {
+                mac: self.config.mac,
+            },
+        })
+    }
+    fn restore_state(
+        &mut self,
+        state: &super::super::DeviceSnapshotState,
+    ) -> std::result::Result<(), String> {
+        let super::super::DeviceSnapshotState::PristineNet { mac } = state else {
+            return Err("network snapshot type mismatch".into());
+        };
+        if !self.snapshot_enabled
+            || self.device_state.is_activated()
+            || self.worker.is_some()
+            || *mac != self.config.mac
+            || !matches!(
+                self.cfg_backend,
+                VirtioNetBackend::UnixstreamFd(_) | VirtioNetBackend::UnixstreamPath(_)
+            )
+        {
+            return Err("network template configuration mismatch".into());
+        }
+        self.frozen = true;
+        Ok(())
+    }
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -178,7 +259,14 @@ impl VirtioDevice for Net {
             self.cfg_backend.clone(),
         ) {
             Ok(worker) => {
-                worker.run();
+                if self.snapshot_enabled {
+                    self.worker = Some(
+                        super::snapshot::Worker::new(worker, self.frozen)
+                            .map_err(|_| ActivateError::BadActivate)?,
+                    );
+                } else {
+                    let _thread = worker.run().map_err(|_| ActivateError::BadActivate)?;
+                }
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
@@ -194,5 +282,176 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::legacy::DummyIrqChip;
+    use crate::devices::virtio::{DeviceSnapshot, DeviceSnapshotState, Queue};
+    use crate::utils::eventfd::{EventFd, EFD_NONBLOCK};
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use vm_memory::{Bytes, GuestAddress};
+
+    fn device() -> (Net, UnixStream) {
+        let (local, peer) = UnixStream::pair().unwrap();
+        let mut net = Net::new(
+            "eth0".into(),
+            VirtioNetBackend::UnixstreamFd(Arc::new(local.into())),
+            [2, 0, 0, 0, 0, 1],
+            0,
+        )
+        .unwrap();
+        net.enable_snapshot_profile();
+        (net, peer)
+    }
+    fn activate(
+        net: &mut Net,
+        saved: Option<&DeviceSnapshot>,
+    ) -> (GuestMemoryMmap, Vec<Arc<EventFd>>) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let queues = (0..2)
+            .map(|index| {
+                let queue = if let Some(saved) = saved {
+                    saved.queues.as_ref().unwrap()[index]
+                        .restore(1024, &mem)
+                        .unwrap()
+                } else {
+                    let mut queue = Queue::new(1024);
+                    queue.size = 8;
+                    queue.ready = true;
+                    let base = 0x1000 + index as u64 * 0x5000;
+                    queue.desc_table = GuestAddress(base);
+                    queue.avail_ring = GuestAddress(base + 0x200);
+                    queue.used_ring = GuestAddress(base + 0x400);
+                    queue
+                };
+                DeviceQueue::new(queue, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
+            })
+            .collect::<Vec<_>>();
+        let events = queues.iter().map(|queue| queue.event.clone()).collect();
+        net.activate(
+            mem.clone(),
+            InterruptTransport::new(DummyIrqChip::new().into(), "net-template-test".into())
+                .unwrap(),
+            queues,
+        )
+        .unwrap();
+        (mem, events)
+    }
+    fn freeze(net: &mut Net) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !net.freeze().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    fn submit(mem: &GuestMemoryMmap) {
+        let base = 0x6000;
+        let mut frame = vec![0; super::super::VNET_HDR_LEN];
+        frame.extend_from_slice(&[0xab; 60]);
+        mem.write_slice(&frame, GuestAddress(0x18000)).unwrap();
+        mem.write_obj(0x18000u64, GuestAddress(base)).unwrap();
+        mem.write_obj(frame.len() as u32, GuestAddress(base + 8))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(base + 12)).unwrap();
+        mem.write_obj(0u16, GuestAddress(base + 0x204)).unwrap();
+        mem.write_obj(1u16, GuestAddress(base + 0x202)).unwrap();
+    }
+
+    #[test]
+    fn pristine_network_restore_parks_workers_then_uses_new_backend() {
+        let (mut source, _source_peer) = device();
+        let (_source_mem, _events) = activate(&mut source, None);
+        assert!(source.capture_state().is_err());
+        freeze(&mut source);
+        let saved = source.capture_state().unwrap();
+        let saved: DeviceSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let (mut target, mut peer) = device();
+        target.restore_state(&saved.state).unwrap();
+        let (mem, _events) = activate(&mut target, Some(&saved));
+        submit(&mem);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0; 4]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        target.thaw().unwrap();
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut length = [0; 4];
+        peer.read_exact(&mut length).unwrap();
+        assert_eq!(u32::from_be_bytes(length), 60);
+        let mut frame = [0; 60];
+        peer.read_exact(&mut frame).unwrap();
+        assert_eq!(frame, [0xab; 60]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match target.freeze() {
+                Err(error) => {
+                    assert!(error.contains("before any traffic"));
+                    break;
+                }
+                Ok(false) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Ok(true) => panic!("active network was accepted as an inert template"),
+            }
+        }
+    }
+
+    #[test]
+    fn unread_backend_bytes_and_pending_guest_tx_refuse_capture() {
+        let (mut net, mut peer) = device();
+        net.frozen = true;
+        let (_mem, _events) = activate(&mut net, None);
+        peer.write_all(&[0, 0]).unwrap(); // An incomplete frame header is already activity.
+        assert!(net.freeze().is_err());
+        let (mut net, _peer) = device();
+        net.frozen = true;
+        let (mem, _events) = activate(&mut net, None);
+        submit(&mem);
+        assert!(net.freeze().is_err());
+    }
+
+    #[test]
+    fn ordinary_network_and_wrong_mac_do_not_accept_template_restore() {
+        let (local, _peer) = UnixStream::pair().unwrap();
+        let mut net = Net::new(
+            "eth0".into(),
+            VirtioNetBackend::UnixstreamFd(Arc::new(local.into())),
+            [2; 6],
+            0,
+        )
+        .unwrap();
+        assert!(net.freeze().is_err());
+        assert!(net
+            .restore_state(&DeviceSnapshotState::PristineNet { mac: [2; 6] })
+            .is_err());
+        net.enable_snapshot_profile();
+        assert!(net
+            .restore_state(&DeviceSnapshotState::PristineNet { mac: [3; 6] })
+            .is_err());
+    }
+
+    #[test]
+    fn inactive_network_rechecks_backend_at_freeze_and_capture() {
+        let (mut net, mut peer) = device();
+        freeze(&mut net);
+        assert!(net.capture_state().unwrap().queues.is_none());
+        peer.write_all(&[0, 0]).unwrap();
+        assert!(net.capture_state().is_err());
+        assert!(net.freeze().is_err());
+        let (mut net, peer) = device();
+        drop(peer);
+        assert!(net.freeze().is_err());
     }
 }

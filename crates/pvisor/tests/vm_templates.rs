@@ -37,6 +37,8 @@ fn fixture() -> (
             profile: pvisor::environment_snapshot::templates::PROFILE.into(),
         },
         stdio_ports: [true, true, false],
+        network_mac: None,
+        native_overlay: false,
     };
     let source = root.join("source");
     spec.prepare_rootfs(&image, &guest, &source).unwrap();
@@ -79,6 +81,11 @@ fn publish(
 #[test]
 fn update_switches_new_consumers_and_gc_skips_only_live_generations() {
     let (temp, catalog, spec, source, ram) = fixture();
+    assert!(
+        catalog
+            .acquire_version(&spec.id().unwrap(), &spec.compatibility)
+            .is_err()
+    );
     let a = publish(&catalog, "shell", None, &spec, &source, &ram).unwrap();
     let live_a = catalog.acquire("shell", &spec.compatibility).unwrap();
     let mut next = spec.clone();
@@ -95,11 +102,15 @@ fn update_switches_new_consumers_and_gc_skips_only_live_generations() {
     let live_b = catalog.acquire("shell", &spec.compatibility).unwrap();
     assert_eq!(live_a.version().id, a.id);
     assert_eq!(live_b.version().id, b.id);
+    let detached = catalog.acquire_version(&a.id, &spec.compatibility).unwrap();
+    assert_eq!(detached.version().id, a.id); // Alias has already moved to B.
+    drop(live_a); // Admission can release its lease after the recipient acquired A.
     assert_eq!(catalog.collect().unwrap(), 0);
-    drop(live_a);
+    drop(detached);
     // B stays leased: it must not prevent reclaiming unrelated A.
     assert_eq!(catalog.collect().unwrap(), 1);
     assert!(!temp.path().join("catalog/generations").join(&a.id).exists());
+    assert!(catalog.acquire_version(&a.id, &spec.compatibility).is_err());
     assert!(publish(&catalog, "reuse", None, &spec, &source, &ram).is_err());
     assert!(catalog.selected("reuse").unwrap().is_none());
     catalog.remove("shell", &b.id).unwrap();
@@ -158,6 +169,7 @@ fn compare_and_swap_and_compatibility_fences_preserve_current_generation() {
     let mut wrong = spec.compatibility.clone();
     wrong.host_boot = "another-boot".into();
     assert!(catalog.acquire("shell", &wrong).is_err());
+    assert!(catalog.acquire_version(&record.id, &wrong).is_err());
     assert_eq!(
         catalog.selected("shell").unwrap().as_deref(),
         Some(record.id.as_str())
@@ -200,6 +212,59 @@ fn preparation_checks_inputs_and_never_overwrites_an_existing_image() {
         .is_err()
     );
     assert!(!target.exists());
+}
+
+#[test]
+fn network_topology_is_bound_without_changing_legacy_recipe_ids() {
+    let (_temp, _catalog, spec, _source, _ram) = fixture();
+    let old = serde_json::to_value(&spec).unwrap();
+    assert!(old.get("network_mac").is_none());
+    assert!(old.get("native_overlay").is_none());
+    let legacy: TemplateSpec = serde_json::from_value(old).unwrap();
+    assert!(legacy.network_mac.is_none());
+    assert_eq!(legacy.id().unwrap(), spec.id().unwrap());
+    let mut network = spec.clone();
+    network.network_mac = Some([2, 0, 0, 0, 0, 1]);
+    assert_ne!(network.id().unwrap(), spec.id().unwrap());
+    for mac in [[0; 6], [1, 0, 0, 0, 0, 1], [255; 6]] {
+        network.network_mac = Some(mac);
+        assert!(network.id().is_err());
+    }
+}
+
+#[test]
+fn native_overlay_templates_capture_the_whole_private_layout() {
+    let (temp, catalog, mut spec, _source, ram) = fixture();
+    spec.native_overlay = true;
+    spec.generation = "native-overlay".into();
+    let source = temp.path().join("capsule");
+    spec.prepare_rootfs(
+        &temp.path().join("image"),
+        &temp.path().join("guest"),
+        &source,
+    )
+    .unwrap();
+    for path in ["rootfs", "upper", "work"] {
+        assert!(source.join(path).is_dir());
+    }
+    assert!(source.join("rootfs/init.krun").is_file());
+    assert!(!source.join("init.krun").exists());
+    fs::write(source.join("upper/private"), b"captured upper state").unwrap();
+    let version = publish(&catalog, "native", None, &spec, &source, &ram).unwrap();
+    let lease = catalog
+        .acquire_version(&version.id, &spec.compatibility)
+        .unwrap();
+    for destination in ["a", "b"] {
+        lease
+            .environment()
+            .materialize(&temp.path().join(destination))
+            .unwrap();
+    }
+    fs::write(temp.path().join("a/upper/private"), b"one instance only").unwrap();
+    assert_eq!(
+        fs::read(temp.path().join("b/upper/private")).unwrap(),
+        b"captured upper state"
+    );
 }
 
 #[test]

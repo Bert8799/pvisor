@@ -76,6 +76,27 @@ impl VmExecutor {
         anyhow::bail!(UNSUPPORTED_MESSAGE)
     }
 
+    /// Native template restore requires Linux x86_64.
+    pub fn from_template(
+        _settings: VmSettings,
+        _lease: crate::environment_snapshot::templates::TemplateLease,
+        _storage: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(UNSUPPORTED_MESSAGE)
+    }
+    /// Inert template capture is unavailable on Intel macOS.
+    pub fn capture_template(
+        &self,
+        _catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        _name: &str,
+        _expected: Option<&str>,
+        _guest: &std::path::Path,
+        _stage: &std::path::Path,
+        _generation: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(UNSUPPORTED_MESSAGE)
+    }
+
     pub fn settings(&self) -> &VmSettings {
         &self.settings
     }

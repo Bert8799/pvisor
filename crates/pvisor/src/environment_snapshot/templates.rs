@@ -50,6 +50,19 @@ pub struct TemplateSpec {
     pub compatibility: Compatibility,
     /// Handoff console topology, including required stdin and stdout ports.
     pub stdio_ports: [bool; 3],
+    /// Optional single pristine virtio-net device's exact nonzero unicast MAC.
+    /// Each restored instance supplies a fresh isolated backend; no connection
+    /// state is captured. None preserves the original network-free recipe bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_mac: Option<[u8; 6]>,
+    /// Native executor layout: rootfs lower plus private upper/work and optional
+    /// resolver lower inside the captured tree. False retains plain-root recipes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub native_overlay: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TemplateSpec {
@@ -77,6 +90,12 @@ impl TemplateSpec {
             self.cpus > 0 && self.memory_mib > 0,
             "empty template resource budget"
         );
+        if let Some(mac) = self.network_mac {
+            ensure!(
+                mac != [0; 6] && mac[0] & 1 == 0,
+                "invalid template network MAC"
+            );
+        }
         for value in [
             &self.compatibility.host_boot,
             &self.compatibility.build,
@@ -111,7 +130,10 @@ impl TemplateSpec {
     /// supervisor before copying. Source/destination must be independent trees;
     /// source writers must remain stopped through the copy. Existing init or
     /// config paths are rejected, never overwritten. Failure may leave a partial
-    /// private destination; do not boot or reuse it. No VM is started here.
+    /// private destination; do not boot or reuse it. With native_overlay, the
+    /// destination is a capsule containing rootfs/, upper/ and work/; boot files
+    /// are placed under rootfs/. Capture must retain the entire capsule, including
+    /// any native resolver lower added before boot. No VM is started here.
     pub fn prepare_rootfs(
         &self,
         source: &Path,
@@ -131,7 +153,16 @@ impl TemplateSpec {
             !destination.try_exists()?,
             "template destination already exists"
         );
-        copy_owned_tree(source, destination)?;
+        let root = if self.native_overlay {
+            fs::DirBuilder::new().mode(0o700).create(destination)?;
+            for directory in ["upper", "work"] {
+                fs::create_dir(destination.join(directory))?;
+            }
+            destination.join("rootfs")
+        } else {
+            destination.to_owned()
+        };
+        copy_owned_tree(source, &root)?;
         let mut input = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -141,18 +172,19 @@ impl TemplateSpec {
             .create_new(true)
             .mode(0o755)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(destination.join("init.krun"))?;
+            .open(root.join("init.krun"))?;
         std::io::copy(&mut input, &mut output)?;
         output.sync_all()?;
         ensure!(
-            file_hash(&destination.join("init.krun"))? == self.guest_sha256,
+            file_hash(&root.join("init.krun"))? == self.guest_sha256,
             "template supervisor changed during copy"
         );
         write_new(
-            &destination.join(".pvisor-guest.json"),
+            &root.join(".pvisor-guest.json"),
             &serde_json::to_vec(&BootConfig::Template { template: boot })?,
             0o400,
         )?;
+        File::open(&root)?.sync_all()?;
         File::open(destination)?.sync_all()?;
         Ok(())
     }
@@ -178,7 +210,8 @@ pub struct TemplateCapture<'a> {
     pub machine: &'a [u8],
     /// Frozen, captured raw RAM. Copying is sparse and uses bounded buffers.
     pub ram: &'a File,
-    /// Private prepared root filesystem belonging to that same frozen VM.
+    /// Private prepared root filesystem belonging to that same frozen VM, or
+    /// the entire native-overlay capsule when that recipe option is enabled.
     pub rootfs: &'a Path,
 }
 
@@ -196,9 +229,25 @@ pub struct TemplateLease {
     version: TemplateVersion,
     environment: PublishedEnvironment,
     _generation: File,
+    catalog: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TemplateBinding {
+    pub catalog: PathBuf,
+    pub id: String,
+    pub compatibility: Compatibility,
 }
 
 impl TemplateLease {
+    pub(crate) fn binding(&self) -> TemplateBinding {
+        TemplateBinding {
+            catalog: self.catalog.clone(),
+            id: self.version.id.clone(),
+            compatibility: self.version.spec.compatibility.clone(),
+        }
+    }
     /// Immutable identity selected when the lease was acquired.
     pub fn version(&self) -> &TemplateVersion {
         &self.version
@@ -220,6 +269,16 @@ struct Selection {
 }
 
 impl TemplateCatalog {
+    pub(crate) fn validate_source(&self, source: &Path) -> anyhow::Result<PathBuf> {
+        let source = source.canonicalize()?;
+        ensure!(
+            source != Path::new("/")
+                && !source.starts_with(&self.root)
+                && !self.root.starts_with(&source),
+            "template source overlaps catalog or host root"
+        );
+        Ok(source)
+    }
     /// Open/create private catalog directories beneath an existing parent. Paths
     /// must be absolute; existing symlinks, foreign owners or nonprivate entries
     /// fail. Use a trusted host parent and keep the entire tree guest-inaccessible.
@@ -274,16 +333,17 @@ impl TemplateCatalog {
         if let Some(expected) = expected {
             valid_digest(expected)?;
         }
-        let source = source.canonicalize()?;
-        ensure!(
-            !source.starts_with(&self.root) && !self.root.starts_with(&source),
-            "template source overlaps catalog"
-        );
+        let source = self.validate_source(source)?;
         ensure!(
             ready.version == pvisor_guest::template::VERSION && ready.template_id == id,
             "template readiness identity mismatch"
         );
-        let boot: BootConfig = read_json(&source.join(".pvisor-guest.json"))?;
+        let boot_root = if spec.native_overlay {
+            source.join("rootfs")
+        } else {
+            source.clone()
+        };
+        let boot: BootConfig = read_json(&boot_root.join(".pvisor-guest.json"))?;
         ensure!(
             matches!(boot, BootConfig::Template { template }
             if template.template_id == id && template.version == ready.version
@@ -291,7 +351,7 @@ impl TemplateCatalog {
             "template boot recipe mismatch"
         );
         ensure!(
-            file_hash(&source.join("init.krun"))? == spec.guest_sha256,
+            file_hash(&boot_root.join("init.krun"))? == spec.guest_sha256,
             "template supervisor changed before capture"
         );
         let (staging, _writer) = {
@@ -372,9 +432,42 @@ impl TemplateCatalog {
         let (version, generation) = {
             let _gate = self.gate(false)?;
             let id = self.selection(name)?.context("template alias not found")?;
-            let generation = lock(&self.root.join("locks").join(format!("{id}.lock")), false)?;
-            (self.version(&id)?, generation)
+            self.version_lease(&id)?
         };
+        self.open_lease(version, generation, expected)
+    }
+
+    /// Acquire the exact generation fixed by an earlier admission, without
+    /// consulting a mutable alias. Keep the admitting lease until the recipient
+    /// has acquired this one. Reclaimed or unknown versions fail; they are never
+    /// rebuilt, substituted or revived. Compatibility and lease lifetime are the
+    /// same as acquire(). This supports handoff to detached VM supervisors.
+    pub fn acquire_version(
+        &self,
+        id: &str,
+        expected: &Compatibility,
+    ) -> anyhow::Result<TemplateLease> {
+        valid_digest(id)?;
+        let (version, generation) = {
+            let _gate = self.gate(false)?;
+            self.version_lease(id)?
+        };
+        self.open_lease(version, generation, expected)
+    }
+
+    fn version_lease(&self, id: &str) -> anyhow::Result<(TemplateVersion, File)> {
+        let version = self.version(id)?;
+        let generation = private_file(&self.root.join("locks").join(format!("{id}.lock")), false)?;
+        fs2::FileExt::try_lock_shared(&generation)?;
+        Ok((version, generation))
+    }
+
+    fn open_lease(
+        &self,
+        version: TemplateVersion,
+        generation: File,
+        expected: &Compatibility,
+    ) -> anyhow::Result<TemplateLease> {
         ensure!(
             version.spec.compatibility == *expected,
             "template compatibility mismatch"
@@ -391,6 +484,7 @@ impl TemplateCatalog {
             version,
             environment,
             _generation: generation,
+            catalog: self.root.clone(),
         })
     }
 

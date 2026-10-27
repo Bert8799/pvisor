@@ -38,6 +38,90 @@ fn restore() -> MachineRestore {
     }
 }
 
+fn empty_vsock_machine(mapped: bool, tsi: bool) -> crate::api::MachineSnapshot {
+    use crate::devices::snapshot::{BusDeviceSnapshot, BusMappingSnapshot};
+    use crate::devices::{
+        legacy::DummyIrqChip,
+        virtio::{
+            vsock::{TsiFlags, Vsock},
+            MmioTransport,
+        },
+    };
+    let ports = mapped.then(|| {
+        [(44772, (std::path::PathBuf::from("/tmp/old.sock"), true))]
+            .into_iter()
+            .collect()
+    });
+    let flags = if tsi {
+        TsiFlags::from_bits_truncate(1)
+    } else {
+        TsiFlags::empty()
+    };
+    let vsock = std::sync::Arc::new(std::sync::Mutex::new(
+        Vsock::new(3, None, ports, flags).unwrap(),
+    ));
+    let mem =
+        vm_memory::GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), 0x10000)]).unwrap();
+    let mut mmio = MmioTransport::new(mem, DummyIrqChip::new().into(), vsock).unwrap();
+    assert!(mmio.freeze().unwrap());
+    let mut machine = restore().state;
+    machine.devices = vec![BusMappingSnapshot {
+        base: 0x10000,
+        len: 0x1000,
+        device: BusDeviceSnapshot::Virtio(mmio.capture_state().unwrap()),
+    }];
+    serde_json::from_value(serde_json::to_value(machine).unwrap()).unwrap()
+}
+
+#[test]
+fn fresh_vsock_endpoints_are_atomic_and_do_not_reuse_source_authority() {
+    use crate::api::SnapshotState;
+    let source = empty_vsock_machine(false, false);
+    let original = serde_json::to_value(&source).unwrap();
+    let mut destination = source.clone();
+    assert_eq!(
+        destination
+            .rebind_vsock_ports(&[(44772, "/tmp/new-owner.sock".into(), true)])
+            .unwrap(),
+        1
+    );
+    assert_eq!(serde_json::to_value(&source).unwrap(), original);
+    assert!(serde_json::to_string(&destination)
+        .unwrap()
+        .contains("/tmp/new-owner.sock"));
+    let rebound = serde_json::to_value(&destination).unwrap();
+    assert!(destination
+        .rebind_vsock_ports(&[(44772, "/tmp/another.sock".into(), true)])
+        .is_err());
+    assert_eq!(serde_json::to_value(&destination).unwrap(), rebound);
+    for ports in [
+        vec![(0, "/tmp/a.sock".into(), true)],
+        vec![(1, "relative".into(), true)],
+        vec![
+            (1, "/tmp/a.sock".into(), true),
+            (1, "/tmp/b.sock".into(), false),
+        ],
+        vec![(1, "/tmp/../a.sock".into(), true)],
+    ] {
+        let mut unchanged = source.clone();
+        assert!(unchanged.rebind_vsock_ports(&ports).is_err());
+        assert_eq!(serde_json::to_value(&unchanged).unwrap(), original);
+    }
+}
+
+#[test]
+fn mapped_or_tsi_vsock_snapshots_cannot_be_relabelled_as_fresh_endpoints() {
+    use crate::api::SnapshotState;
+    for (mapped, tsi) in [(true, false), (false, true)] {
+        let mut state = empty_vsock_machine(mapped, tsi);
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(state
+            .rebind_vsock_ports(&[(44772, "/tmp/new-owner.sock".into(), true)])
+            .is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    }
+}
+
 #[test]
 fn machine_ram_inventory_checks_offsets_overlap_and_exact_file_size() {
     let valid = restore();

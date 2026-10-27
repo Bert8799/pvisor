@@ -20,6 +20,7 @@ pub(super) const MAX_FRAME: usize = 16 * 1024;
 pub(super) struct RamBacking {
     pub file: Arc<File>,
     storage: Arc<File>,
+    private_cow: bool,
     pub path: PathBuf,
     _mount: Option<RamFileMount>,
     compression_store: Option<Arc<std::sync::Mutex<crate::ram_backing::CompressedRam>>>,
@@ -41,6 +42,7 @@ impl RamBacking {
     pub(super) fn restored(restore: Arc<super::checkpoint::PreparedRestore>) -> Self {
         Self {
             file: restore.ram.clone(),
+            private_cow: true,
             storage: restore.ram.clone(),
             path: restore.ram_path.clone(),
             _mount: None,
@@ -49,6 +51,24 @@ impl RamBacking {
             _temporary_layers: None,
             _temporary: None,
             restored: Some(restore),
+        }
+    }
+    pub(super) fn template(file: Arc<File>, path: PathBuf) -> Self {
+        Self {
+            storage: file.clone(),
+            file,
+            path,
+            private_cow: true,
+            _mount: None,
+            compression_store: None,
+            layers: None,
+            _temporary_layers: None,
+            _temporary: None,
+            #[cfg(any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
+            restored: None,
         }
     }
     pub(super) fn create(path: Option<&Path>) -> anyhow::Result<Self> {
@@ -64,6 +84,7 @@ impl RamBacking {
             let file = Arc::new(file);
             return Ok(Self {
                 storage: file.clone(),
+                private_cow: false,
                 file,
                 path,
                 _mount: None,
@@ -83,6 +104,7 @@ impl RamBacking {
         let file = Arc::new(temporary.reopen()?);
         Ok(Self {
             storage: file.clone(),
+            private_cow: false,
             file,
             path: temporary.path().canonicalize()?,
             _mount: None,
@@ -439,13 +461,9 @@ impl VmControl {
         let connection = guard.as_mut().ok_or_else(|| {
             anyhow::anyhow!("VM control unavailable: not a VM, not started, or stopped")
         })?;
-        #[cfg(any(
-            all(target_os = "linux", target_arch = "x86_64"),
-            all(target_os = "macos", target_arch = "aarch64")
-        ))]
         anyhow::ensure!(
             !(matches!(operation, OperationKind::RunOffload { .. })
-                && connection.backing.restored.is_some()),
+                && connection.backing.private_cow),
             "CAPABILITY_UNSUPPORTED: restored private COW RAM cannot use writable-backing offload"
         );
         if let OperationKind::RunCheckpoint {
@@ -1115,6 +1133,7 @@ mod tests {
         let path = directory.path().join("container");
         let physical = RamBacking::create(Some(&path)).unwrap();
         let mut backing = RamBacking {
+            private_cow: false,
             #[cfg(any(
                 all(target_os = "linux", target_arch = "x86_64"),
                 all(target_os = "macos", target_arch = "aarch64")
@@ -1147,6 +1166,7 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
         let original = temporary.path().to_owned();
         let mut backing = RamBacking {
+            private_cow: false,
             #[cfg(any(
                 all(target_os = "linux", target_arch = "x86_64"),
                 all(target_os = "macos", target_arch = "aarch64")

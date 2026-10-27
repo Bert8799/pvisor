@@ -135,7 +135,7 @@ pub trait VmConfiguration: Sized {
     fn set_firmware_path(&mut self, path: PathBuf) -> io::Result<()>;
     fn ram_backing(&mut self, file: File) -> io::Result<()>;
     fn embedded_kernel(&mut self, bytes: &[u8], guest_addr: u64, entry_addr: u64)
-    -> io::Result<()>;
+        -> io::Result<()>;
     fn disable_implicit_init(&mut self) -> io::Result<()>;
     /// Configure a custom init's command; requires implicit init to be disabled.
     /// Validate atomically before replacing the previous command.
@@ -384,6 +384,19 @@ pub trait FrozenMemory {
 /// Inspect opaque state and rebind captured filesystems to caller-owned copies.
 /// Rebinding preserves the old state on error; it does not copy or publish files.
 pub trait SnapshotState {
+    /// Bind fresh host Unix endpoints to a captured, empty vsock device. Each
+    /// tuple is (guest port, host Unix path, host-listen flag); true creates a new
+    /// host listener during activation, false selects a guest-to-host target.
+    /// Only zero-TSI states without prior host or Unix port mappings are accepted;
+    /// capture already excludes connections, listeners and pending responses.
+    /// CID and queue state are unchanged. Ports must be nonzero and unique (at
+    /// most 64); paths must be absolute, NUL-free, contain no parent traversal
+    /// and be shorter than 104 bytes.
+    /// The caller owns endpoint authorization, private parent directories and
+    /// their lifetime through VM teardown. No host sockets are cloned/connected
+    /// here. Returns the number of rebound devices; any error preserves all prior
+    /// snapshot bytes. Unsupported backends return Unsupported.
+    fn rebind_vsock_ports(&mut self, ports: &[(u32, PathBuf, bool)]) -> io::Result<usize>;
     fn cpu_count(&self) -> io::Result<usize>;
     fn has_kernel_layout(&self) -> io::Result<bool>;
     /// Verify captured inode identities/content while every source writer is frozen.

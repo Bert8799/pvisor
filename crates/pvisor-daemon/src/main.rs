@@ -18,6 +18,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prepare a credential-free native VM template in an isolated process.
+    TemplatePrepare(TemplateArgs),
     #[command(hide = true)]
     CacheWorker {
         #[arg(long)]
@@ -87,12 +89,114 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct TemplateArgs {
+    #[arg(long)]
+    rootfs: PathBuf,
+    /// Exact static pvisor-guest supervisor executable to install.
+    #[arg(long)]
+    guest: PathBuf,
+    #[arg(long)]
+    catalog: PathBuf,
+    #[arg(long)]
+    name: String,
+    /// Previously selected generation; omission means create-only.
+    #[arg(long)]
+    expected: Option<String>,
+    #[arg(long, default_value_t = 2)]
+    cpus: u16,
+    #[arg(long, default_value_t = 128)]
+    memory_mib: u32,
+    #[arg(long)]
+    library_dir: Option<PathBuf>,
+    /// Existing trusted host directory for automatically reclaimed build files.
+    #[arg(long)]
+    work_dir: PathBuf,
+    #[arg(long, hide = true)]
+    template_worker_stage: Option<PathBuf>,
+}
+
+fn prepare_template(args: &TemplateArgs) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    anyhow::ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "native templates require Linux x86_64"
+    );
+    if let Some(stage) = &args.template_worker_stage {
+        let executor = pvisor::VmExecutor::new(pvisor::VmSettings {
+            rootfs: Some(args.rootfs.canonicalize()?),
+            rootfs_immutable: true,
+            cpus: args.cpus,
+            memory_mib: args.memory_mib,
+            library_dir: args.library_dir.clone(),
+            ..Default::default()
+        })?;
+        return executor.capture_template(
+            pvisor::environment_snapshot::templates::TemplateCatalog::new(&args.catalog)?,
+            &args.name,
+            args.expected.as_deref(),
+            &args.guest.canonicalize()?,
+            stage,
+            &uuid::Uuid::new_v4().to_string(),
+        );
+    }
+    let work = args.work_dir.canonicalize()?;
+    let stage = tempfile::Builder::new()
+        .prefix("template-build-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(work)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(std::env::args_os().skip(1))
+        .arg("--template-worker-stage")
+        .arg(stage.path())
+        .stdin(std::process::Stdio::null());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let result = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("template preparation timed out; inspect catalog selection before retry");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    stage.close()?;
+    anyhow::ensure!(
+        result.success(),
+        "template preparation failed; inspect catalog selection before retry"
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // The re-executed VM runner enters namespaces before any Tokio threads exist.
     if pvisor::run_krun_internal_if_requested()? {
         return Ok(());
     }
     let args = Args::parse();
+    if let Command::TemplatePrepare(template) = &args.command {
+        return prepare_template(template);
+    }
     if let Command::CacheWorker {
         listen,
         image_store,
@@ -123,7 +227,10 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Protocol | Command::MemoryPool { .. } | Command::CacheWorker { .. } => {
+        Command::Protocol
+        | Command::MemoryPool { .. }
+        | Command::CacheWorker { .. }
+        | Command::TemplatePrepare(_) => {
             unreachable!()
         }
         Command::NativeSupervisor { sandbox_dir } => {
@@ -295,6 +402,36 @@ async fn shutdown() {
 mod tests {
     use super::*;
     use pvisor_daemon::memory_pool::PoolMode;
+
+    #[test]
+    fn template_preparation_requires_explicit_inputs_and_accepts_conditional_update() {
+        assert!(Args::try_parse_from(["pvisor-daemon", "template-prepare"]).is_err());
+        let args = [
+            "pvisor-daemon",
+            "template-prepare",
+            "--rootfs",
+            "/image",
+            "--guest",
+            "/guest",
+            "--catalog",
+            "/catalog",
+            "--name",
+            "agent",
+            "--work-dir",
+            "/work",
+            "--expected",
+            "old-version",
+        ];
+        assert!(matches!(
+            Args::try_parse_from(args).unwrap().command,
+            Command::TemplatePrepare(TemplateArgs {
+                cpus: 2,
+                memory_mib: 128,
+                expected: Some(_),
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn composite_service_selection_and_component_options() {

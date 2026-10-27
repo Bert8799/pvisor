@@ -98,6 +98,10 @@ pub enum DeviceSnapshotState {
     Console(super::console::ConsoleSnapshot),
     Vsock(super::vsock::VsockSnapshot),
     Balloon([u32; 4]),
+    #[cfg(feature = "net")]
+    PristineNet {
+        mac: [u8; 6],
+    },
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     Fs {
         tag: Vec<u8>,

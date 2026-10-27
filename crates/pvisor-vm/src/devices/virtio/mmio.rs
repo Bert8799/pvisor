@@ -78,6 +78,16 @@ pub struct MmioSnapshot {
 }
 
 impl MmioSnapshot {
+    pub(crate) fn rebind_vsock_ports(
+        &mut self,
+        ports: &[(u32, std::path::PathBuf, bool)],
+    ) -> std::io::Result<bool> {
+        if let DeviceSnapshotState::Vsock(state) = &mut self.device.state {
+            state.rebind_unix_ports(ports)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
     /// Restore filesystem topology before registering queue kick eventfds.
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub(crate) fn filesystem_request_queues(

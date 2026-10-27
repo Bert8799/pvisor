@@ -8,17 +8,20 @@ use crate::devices::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
+use super::snapshot::Stop;
 use super::VNET_HDR_LEN;
 
 use crate::utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
-use std::os::fd::AsRawFd;
 use std::thread;
 use std::{cmp, result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
+    pub(super) stop: Option<Stop>,
+    pristine: bool,
     rx_q: DeviceQueue,
     tx_q: DeviceQueue,
     interrupt: InterruptTransport,
@@ -26,12 +29,12 @@ pub struct NetWorker {
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
 
-    rx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    rx_frame_buf: Box<[u8]>,
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
-    tx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    tx_frame_buf: Box<[u8]>,
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
 }
@@ -67,6 +70,8 @@ impl NetWorker {
         };
 
         Ok(Self {
+            stop: None,
+            pristine: true,
             rx_q,
             tx_q,
 
@@ -74,25 +79,24 @@ impl NetWorker {
             backend,
             interrupt,
 
-            rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            rx_frame_buf: vec![0u8; MAX_BUFFER_SIZE].into_boxed_slice(),
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
 
-            tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            tx_frame_buf: vec![0u8; MAX_BUFFER_SIZE].into_boxed_slice(),
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
         })
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> std::io::Result<thread::JoinHandle<Self>> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
@@ -101,6 +105,15 @@ impl NetWorker {
         let backend_socket = self.backend.raw_socket_fd();
 
         let epoll = Epoll::new().unwrap();
+        if let Some(stop) = &self.stop {
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    stop.event.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, stop.event.as_raw_fd() as u64),
+                )
+                .unwrap();
+        }
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -123,9 +136,15 @@ impl NetWorker {
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
+            if self.stop.as_ref().is_some_and(Stop::requested) {
+                return self;
+            }
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
+                        if self.stop.as_ref().is_some_and(Stop::requested) {
+                            return self;
+                        }
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
@@ -139,8 +158,12 @@ impl NetWorker {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
                                 {
-                                    log::error!("Got {event_set:?} on backend fd, virtio-net will stop working");
-                                    eprintln!("LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!");
+                                    log::error!(
+                                        "Got {event_set:?} on backend fd, virtio-net will stop working"
+                                    );
+                                    eprintln!(
+                                        "LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!"
+                                    );
                                 } else {
                                     if event_set.contains(EventSet::IN) {
                                         self.process_backend_socket_readable()
@@ -233,6 +256,18 @@ impl NetWorker {
     }
 
     fn process_rx(&mut self) -> result::Result<(), RxError> {
+        // Only snapshot-profile workers check the first backend readiness. This
+        // catches partial frame headers before the backend's blocking read and
+        // never adds a polling syscall to ordinary workers or established flows.
+        if self.stop.is_some() && self.pristine {
+            if !self
+                .backend_ready()
+                .map_err(|_| RxError::Backend(ReadError::Internal(nix::Error::EIO)))?
+            {
+                return Ok(());
+            }
+            self.pristine = false;
+        }
         // if we have a deferred frame we try to process it first,
         // if that is not possible, we don't continue processing other frames
         if self.rx_has_deferred_frame {
@@ -309,6 +344,7 @@ impl NetWorker {
         let mut result = Ok(());
 
         while let Some(head) = tx_queue.pop(&self.mem) {
+            self.pristine = false;
             let head_index = head.index;
             // Addresses below outlive the descriptor walk.
             let _memory_access = head.memory_access.clone();
@@ -381,7 +417,7 @@ impl NetWorker {
                     break;
                 }
                 Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
-                    return Err(TxError::Backend(e))
+                    return Err(TxError::Backend(e));
                 }
             }
         }
@@ -393,6 +429,35 @@ impl NetWorker {
         }
 
         result
+    }
+
+    fn backend_ready(&self) -> std::io::Result<bool> {
+        super::snapshot::backend_ready(self.backend.raw_socket_fd())
+    }
+
+    // Must run while CPUs are parked and the RAM gate is still OPEN.
+    pub(super) fn validate_pristine(&self) -> Result<(), String> {
+        if !self.pristine
+            || self.rx_has_deferred_frame
+            || self.tx_has_deferred_frame
+            || self.backend.has_unfinished_write()
+            || !self.tx_q.queue.is_empty(&self.mem)
+            || self.backend_ready().map_err(|e| e.to_string())?
+        {
+            return Err("network snapshot requires a template before any traffic".into());
+        }
+        Ok(())
+    }
+
+    // No guest reads here: capture runs with the RAM gate CLOSED.
+    pub(super) fn snapshot_queues(&self) -> Result<Vec<super::super::QueueSnapshot>, String> {
+        if !self.pristine || self.backend_ready().map_err(|e| e.to_string())? {
+            return Err("network template backend became active".into());
+        }
+        Ok(vec![
+            self.rx_q.queue.capture_state(),
+            self.tx_q.queue.capture_state(),
+        ])
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.

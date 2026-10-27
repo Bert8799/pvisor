@@ -1206,7 +1206,12 @@ pub fn build_microvm_for_arch<A: crate::backend::Architecture>(
     }
 
     #[cfg(feature = "net")]
-    attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
+    attach_net_devices(
+        &mut vmm,
+        &vm_resources.net,
+        intc.clone(),
+        vm_resources.snapshot_profile,
+    )?;
     #[cfg(feature = "net")]
     if vm_resources.dhcp_client {
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
@@ -2539,8 +2544,12 @@ fn attach_net_devices(
     vmm: &mut Vmm,
     net_devices: &NetBuilder,
     intc: IrqChip,
+    snapshot_profile: bool,
 ) -> Result<(), StartMicrovmError> {
     for net_device in net_devices.list.iter() {
+        if snapshot_profile {
+            net_device.lock().unwrap().enable_snapshot_profile();
+        }
         let id = net_device.lock().unwrap().id().to_string();
 
         attach_mmio_device(vmm, id, intc.clone(), net_device.clone())

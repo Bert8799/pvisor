@@ -254,6 +254,33 @@ clock conversion 或 wake latch，不能自动卸载，也不证明 Linux runque
 当前源码尚无对应的真实 KVM 实测通过记录；macOS/HVF 尚未实际编译或运行
 验证。后续实测须使用独立制品和收据，不覆盖已有 binary、receipt 或实验数据。
 
+## Pristine network templates
+
+With the existing snapshot profile, a Unix-stream virtio-net backend can capture
+an inert template before any network traffic. The device stops and joins its
+worker before acknowledging freeze. Pending guest TX, backend input (including
+a partial frame header), deferred frames or any previous traffic reject capture.
+The capture phase copies queue indices without reading guest RAM after the RAM
+gate closes. Worker stop, panic and thaw errors remain explicit failures.
+
+Restore validates the saved MAC, feature negotiation and queue topology, creates
+a fresh caller-owned backend, and keeps its worker parked until thaw. Host
+descriptors, frames and connection state are not serialized. Ordinary network
+VMs do not opt into this capture path. The two existing fixed-size packet buffers
+remain single-owner allocations on the heap so returning parked workers does not
+copy large arrays through the thread stack; no packet cache or extra resident VM
+is introduced. This is not capture/restore of active network connections.
+
+`SnapshotState::rebind_vsock_ports` can attach fresh private host Unix endpoints
+to an empty, previously unmapped zero-TSI vsock snapshot. It preserves CID and
+queue state, validates bounded unique guest ports and absolute socket paths, and
+changes nothing on error. Existing mappings or TSI authority cannot be relabelled
+through this API. The caller retains endpoint authorization and private-directory
+ownership; restore still validates all machine state before resuming.
+
+These are VM-level prerequisites for daemon template creation. They do not add
+template selection to the daemon or relax ordinary Job checkpoint admission.
+
 ## Overlay protocol correctness
 
 Guest OPEN flags are Linux wire values. The adapter translates access mode,

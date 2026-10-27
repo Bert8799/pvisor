@@ -76,6 +76,7 @@ pub struct VmExecutor {
     firmware_path: Option<PathBuf>,
     features: crate::features::FeatureSettings,
     private_ram: bool,
+    template: Option<std::sync::Arc<super::templates::Prepared>>,
     vsock_ports: BTreeMap<u32, PathBuf>,
     #[cfg(target_os = "linux")]
     cpu_group: Option<std::sync::Arc<super::cpu_qos::CpuQosGroup>>,
@@ -104,7 +105,7 @@ pub(super) struct RunnerSpec {
     #[serde(default)]
     pub(super) features: crate::features::FeatureSettings,
     #[serde(default)]
-    vsock_ports: BTreeMap<u32, PathBuf>,
+    pub(super) vsock_ports: BTreeMap<u32, PathBuf>,
     #[serde(default)]
     pub(super) cpu_qos: Option<pvisor_core::CpuQosClass>,
     #[cfg(target_os = "linux")]
@@ -131,6 +132,8 @@ pub(super) struct RunnerSpec {
     pub(super) checkpoint: Option<super::checkpoint::LaunchBinding>,
     #[serde(default)]
     pub(super) restore: Option<super::checkpoint::RestoreLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) template: Option<super::templates::Launch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +157,7 @@ pub(super) struct OverlayDeviceSpec {
 
 /// A host-root VM must not reach the same workspace through its original lower
 /// path, or reach writable backing state through the root device.
-fn protect_overlay_backing(
+pub(super) fn protect_overlay_backing(
     root: &mut OverlayDeviceSpec,
     workspace: Option<&OverlayDeviceSpec>,
 ) -> anyhow::Result<()> {
@@ -560,6 +563,7 @@ impl VmExecutor {
             firmware_path,
             features: Default::default(),
             private_ram: false,
+            template: None,
             vsock_ports: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             cpu_group: None,
@@ -598,6 +602,10 @@ impl VmExecutor {
         anyhow::ensure!(
             self.restore.is_none(),
             "owned rootfs cannot override a restored VM"
+        );
+        anyhow::ensure!(
+            self.template.is_none(),
+            "owned rootfs cannot override a template"
         );
         let root = self.settings.rootfs.as_ref().context("missing VM rootfs")?;
         anyhow::ensure!(
@@ -706,6 +714,67 @@ impl VmExecutor {
         }
     }
 
+    /// Prepare one new native Attempt from an inert template. The supplied lease
+    /// is retained until VM teardown. The executor is single-use, including after
+    /// a failed launch; create another lease/executor for another instance.
+    /// Linux x86_64 only; exact build, firmware, sizing and network topology must
+    /// match. Shares sealed read-only filesystem lowers and baseline RAM, with
+    /// private upper/work and COW RAM writes. Caller owns private storage and reclaims partial preparation
+    /// after failure. Managed workspace/stage/apply profiles are unsupported.
+    pub fn from_template(
+        settings: VmSettings,
+        lease: crate::environment_snapshot::templates::TemplateLease,
+        storage: &Path,
+    ) -> anyhow::Result<Self> {
+        let prepared = super::templates::prepare(&settings, lease, storage)?;
+        let mut settings = settings;
+        settings.rootfs = Some(prepared.rootfs());
+        let mut executor = Self::new(settings)?;
+        executor.template = Some(std::sync::Arc::new(prepared));
+        Ok(executor)
+    }
+
+    /// Capture a credential-free inert template in this isolated synchronous
+    /// runner process. Guest shutdown/capture terminates the process; never call
+    /// from a service or a Tokio host. The parent owns stage cleanup and must reap
+    /// the preparer. No user command/env is admitted before capture. Native Linux
+    /// x86_64 only. Publication uses the catalog's expected-selection fence.
+    pub fn capture_template(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.template.is_none()
+                && self.vsock_ports.is_empty()
+                && self.rootfs_base.is_none()
+                && !self.private_ram
+                && self.settings.memory_pool.is_none()
+                && self.settings.snapshot_filesystem_pool.is_none()
+                && !self.settings.cold_pager_requested()
+                && !self.settings.ram_dedup
+                && !self.settings.ram_compression,
+            "template preparation requires a fresh plain VM executor"
+        );
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        ))]
+        anyhow::ensure!(
+            self.restore.is_none(),
+            "a restored execution cannot become a template preparer"
+        );
+        super::templates::capture(self, catalog, name, expected, guest, stage, generation)
+    }
+
+    pub(super) fn firmware_path(&self) -> Option<&Path> {
+        self.firmware_path.as_deref()
+    }
+
     pub fn settings(&self) -> &VmSettings {
         &self.settings
     }
@@ -736,6 +805,10 @@ impl VmExecutor {
             self.restore.is_none(),
             "private RAM mode requires a fresh VM"
         );
+        anyhow::ensure!(
+            self.template.is_none(),
+            "private anonymous RAM cannot replace a template baseline"
+        );
         self.private_ram = true;
         Ok(self)
     }
@@ -747,6 +820,12 @@ impl VmExecutor {
     }
 
     fn ram_backing(&self) -> anyhow::Result<super::control::RamBacking> {
+        if let Some(template) = &self.template {
+            return Ok(super::control::RamBacking::template(
+                template.ram.clone(),
+                template.ram_path.clone(),
+            ));
+        }
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
@@ -792,7 +871,7 @@ fn firmware_read_only_paths(firmware: Option<&Path>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn configure_runner_firmware(
+pub(super) fn configure_runner_firmware(
     vm: &mut impl VmConfiguration,
     firmware: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -896,7 +975,7 @@ impl RunExecutor for VmExecutor {
                     CapabilityDimension::FilesystemWrite,
                     "libkrun-guest-kernel-virtiofs-overlay",
                 ),
-            supports_checkpoint: self.settings.prepared_rootfs.is_none(),
+            supports_checkpoint: self.settings.prepared_rootfs.is_none() && self.template.is_none(),
             supports_migration: false,
         }
     }
@@ -920,6 +999,16 @@ impl RunExecutor for VmExecutor {
     async fn execute(&self, context: &Session) -> ExecutorOutput {
         crate::util::startup_mark_run("vm.prepare_begin", context.spec().run_id.as_str());
         let mut spec = context.spec().clone();
+        if self.template.is_some()
+            && !matches!(spec.invocation, RunInvocation::Process(ref process) if matches!(process.stdin, pvisor_core::StdioMode::Null))
+        {
+            return failed_to_start("template handoff requires closed workload stdin".into());
+        }
+        if self.template.is_some() && spec.metadata.contains_key("pvisor.vm.workspace_overlay") {
+            return failed_to_start(
+                "native templates do not support managed workspace overlays".into(),
+            );
+        }
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
@@ -974,12 +1063,19 @@ impl RunExecutor for VmExecutor {
                 root.display()
             ));
         }
-        let guest_cwd = spec
-            .metadata
-            .get("pvisor.vm.guest_cwd")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let guest_cwd = if self.template.is_some() {
+            invocation
+                .cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "/".into())
+        } else {
+            spec.metadata
+                .get("pvisor.vm.guest_cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "/".into())
+        };
         let workspace = spec
             .metadata
             .get("pvisor.vm.workspace_overlay")
@@ -1310,6 +1406,7 @@ impl RunExecutor for VmExecutor {
             && self.vsock_ports.is_empty()
             && !self.settings.cold_pager_requested()
             && self.settings.prepared_rootfs.is_none()
+            && self.template.is_none()
         {
             let prepared = if let Some(drivers) = &context.drivers {
                 let store = match drivers.execution_snapshot_store() {
@@ -1429,6 +1526,7 @@ impl RunExecutor for VmExecutor {
             firmware_path: self.firmware_path.clone(),
             checkpoint,
             restore: None,
+            template: None,
         };
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
@@ -1446,6 +1544,12 @@ impl RunExecutor for VmExecutor {
             if let Err(error) = apply_restore(&mut runner, restore, context) {
                 return failed_to_start(format!("restore launch contract: {error:#}"));
             }
+        }
+        if let Some(template) = &self.template
+            && let Err(error) =
+                super::templates::apply(template, &mut runner, context.attempt_id().as_str())
+        {
+            return failed_to_start(format!("template launch contract: {error:#}"));
         }
         if let Err(error) = hide_host_authority(
             &mut runner.root,
@@ -2202,6 +2306,9 @@ pub fn run_internal_if_requested() -> anyhow::Result<bool> {
 
 fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
     spec.features.validate(crate::RunExecutorKind::Vm)?;
+    // Pin the shared tree in the actual VMM process before entering Landlock.
+    // A detached supervisor crash must not let GC reclaim a live runner's lowers.
+    let template_lease = super::templates::runner_lease(&spec)?;
     let _direct_lowers = crate::image::cache::attach_runner_lowers(
         spec.root.lowers.iter().chain(
             spec.workspace
@@ -2211,7 +2318,7 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
     )?;
     // Acquire before Landlock and hold until the VM has stopped. Copy restores
     // use ordinary fingerprints; the original generation is no longer leased.
-    let baseline_owners = if spec.restore.is_none() {
+    let baseline_owners = if spec.restore.is_none() && spec.template.is_none() {
         std::iter::once(&spec.root)
             .chain(spec.workspace.iter())
             .map(lease_overlay_baseline)
@@ -2247,15 +2354,24 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64")
     ))]
-    let restore = if spec.restore.is_some() {
+    let restore = if spec.restore.is_some() || spec.template.is_some() {
         let ram = std::env::var(RAM_FD_ENV)?.parse::<RawFd>()?;
         anyhow::ensure!(ram == RAM_CHILD_FD, "invalid restore RAM descriptor");
         if unsafe { libc::fcntl(ram, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        Some(super::checkpoint::native::machine_restore(&spec, unsafe {
-            std::fs::File::from_raw_fd(ram)
-        })?)
+        let ram = unsafe { std::fs::File::from_raw_fd(ram) };
+        Some(if spec.template.is_some() {
+            super::templates::machine_restore(
+                &spec,
+                ram,
+                template_lease
+                    .as_ref()
+                    .context("missing runner template lease")?,
+            )?
+        } else {
+            super::checkpoint::native::machine_restore(&spec, ram)?
+        })
     } else {
         None
     };
@@ -2425,25 +2541,41 @@ fn run_linked_krun(
     let cold_pager =
         spec.cold_ram_compression || std::env::var_os("PVISOR_EXPERIMENTAL_MEMORY_POOL").is_some();
     anyhow::ensure!(
-        !cold_pager || (!spec.ram_dedup && spec.restore.is_none() && spec.checkpoint.is_none()),
+        !cold_pager
+            || (!spec.ram_dedup
+                && spec.restore.is_none()
+                && spec.template.is_none()
+                && spec.checkpoint.is_none()),
         "cold pager is incompatible with dedup, snapshot restore and snapshot capture"
     );
-    if spec.restore.is_none() && !cold_pager && !spec.private_ram {
+    if spec.restore.is_none() && spec.template.is_none() && !cold_pager && !spec.private_ram {
         vm.ram_backing(unsafe { std::fs::File::from_raw_fd(ram) })?;
-    } else if spec.restore.is_none() {
+    } else if spec.restore.is_none() && spec.template.is_none() {
         // Bookkeeping FD is not guest RAM. Close it; dedup/paging uses private
         // anonymous memory and must never masquerade as shared file backing.
         // Restored RAM has already transferred this descriptor to MachineRestore;
         // constructing another File here would close its still-owned mapping FD.
         drop(unsafe { std::fs::File::from_raw_fd(ram) });
     }
-    if spec.checkpoint.is_some() {
+    if spec.checkpoint.is_some() || spec.template.is_some() {
         vm.snapshot_profile()?;
     }
     // Both cold launch and restore configure the same built-in supervisor.
     // Restore verifies its virtual inode and restores the saved consumed state;
     // disabling it would change the captured device configuration.
 
+    let (template_input, mut handoff) = match super::templates::handoff(&spec, &guest)? {
+        Some(super::templates::Handoff {
+            writer,
+            reader,
+            task,
+        }) => (Some(reader), Some((writer, task))),
+        None => (None, None),
+    };
+    if let Some(reader) = &template_input {
+        vm.disable_implicit_init()?;
+        vm.task_stdio(reader.as_raw_fd(), libc::STDOUT_FILENO, libc::STDERR_FILENO)?;
+    }
     // OverlayFs cannot service FUSE_SETUPMAPPING; keep DAX disabled.
     add_vm_overlay(
         &mut vm,
@@ -2451,13 +2583,15 @@ fn run_linked_krun(
         &spec.root,
         baseline_indexes.first().cloned().flatten(),
     )?;
-    vm.virtual_file(
-        "/dev/root",
-        "/.pvisor-guest.json",
-        guest_config,
-        0o400,
-        true,
-    )?;
+    if spec.template.is_none() {
+        vm.virtual_file(
+            "/dev/root",
+            "/.pvisor-guest.json",
+            guest_config,
+            0o400,
+            true,
+        )?;
+    }
     if let Some(workspace) = &spec.workspace {
         add_vm_overlay(
             &mut vm,
@@ -2524,7 +2658,17 @@ fn run_linked_krun(
                 ),
             }
         }
-        if spec.restore.is_some() {
+        if let Some((mut writer, task)) = handoff.take() {
+            // Keep the input descriptor alive through VM execution. The console
+            // retains its own fd owner; the writer has a bounded host timeout.
+            std::thread::Builder::new().name("pvisor-template-task".into()).spawn(move || {
+                if let Err(error) = pvisor_guest::control::write_frame(&mut writer, &task) {
+                    eprintln!("template task delivery failed: {error}");
+                    std::process::exit(1);
+                }
+            })?;
+        }
+        if spec.restore.is_some() || spec.template.is_some() {
             handle.resume().map_err(std::io::Error::other)?;
         }
         #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
@@ -2565,7 +2709,7 @@ fn run_linked_krun(
                             handle.resume().map(|()| (VmState::Running, None))
                         }
                         Ok(OperationKind::RunOffload { .. }) => {
-                            if cold_pager || spec.private_ram {
+                            if cold_pager || spec.private_ram || spec.template.is_some() {
                                 rejection_state = handle.is_paused().ok().map(|paused|
                                     if paused { VmState::Paused } else { VmState::Running });
                                 Err("whole-VM offload requires writable shared RAM backing".into())
@@ -2624,6 +2768,7 @@ fn run_linked_krun(
             })?;
         Ok(())
     });
+    drop(template_input);
     if let Err(error) = started {
         // A failed build cannot leave an accepted execution receipt.
         attestation.set_len(0)?;
@@ -2710,7 +2855,7 @@ mod feature_tests {
     }
 }
 
-fn prepare_network_resolver(
+pub(super) fn prepare_network_resolver(
     overlay: &mut OverlayDeviceSpec,
     temporary: &Path,
     enabled: bool,
@@ -2737,7 +2882,7 @@ fn prepare_network_resolver(
     Ok(())
 }
 
-fn add_vm_overlay(
+pub(super) fn add_vm_overlay(
     vm: &mut pvisor_vm::api::VmBuilder,
     tag: &str,
     overlay: &OverlayDeviceSpec,

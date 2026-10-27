@@ -373,7 +373,10 @@ impl VmConfiguration for VmBuilder {
                         .map(|p| path(p))
                         .collect::<io::Result<_>>()?,
                     lower_mutability: if overlay.lower_mutability.is_empty() {
-                        vec![pvisor_overlay_core::LayerMutability::Immutable; overlay.lower_dirs.len()]
+                        vec![
+                            pvisor_overlay_core::LayerMutability::Immutable;
+                            overlay.lower_dirs.len()
+                        ]
                     } else {
                         overlay.lower_mutability
                     },
@@ -675,6 +678,53 @@ impl FrozenMemory for FrozenMachine<'_> {
     }
 }
 impl SnapshotState for MachineSnapshot {
+    fn rebind_vsock_ports(&mut self, ports: &[(u32, PathBuf, bool)]) -> io::Result<usize> {
+        #[cfg(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        ))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let mut unique = std::collections::BTreeSet::new();
+            if ports.len() > 64
+                || ports.iter().any(|(port, path, _)| {
+                    *port == 0
+                        || !unique.insert(*port)
+                        || !path.is_absolute()
+                        || path.as_os_str().as_bytes().contains(&0)
+                        || path.as_os_str().as_bytes().len() >= 104
+                        || path
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid fresh vsock port mapping",
+                ));
+            }
+            let mut internal: crate::vmm::snapshot::MachineSnapshot =
+                serde::Deserialize::deserialize(&self.state).map_err(io::Error::other)?;
+            let mut count = 0;
+            for mapping in &mut internal.devices {
+                if let crate::devices::snapshot::BusDeviceSnapshot::Virtio(device) =
+                    &mut mapping.device
+                {
+                    count += usize::from(device.rebind_vsock_ports(ports)?);
+                }
+            }
+            self.state = serde_json::to_value(internal).map_err(io::Error::other)?;
+            Ok(count)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        )))]
+        {
+            let _ = ports;
+            Err(unsupported("fresh vsock endpoints"))
+        }
+    }
     fn has_kernel_layout(&self) -> io::Result<bool> {
         match self.state.get("kernel_layout") {
             None | Some(serde_json::Value::Null) => Ok(false),

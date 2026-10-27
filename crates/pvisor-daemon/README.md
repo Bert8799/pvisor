@@ -157,6 +157,70 @@ No security audit or hostile multi-user assurance is claimed.
 
 ## State, concurrency and failure behavior
 
+### Native inert VM templates
+
+An optional local prepared-image `template` selects a credential-free VM snapshot
+instead of cold boot. This is an operator setting; the OpenSandbox template and
+snapshot HTTP APIs remain unsupported. Prepare with the **same daemon binary,
+host boot and firmware** that will serve instances:
+
+```sh
+pvisor-daemon template-prepare --rootfs /srv/images/agent --guest /path/to/pvisor-guest \
+  --catalog /srv/pvisor-templates --name agent --cpus 2 --memory-mib 128 \
+  --work-dir /srv/pvisor-template-work
+```
+
+The work directory must already exist and be trusted. The preparer creates a
+private temporary child, starts only the inert guest supervisor, then freezes
+CPU/devices/RAM together and publishes a generation. The parent reaps the worker
+and removes staging on normal completion or failure, with a 90-second budget.
+On Linux, parent death kills its worker; an abrupt parent death can leave private
+staging files for later removal. Publication can succeed before an error or lost
+response: inspect the catalog selection before retrying. Pass `--expected OLD_ID`
+to conditionally update an alias; omission is create-only. Never overwrite a
+generation. Alias removal/collection retain the catalog's lease rules.
+
+The JSON result contains `spec.image_sha256`. Add the selection to the existing
+prepared-image manifest, retaining its bootstrap/service contract:
+
+```json
+{
+  "rootfs": "/srv/images/agent",
+  "entrypoint": ["/guest/bootstrap", "--"],
+  "cwd": "/work",
+  "template": {
+    "catalog": "/srv/pvisor-templates",
+    "name": "agent",
+    "image_sha256": "<spec.image_sha256 from preparation>"
+  }
+}
+```
+
+Images and catalog must be independent of each other and daemon state. The
+operator keeps the provisioned image immutable and free of per-instance secrets;
+the manifest digest binds the intended image without rescanning the image at
+every create. A changed image, guest supervisor, daemon build, firmware, host
+boot or VM sizing needs a compatible new capture/selection. Requests must match
+the captured vCPU/RAM budget exactly; there is no implicit cold fallback. The
+experimental memory pool cannot be combined with template COW RAM.
+
+Create holds a generation lease and persists its exact ID before launching the
+detached supervisor. The supervisor acquires that ID rather than looking up the
+alias again, retaining its lease through VM teardown. Normal generation/token,
+private state, cgroup admission and deletion proofs remain in force. Every new
+Attempt shares the generation's sealed read-only rootfs, with its own upper/work,
+private COW RAM writes, fresh network backend and private vsock publication. Only then is one fresh task sent: request
+argv/env plus the manifest cwd (default `/`), new Attempt identity and host random
+entropy. No bootstrap/service process runs in the captured template. The runner
+does not inherit workload stdin or accept a second task.
+
+Create/Inspect/resume still require the existing **real** execd/egress or envd
+health/authentication checks. Template handoff readiness is not service readiness.
+The real bootstrap and SDK end-to-end coverage remain deployment prerequisites;
+VM template component tests do not supply those services or cgroup delegation.
+
+### Ownership and reconciliation
+
 - One daemon exclusively locks a private state directory. Owner identity and
   sandbox records are atomically persisted before native creation/control.
 - Runtime operations use core `AgentCtlHostRequest`/`AgentCtlHostResponse` version-1

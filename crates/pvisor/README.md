@@ -418,6 +418,9 @@ and [configuration example](../../docs/src/en/reference/config.md#vm-control-mem
 `TemplateSpec` binds a fresh generation, source-image inventory, exact guest
 supervisor digest, CPU/RAM sizing, console topology and existing host/build/
 firmware compatibility, with the distinct `pvisor-inert-template-v1` profile.
+An optional `network_mac` binds one pristine virtio-net device; each restored VM
+must supply a fresh isolated backend with that exact MAC. Omission preserves
+existing network-free version-1 recipe identities.
 `prepare_rootfs` verifies and independently
 copies the source, then installs the supervisor and credential-free template
 boot document. Existing init/config files are never overwritten. The guest waits
@@ -450,6 +453,10 @@ for the VM runtime's private COW mapping. Callers rebind filesystem paths,
 install the matching machine topology and resume through the VM API, then send
 one fresh task with its instance identity and entropy.
 
+`acquire_version` pins an already admitted generation directly, even after an
+alias update or removal. Keep the admitting lease until the recipient has
+acquired its own lease; reclaimed versions fail without substitution or revival.
+
 `remove` conditionally unselects an alias. Explicit `collect` reclaims only
 unselected generations without live leases; another generation's reader does
 not block that reclamation. Live builders are skipped, abandoned build/selection
@@ -460,12 +467,34 @@ Empty generation lock markers remain as identity-reuse fences, without retaining
 RAM or filesystem payloads; reclaimed generations cannot be published again.
 Private state must remain host-owned, guest-inaccessible and externally unmodified.
 
-This is the template preparation/storage foundation. The Daemon creation path
-does not yet select these generations or hand off new tasks. Existing native
-execution restore retains its no-network restrictions; this API does not make
-network snapshots, application credentials/identity cloning or service readiness
-supported. A general prepared-rootfs catalog entry is a different object and
-cannot be used as a template generation.
+`TemplateSpec::native_overlay` selects a capsule containing `rootfs/`, private
+`upper/` and `work/`, and the native resolver lower. The capsule is captured as
+one tree. `VmExecutor::capture_template` boots only the inert supervisor in an
+isolated synchronous preparer process; the parent must reap it and reclaim its
+staging directory. It must never be called inside a service/Tokio host.
+`VmExecutor::from_template` retains a generation lease, materializes private
+upper/work, shares the generation's sealed read-only lowers, and uses the normal
+self-exec runner, live controls and cancellation.
+Each executor admits one Attempt; reuse after success or failure is rejected.
+The actual VMM child also acquires the fixed generation before its sandbox and
+retains it through teardown, fencing GC independently of supervisor survival.
+Rebound lowers use conservative Mutable declarations, matching the snapshot
+API's new backing lifetime; the runner enforces read-only host access to their
+sealed physical trees. Instance writes use copy-up into private upper/work.
+RAM remains a read-only baseline with private COW mappings;
+there is no per-instance eager RAM copy or resident prewarming VM.
+
+The runner binds fresh network/vsock endpoints and sends one new task, with a
+new Attempt identity and host CSPRNG entropy, after restoring. Workload stdin
+must be closed, console topology must match, and PTYs are unsupported. Explicit
+backing/paging/pool modes, CPU QoS overrides, managed workspace overlays and
+execution checkpoints are unsupported in this initial native template profile.
+Ordinary native execution checkpoint/restore retains its separate no-network
+contract. The daemon's local prepared-image manifest can select these templates;
+see its README for preparation, fixed-version handoff and service-readiness rules.
+A general prepared-rootfs catalog entry is a different object and cannot be used
+as a VM template. This does not clone active network connections or initialized
+application credentials, and does not establish SDK conformance or latency gains.
 
 ## Resource ownership and local cold compression
 

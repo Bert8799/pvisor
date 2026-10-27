@@ -16,6 +16,8 @@ mod cpu;
 mod cpu_qos;
 #[cfg(target_os = "linux")]
 mod exit_cpu;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod templates;
 #[cfg(target_os = "linux")]
 pub use cpu_qos::CpuQosGroup;
 #[cfg(target_os = "linux")]
