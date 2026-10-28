@@ -74,6 +74,18 @@ class RegistryTests(unittest.TestCase):
                 )
                 self.assertTrue(path.with_suffix(".py").is_file())
                 continue
+            if row["status"] == "explicit-python-cli-template-pairs":
+                self.assertEqual(row["benchmark_id"], "B-TEMPLATE-CLI")
+                self.assertEqual(row["role"], "engineering A/B")
+                self.assertEqual(row["entry"], "startup/template_cli.json")
+                self.assertEqual(
+                    table,
+                    {
+                        "cold-template-paired": "$ python3 @REPO@/benchmark.new/startup/template_cli.py --json"
+                    },
+                )
+                self.assertTrue(path.with_suffix(".py").is_file())
+                continue
             if row["status"] == "explicit-python-paired-memory":
                 self.assertEqual(row["benchmark_id"], "B-MEMORY-SCALE")
                 self.assertEqual(row["role"], "engineering A/B")

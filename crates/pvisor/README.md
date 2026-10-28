@@ -500,8 +500,17 @@ externally unmodified throughout their leases, as with the original restore path
 The runner binds fresh network/vsock endpoints and sends one new task, with a
 new Attempt identity and host CSPRNG entropy, after restoring. Workload stdin
 must be closed, console topology must match, and PTYs are unsupported. Explicit
-backing/paging/pool modes, CPU QoS overrides, managed workspace overlays and
-execution checkpoints are unsupported in this initial native template profile.
+backing/paging/pool modes, CPU QoS overrides and execution checkpoints are
+unsupported. Root-only templates reject managed workspaces.
+`capture_workspace_template` additionally captures an unused `pvisor-workspace`
+device before any mount or filesystem request. Its recipe declares
+`workspace_device`; restore requires a fresh managed workspace and resets only
+that pristine device to the newly authorized backend. Previously used or legacy
+devices are rejected, and ordinary root snapshot rebinding checks remain intact.
+Guest workspace mountpoint creation occurs after the fresh task handoff, keeping
+the captured root upper unchanged through restore. CLI selection uses the public
+`VmSettings.template` catalog/version contract; embedding callers acquire a lease
+and pass settings without that unresolved selector to `from_template`.
 Ordinary native execution checkpoint/restore retains its separate no-network
 contract. The daemon's local prepared-image manifest can select these templates;
 see its README for preparation, fixed-version handoff and service-readiness rules.

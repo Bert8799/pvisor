@@ -36,6 +36,15 @@ VM staged 和 lazy image 均不建立中间宿主文件系统 FUSE 挂载。lazy
 可使用该接口，不触发解包或内核存储分配。`embedded_kernel` 仍在需要真实字节时
 惰性解包；动态固件与调用方提供的内核不使用这个摘要。
 
+`RuntimeSupport::embedded_guest` 借用普通启动实际使用的内置 guest 字节，不做 I/O
+或分配；没有 init-blob 时返回 `None`，避免模板准备使用另一个 supervisor 制品。
+
+`SnapshotState::reset_unmounted_filesystem` 只允许重置明确从未挂载、从未收到请求的
+模板设备。调用方须在首次 guest 挂载前捕获且确保没有待处理请求；快照持久化
+pristine 标记，旧快照缺少该证据时拒绝重置。恢复保留新 builder 配置的后端，
+不沿用旧 workspace 的 inode/handle 表；已使用设备拒绝重置，失败不改变快照。
+普通文件系统快照恢复及其 backing 校验不变。
+
 ## 核心接口模型
 
 所有定义集中在 `src/api.rs`，实现集中在私有适配器中。文件系统配置使用 `PathBuf`，UTF-8 校验及内部设备格式转换由运行时完成。

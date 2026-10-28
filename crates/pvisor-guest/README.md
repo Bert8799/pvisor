@@ -123,7 +123,9 @@ environment. Initial stdin must be `Closed`, with no PTY: the handoff owns stdin
 Stdout becomes ordinary workload output after the readiness frame. The host must
 consume that frame separately. No host environment is inherited or shell text
 evaluated by the handoff. Existing launch validation, supervision and final
-virtio-fs synchronization apply after receipt.
+virtio-fs synchronization apply after receipt. A workspace mountpoint is created
+in the private guest root only after this handoff, immediately before mounting
+the freshly bound workspace device; no old workspace is mounted during capture.
 
 Malformed, oversized, truncated, foreign-template or invalid tasks fail closed
 before reseeding. Failed reseeding returns no launch options. There is no second

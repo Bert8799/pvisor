@@ -90,6 +90,53 @@ python3 benchmark.new/startup/vm_ready.py --binary target/tmp/baseline-pvisor
 临时可执行副本，保留结果，无需额外执行清理脚本。独立版本批次分别统计，
 不通过通用发布器覆盖用户启动表，也不作为随机配对实验。
 
+## CLI 普通启动与模板恢复
+
+`template_cli.py` 属于 [B-TEMPLATE-CLI](../../benchmark/README.md#b-template-cli)，
+比较同一个真实 `pvisor run --vm` 制品的两种创建方式，不改变原有八后端表、
+`vm_ready.py` 或固定历史基线。正式比较只包含当前普通启动和当前模板恢复。
+注册入口为 `template_cli.json`，使用下面的专用 Python 命令执行，结果留在
+`target/tmp/`，不通过通用发布器覆盖用户表。
+
+```sh
+python3 benchmark.new/startup/template_cli.py \
+  --binary target/release/pvisor --cpu-affinity 10,11
+python3 benchmark.new/startup/template_cli.py --audit target/tmp/template-cli-BATCH
+```
+
+默认自动准备最小 shell rootfs，再由**同一个 CLI 制品**的
+`cache prepare-template` 捕获模板；两组读取同一份已封存 rootfs。
+`--rootfs` 可指定待准备的源镜像。模板制作耗时独立记录在 `preparation.json`，
+不计入 Ready。也可复用该制品已制作的固定版本：同时传入 `--catalog`、
+`--template-version` 和制作命令返回的封存 `--rootfs`；资源、内核、宿主启动身份与
+制品不兼容时直接失败。此时 `--preparation-ms` 可补充独立记录的准备成本，
+省略则表示未测。
+
+`--preflight-only` 只验证每组一次真实启动，不产生性能结果；`--json` 将进度写到
+stderr，stdout 输出机器可读的一行统计。CPU 参数必须选两个可用核心。
+CLI 的 `[vm.template]` 选择器领取不可变版本，保持正常 owner、实例控制及 workspace
+暂存；仅接受 Linux x86_64、自动 VM 网络和关闭的 stdin，不支持 PTY、原生执行
+checkpoint 或附加 RAM backing/paging 模式。失败不会回退成普通启动。
+
+脚本生成两份配置，均声明只读基础 rootfs，只有模板配置增加上述选择器；相同的
+CLI 参数固定 `--overlaynet auto`、2 vCPU / 128 MiB、新 workspace/stage 及同一
+shell 任务。任务在 Ready 前读回本次随机 workspace 标记，报告模板交接实例身份。
+普通启动必须没有该身份，模板必须有每次独立的身份，禁止静默回退普通启动。
+探针比原来的单条 printf 多了工作区和交接检查，结果不与旧 CLI 数值直接相减。
+
+两组各一次预检、3 次预热、60 次正式样本；固定 seed，30 对先普通启动、30 对先模板，
+整批前检查选定 CPU 及 SMT 同胞空闲。复用 `timing.capture` 的 Popen→完整 Ready
+时钟以及原输出、VM Bundle 和 stage 校验，统计五项 Ready 和同次 Exit。
+模板查询、租约、校验、恢复和任务交接都计时；Python、准备输入及制作模板不计时。
+本实验不保留已启动 VM，也不测预热池、完整 Agent 初始化或部署密度。
+
+证据保存在 `target/tmp/template-cli-*`：配置、二进制/观察者冻结副本、输入清单、
+预定顺序、逐次纳秒计时、输出、Bundle、工作区输入副本及自动清理回执。
+两组 128 次启动全部正确、输入不变、清理成功并独立复算通过后，才生成
+`summary.json` 和含五项 Ready 指标的 `report.md`。正式样本不剔除慢值，差值为模板减普通
+启动，附 95% 配对 bootstrap 区间；区间跨 0 时报告未检出差异。任何失败保留诊断，
+不输出成功比较、不更新用户文档。历史 SDK 数据继续只作为内部机制实验。
+
 ## TurboOCI 按需镜像对照
 
 [TurboOCI 对照协议](TURBO_OCI.md)属于 B-LAZY-STARTUP，分别比较客户端准备、

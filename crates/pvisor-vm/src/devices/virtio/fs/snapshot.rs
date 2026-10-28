@@ -13,6 +13,8 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "state", deny_unknown_fields)]
 pub enum FsSnapshot {
+    /// Explicitly reset unused device; restore retains the builder's new backend.
+    Fresh,
     Passthrough(PassthroughSnapshot),
     ReadOnly(Box<FsSnapshot>),
     Overlay(Box<super::overlay::OverlaySnapshot>),
@@ -27,6 +29,9 @@ pub enum FsSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSnapshot {
+    /// Missing legacy evidence is conservative: it cannot authorize reset.
+    #[serde(default)]
+    pub(crate) pristine: bool,
     pub(crate) options: u64,
     pub(crate) next_inode: u64,
     pub(crate) fs: FsSnapshot,
@@ -116,6 +121,14 @@ impl FileIdentity {
 }
 
 impl ServerSnapshot {
+    pub(crate) fn reset_unmounted(&mut self) -> io::Result<()> {
+        if !self.pristine || self.options != 0 {
+            return Err(invalid("filesystem was used or lacks pristine evidence"));
+        }
+        self.fs = FsSnapshot::Fresh;
+        self.next_inode = 2;
+        Ok(())
+    }
     pub(crate) fn rebind_overlay_exclusions(&mut self, paths: &[PathBuf]) -> io::Result<()> {
         fn rebind(fs: &mut FsSnapshot, paths: &[PathBuf]) -> io::Result<()> {
             match fs {
@@ -334,7 +347,7 @@ impl FsSnapshot {
             Self::ReadOnly(inner) | Self::Augment { inner, .. } => inner.validate_writeback(enabled),
             Self::Overlay(state) => state.validate_writeback(enabled),
             Self::Passthrough(state) if state.writeback == enabled => Ok(()),
-            Self::Null if !enabled => Ok(()),
+            Self::Null | Self::Fresh if !enabled => Ok(()),
             _ => Err(invalid("FUSE and backing writeback modes disagree")),
         }
     }
@@ -554,7 +567,7 @@ impl FsSnapshot {
             Self::Augment { inner, inodes, .. } => {
                 inner.contains_inode(inode) || inodes.iter().any(|i| i.0 == inode)
             }
-            Self::Null => false,
+            Self::Null | Self::Fresh => false,
         }
     }
 
@@ -566,7 +579,7 @@ impl FsSnapshot {
             Self::Augment { inner, inodes, .. } => inner
                 .max_inode()
                 .max(inodes.iter().map(|i| i.0).max().unwrap_or(1)),
-            Self::Null => 1,
+            Self::Null | Self::Fresh => 1,
         }
     }
 }

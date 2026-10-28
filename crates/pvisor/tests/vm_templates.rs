@@ -39,6 +39,7 @@ fn fixture() -> (
         stdio_ports: [true, true, false],
         network_mac: None,
         native_overlay: false,
+        workspace_device: false,
     };
     let source = root.join("source");
     spec.prepare_rootfs(&image, &guest, &source).unwrap();

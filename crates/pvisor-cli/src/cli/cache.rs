@@ -33,6 +33,8 @@ pub struct CacheArgs {
 
 #[derive(Debug, Subcommand)]
 enum CacheCommand {
+    /// Capture an inert, workspace-capable VM template for this exact CLI build.
+    PrepareTemplate(TemplateArgs),
     /// Copy a quiescent local rootfs into a durable, private VM base catalog.
     PrepareRootfs {
         /// Independent source tree; never the live host root or the base store.
@@ -86,7 +88,154 @@ enum CacheCommand {
     Read { digest: String, path: PathBuf },
 }
 
+#[derive(Debug, Args)]
+struct TemplateArgs {
+    /// Quiescent image without init.krun or template configuration; never host /.
+    #[arg(long)]
+    rootfs: PathBuf,
+    /// Private template catalog, outside workspace and image.
+    #[arg(long)]
+    catalog: PathBuf,
+    /// Alias published on success; runs select the returned immutable version.
+    #[arg(long, default_value = "cli")]
+    name: String,
+    /// Replace this exact previously selected version; omission creates an alias.
+    #[arg(long)]
+    expected: Option<String>,
+    /// Existing parent of private temporary capture backing.
+    #[arg(long)]
+    work_dir: PathBuf,
+    #[arg(long, default_value_t = 2)]
+    cpus: u16,
+    #[arg(long, default_value_t = 128)]
+    memory_mib: u32,
+    #[arg(long)]
+    library_dir: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    template_worker_stage: Option<PathBuf>,
+}
+
+fn prepare_template(args: &TemplateArgs) -> anyhow::Result<()> {
+    use pvisor::environment_snapshot::templates::{PROFILE, TemplateCatalog, TemplateVersion};
+    use std::os::unix::fs::PermissionsExt;
+    anyhow::ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "CLI templates require Linux x86_64"
+    );
+    let image = args.rootfs.canonicalize()?;
+    let catalog_path = super::run::canonical_candidate(&args.catalog)?;
+    super::host_service::reject_guest_exposure([image.clone(), catalog_path.clone()])?;
+    anyhow::ensure!(
+        image != std::path::Path::new("/")
+            && !image.starts_with(&catalog_path)
+            && !catalog_path.starts_with(&image),
+        "template source and catalog must be independent; host / is forbidden"
+    );
+    let settings = pvisor::VmSettings {
+        rootfs: Some(image),
+        rootfs_immutable: true,
+        cpus: args.cpus,
+        memory_mib: args.memory_mib,
+        library_dir: args.library_dir.clone(),
+        ..Default::default()
+    };
+    if let Some(stage) = &args.template_worker_stage {
+        use pvisor_vm::api::RuntimeSupport;
+        let guest = stage.join("pvisor-guest");
+        let bytes = pvisor_vm::api::VmPlatform::embedded_guest()
+            .ok_or_else(|| anyhow::anyhow!("this CLI has no embedded guest supervisor"))?;
+        std::fs::write(&guest, bytes)?;
+        return pvisor::VmExecutor::new(settings)?.capture_workspace_template(
+            TemplateCatalog::new(&catalog_path)?,
+            &args.name,
+            args.expected.as_deref(),
+            &guest,
+            stage,
+            &uuid::Uuid::new_v4().to_string(),
+        );
+    }
+    let work = args.work_dir.canonicalize()?;
+    let stage = tempfile::Builder::new()
+        .prefix("template-build-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(work)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(std::env::args_os().skip(1))
+        .arg("--template-worker-stage")
+        .arg(stage.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("template preparation timed out; inspect catalog before retry");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    anyhow::ensure!(
+        status.success(),
+        "template preparation failed; inspect catalog before retry"
+    );
+    use std::io::Read;
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .take(1 << 20)
+        .read_to_end(&mut output)?;
+    let version: TemplateVersion = serde_json::from_slice(&output)?;
+    let mut compatibility = pvisor::VmExecutor::checkpoint_compatibility(&settings)?;
+    compatibility.profile = PROFILE.into();
+    let lease =
+        TemplateCatalog::new(&catalog_path)?.acquire_version(&version.id, &compatibility)?;
+    let rootfs = lease
+        .environment()
+        .owned_layer_path(std::path::Path::new("rootfs"))?;
+    stage.close()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "catalog":catalog_path, "version":version.id, "rootfs":rootfs, "recipe":version.spec
+        }))?
+    );
+    Ok(())
+}
+
 pub fn run(args: CacheArgs) -> anyhow::Result<()> {
+    if let CacheCommand::PrepareTemplate(template) = &args.command {
+        anyhow::ensure!(
+            args.backend.is_none()
+                && args.location.is_none()
+                && !args.read_only
+                && args.image_store.is_none(),
+            "prepare-template is a local operation"
+        );
+        return prepare_template(template);
+    }
     let prepared_source = match &args.command {
         CacheCommand::PrepareRootfs { rootfs, base_store } => Some(("rootfs", rootfs, base_store)),
         CacheCommand::PrepareWorkspace {
@@ -193,7 +342,9 @@ pub fn run(args: CacheArgs) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        CacheCommand::PrepareRootfs { .. } | CacheCommand::PrepareWorkspace { .. } => {
+        CacheCommand::PrepareRootfs { .. }
+        | CacheCommand::PrepareWorkspace { .. }
+        | CacheCommand::PrepareTemplate(_) => {
             unreachable!()
         }
     };

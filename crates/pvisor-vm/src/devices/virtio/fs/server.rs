@@ -12,7 +12,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use vm_memory::ByteValued;
@@ -83,6 +83,7 @@ pub struct Server<F: FileSystem + Sync> {
     fs: F,
     guest_cache: bool,
     options: AtomicU64,
+    used: AtomicBool,
 }
 
 /// Accepted READDIRPLUS entries acquire references before they are serialized.
@@ -112,6 +113,7 @@ impl<F: FileSystem + Sync> Server<F> {
             fs,
             guest_cache,
             options: AtomicU64::new(FsOptions::empty().bits()),
+            used: AtomicBool::new(false),
         }
     }
 
@@ -161,12 +163,22 @@ impl<F: FileSystem + Sync> Server<F> {
             FsOptions::from_bits_truncate(options).contains(FsOptions::WRITEBACK_CACHE),
         )?;
         Ok(super::snapshot::ServerSnapshot {
+            pristine: !self.used.load(Ordering::Relaxed),
             options,
             next_inode,
             fs,
         })
     }
     pub fn restore_state(&self, state: &super::snapshot::ServerSnapshot) -> io::Result<()> {
+        if matches!(state.fs, super::snapshot::FsSnapshot::Fresh) {
+            if !state.pristine || state.options != 0 || state.next_inode != 2
+                || self.used.load(Ordering::Relaxed) {
+                return Err(super::snapshot::invalid("invalid unused filesystem reset"));
+            }
+            // No FUSE request or kernel identity exists. Keep the separately
+            // constructed, authorized current workspace rather than old paths.
+            return Ok(());
+        }
         if FsOptions::from_bits(state.options).is_none() {
             return Err(super::snapshot::invalid("invalid FUSE options"));
         }
@@ -183,6 +195,7 @@ impl<F: FileSystem + Sync> Server<F> {
         )?;
         self.fs.restore_state(&state.fs)?;
         self.options.store(state.options, Ordering::Relaxed);
+        self.used.store(!state.pristine, Ordering::Relaxed);
         Ok(())
     }
 
@@ -198,6 +211,11 @@ impl<F: FileSystem + Sync> Server<F> {
         // The execution layer decodes the header once before choosing the
         // session guard. Never reread guest-controlled opcode after admission.
         let (in_header, r) = message;
+        // Never clear this fence, including DESTROY; zero negotiated options or
+        // an empty handle table alone cannot prove the guest never mounted it.
+        if !self.used.load(Ordering::Relaxed) {
+            self.used.store(true, Ordering::Relaxed);
+        }
 
         let label = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => "LOOKUP",
@@ -2632,6 +2650,29 @@ mod guest_cache_tests {
             ));
         }
         assert_eq!(server.fs.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unused_filesystem_reset_is_explicit_and_rejects_used_or_legacy_servers() {
+        let server = Server::new(NullFs, false);
+        let mut state = server.capture_state(2).unwrap();
+        assert!(state.pristine);
+        state.reset_unmounted().unwrap();
+        let destination = Server::new(NullFs, false);
+        destination.restore_state(&state).unwrap();
+        assert!(matches!(destination.capture_state(2).unwrap().fs, super::super::snapshot::FsSnapshot::Null));
+
+        let mut legacy = state.clone();
+        legacy.pristine = false;
+        assert!(legacy.reset_unmounted().is_err());
+        assert!(Server::new(NullFs, false).restore_state(&legacy).is_err());
+        let _ = negotiate(&server, FsOptions::empty());
+        let mut used = server.capture_state(2).unwrap();
+        assert!(!used.pristine);
+        let before = serde_json::to_value(&used).unwrap();
+        assert!(used.reset_unmounted().is_err());
+        assert_eq!(serde_json::to_value(&used).unwrap(), before);
+        assert!(server.restore_state(&state).is_err());
     }
 
     fn negotiate<F: FileSystem + Sync>(server: &Server<F>, capable: FsOptions) -> FsOptions {

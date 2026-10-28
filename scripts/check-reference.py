@@ -18,6 +18,7 @@ GROUPS = [
     (CONFIG, "ContainerSettings", "container."),
     (CONFIG, "ContainerMount", "container.mounts[]."),
     (CONFIG, "VmSettings", "vm."),
+    (CONFIG, "VmTemplate", "vm.template."),
     (CONFIG, "PreparedBase", "vm.prepared_rootfs."),
     (CONFIG, "BaseReference", "vm.prepared_rootfs.base."),
     (CONFIG, "OverlayFsSettings", "overlayfs."),

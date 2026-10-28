@@ -6,6 +6,22 @@ use pvisor_vm::api::{
 use syn::visit::{self, Visit};
 
 #[test]
+fn embedded_guest_is_an_immutable_optional_bootstrap() {
+    use api::RuntimeSupport;
+    let bytes = api::VmPlatform::embedded_guest();
+    if cfg!(feature = "init-blob") {
+        let bytes = bytes.expect("enabled embedded guest");
+        assert!(bytes.starts_with(b"\x7fELF"));
+        assert!(std::ptr::eq(
+            bytes,
+            api::VmPlatform::embedded_guest().unwrap()
+        ));
+    } else {
+        assert!(bytes.is_none());
+    }
+}
+
+#[test]
 fn read_only_filesystem_configuration_is_atomic_without_dax() {
     let root = tempfile::tempdir().unwrap();
     let mut builder = VmBuilder::new(1, 128).unwrap();

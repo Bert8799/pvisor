@@ -631,6 +631,14 @@ Design: 负载、对照、控制变量与有效样本判据。
 - **实验设计：** 独立诊断批次，直通 FUSE 仅为不含暂存语义的下限；插桩计时与正式性能采样分开。`immutable_lower_cache.py --profiles` 保留每个 PID/component/instance 的所有累计 records，以各实例 final record 比较 physical parent/leaf stats 和 cache hits/misses/evictions；inclusive spans 不相加。真实 mount 若被拒绝，保留失败并仅以明确标记的 core 机制实验补充，不替代 FUSE 结果。
 - **入口脚本：** `filesystem_fuse_ab.py`、`filesystem_stage_ab.py`、`filesystem_kernel_probe.py`、`filesystem_exec_probe.py`、`filesystem_counters.py`、`filesystem_diagnostic.py`、`immutable_lower_cache.py --profiles`。`filesystem_stage_durability.py --profiles` 也服务此诊断条目；不开启 profile 时服务 B-FS-ENG。`filesystem_exec_probe.py` 在新 VM 中比较相同可执行文件、loader 和全部动态库从 virtio-fs 与匿名 RAM 执行；两组都先复制并校验所有输入、传递相同 fd，避免将准备成本混入 exec。准备来源分为原始文件和独立副本：前者预热原 inode，后者从工作区独立 inode 读入相同字节，保留原工具文件首次映射的机会；共同的 Python 准备仍会预热解释器及部分共享库，不能称为完全冷启动。首个 exec 与后续重复 exec 分开，且不由热路径的零差异否定首次映射成本。guest `/dev/shm` 保持 noexec，使用显式 executable memfd；不重挂载或放宽策略。独立 VM 的完整计数器包含相同准备与指定次数 exec，差异用于请求归因，不能当作完整 Agent 启动水位。
 
+### B-TEMPLATE-CLI：CLI 普通启动与模板恢复 {#b-template-cli}
+
+- **角色：** engineering A/B，不覆盖原有启动用户表或固定 CLI 基线。
+- **Motivation：** 用户从真实 CLI 发起相同任务时，使用已准备模板能少等多久？
+- **想要的结论：** 同一 release 制品的普通启动和模板恢复的五项 Ready 统计，以及中位数差的 95% 配对 bootstrap 区间。
+- **实验设计：** 两组均直接执行 `pvisor run --vm`，保留前端、owner、实例控制、独立 workspace/stage、Bundle 和自动清理；同一 rootfs、shell 探针、网络设置、2 vCPU / 128 MiB 和两核亲和性。3 次预热、60 对预定随机交替样本，热缓存，关闭额外 KVM_RUN 暂停。复用 `timing.capture`、输出和 Bundle/stage 校验；额外要求 guest 读回本次 workspace 随机标记，并报告模板交接身份，拒绝冷启动回退和重复实例。模板查找、租约、校验、恢复、任务交接均计时；镜像/模板预准备不计时，准备成本单列。保留全部有效慢样本，任意失败不生成比较结论。结果和冻结证据保存在 `target/tmp/template-cli-*`。
+- **入口：** `benchmark.new/startup/template_cli.py`。默认调用同一 CLI 的 `cache prepare-template` 自动准备模板，两组读取同一封存 rootfs；支持只做预检、JSON 输出和离线审计。保留真实 workspace/stage，具体用法见启动目录 README。
+
 ### B-STARTUP-ENG：初始化实现的工程 A/B {#b-startup-eng}
 
 - **角色：** engineering A/B

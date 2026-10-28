@@ -471,6 +471,10 @@ impl VmExecutor {
     }
     pub fn new(mut settings: VmSettings) -> anyhow::Result<Self> {
         anyhow::ensure!(
+            settings.template.is_none(),
+            "unresolved vm.template selector; authenticate a lease and use from_template"
+        );
+        anyhow::ensure!(
             settings.prepared_rootfs.is_none() || settings.snapshot_filesystem_pool.is_none(),
             "CAPABILITY_UNSUPPORTED: prepared rootfs cannot use an execution checkpoint filesystem pool"
         );
@@ -720,7 +724,8 @@ impl VmExecutor {
     /// Linux x86_64 only; exact build, firmware, sizing and network topology must
     /// match. Shares sealed read-only filesystem lowers and baseline RAM, with
     /// private upper/work and COW RAM writes. Caller owns private storage and reclaims partial preparation
-    /// after failure. Managed workspace/stage/apply profiles are unsupported.
+    /// after failure. Workspace-capable recipes accept a fresh managed stage;
+    /// existing execution checkpoint restore and cold-RAM modes remain unsupported.
     pub fn from_template(
         settings: VmSettings,
         lease: crate::environment_snapshot::templates::TemplateLease,
@@ -748,6 +753,37 @@ impl VmExecutor {
         stage: &Path,
         generation: &str,
     ) -> anyhow::Result<()> {
+        self.capture_template_profile(catalog, name, expected, guest, stage, generation, false)
+    }
+
+    /// Capture an inert template with an unused workspace device for CLI Jobs.
+    /// Uses the same isolated-process, immutable-source and parent-owned cleanup
+    /// contract as `capture_template`. The device is never mounted before task
+    /// handoff; restore requires a fresh workspace and does not inherit old files.
+    /// Linux x86_64 only; ordinary root-only Daemon templates are unchanged.
+    pub fn capture_workspace_template(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+    ) -> anyhow::Result<()> {
+        self.capture_template_profile(catalog, name, expected, guest, stage, generation, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_template_profile(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+        workspace_device: bool,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.template.is_none()
                 && self.vsock_ports.is_empty()
@@ -768,7 +804,16 @@ impl VmExecutor {
             self.restore.is_none(),
             "a restored execution cannot become a template preparer"
         );
-        super::templates::capture(self, catalog, name, expected, guest, stage, generation)
+        super::templates::capture(
+            self,
+            catalog,
+            name,
+            expected,
+            guest,
+            stage,
+            generation,
+            workspace_device,
+        )
     }
 
     pub(super) fn firmware_path(&self) -> Option<&Path> {
@@ -1004,11 +1049,6 @@ impl RunExecutor for VmExecutor {
         {
             return failed_to_start("template handoff requires closed workload stdin".into());
         }
-        if self.template.is_some() && spec.metadata.contains_key("pvisor.vm.workspace_overlay") {
-            return failed_to_start(
-                "native templates do not support managed workspace overlays".into(),
-            );
-        }
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
@@ -1063,7 +1103,13 @@ impl RunExecutor for VmExecutor {
                 root.display()
             ));
         }
-        let guest_cwd = if self.template.is_some() {
+        let guest_cwd = if let Some(path) = spec
+            .metadata
+            .get("pvisor.vm.guest_cwd")
+            .and_then(serde_json::Value::as_str)
+        {
+            PathBuf::from(path)
+        } else if self.template.is_some() {
             invocation
                 .cwd
                 .as_deref()
@@ -1197,14 +1243,21 @@ impl RunExecutor for VmExecutor {
             }
         };
         let runner_root = root.clone();
-        let root_upper = temporary.path().join("root-upper");
+        let root_upper = self.template.as_ref().map_or_else(
+            || temporary.path().join("root-upper"),
+            |template| template.root_overlay().upper,
+        );
         let root_work = temporary.path().join("root-work");
         if let Err(error) =
             std::fs::create_dir_all(&root_upper).and_then(|()| std::fs::create_dir_all(&root_work))
         {
             return failed_to_start(format!("prepare libkrun root overlay: {error}"));
         }
-        let mut root_overlay = if root_overlay.upper.as_os_str().is_empty() {
+        let mut root_overlay = if let Some(template) = &self.template {
+            let mut root = template.root_overlay();
+            root.access_policy = root_overlay.access_policy;
+            root
+        } else if root_overlay.upper.as_os_str().is_empty() {
             OverlayDeviceSpec {
                 lowers: root_overlay.lowers,
                 lower_mutability: root_overlay.lower_mutability,
@@ -1256,8 +1309,9 @@ impl RunExecutor for VmExecutor {
             .get("pvisor.network.driver")
             .and_then(serde_json::Value::as_str)
             == Some("vm-smoltcp");
-        if let Err(error) =
-            prepare_network_resolver(&mut root_overlay, temporary.path(), vm_network_enabled)
+        if self.template.is_none()
+            && let Err(error) =
+                prepare_network_resolver(&mut root_overlay, temporary.path(), vm_network_enabled)
         {
             return failed_to_start(format!("prepare VM synthetic resolver: {error}"));
         }
@@ -1291,7 +1345,12 @@ impl RunExecutor for VmExecutor {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let upper_mountpoint =
                         guest_path_in_root(&root_upper, target).expect("validated guest target");
-                    if let Err(error) = std::fs::create_dir_all(&upper_mountpoint) {
+                    // Keep captured backing byte-for-byte unchanged through
+                    // snapshot rebinding. The resumed guest creates its own
+                    // mount point after receiving the fresh task instead.
+                    if self.template.is_none()
+                        && let Err(error) = std::fs::create_dir_all(&upper_mountpoint)
+                    {
                         return failed_to_start(format!("create guest overlay target: {error}"));
                     }
                 }

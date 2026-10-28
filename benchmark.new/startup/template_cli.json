@@ -1,0 +1,3 @@
+{
+  "cold-template-paired": "$ python3 @REPO@/benchmark.new/startup/template_cli.py --json"
+}

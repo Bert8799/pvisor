@@ -237,6 +237,24 @@ or a read-access heat detector, and does not promise production density.
 
 `[vm].snapshot_filesystem_pool` opts into immutable lower references during native capture of initial and restored VMs, including the first capture of different VMs. After the first seal, the live control connection retains verified owners; subsequent captures authenticate complete original lowers and reuse their sealed pool trees without broader runner access. Native callers should use an absolute host-owned path on the same volume as Job stores, outside all VM-writable roots and snapshot stores. The first miss creates one pool copy per immutable id; concurrent misses serialize per id and hits create no temporary lower copies. Opt-in native v5 snapshots retain private file contents as independently owned 64 KiB compressed frames, reusing unchanged content; restores rebuild private writable inodes with complete metadata and hard-link topology. Live frame owners survive parent retirement/GC. Sealing checks decoded-content identities before compression, fully verifies pool hits and encodes only misses; this also applies to full compressed RAM sealing. Native capture encodes authenticated frozen private roots directly, without an intermediate private-tree copy; import, restore and suspended artifact export never open their recorded original paths. Complete data validation remains; latency/density benefits require measurement. This profile excludes networking, shared memory pools, ordinary and live cold RAM compression, and explicit RAM backing. Retain the pool with its Job stores or export complete snapshots.
 
+### VM templates {#vm-template}
+
+`vm.template` selects an inert VM template created by the same CLI's
+`pvisor cache prepare-template` command. Set `[run] executor = "vm"` and provide
+the returned `catalog` and immutable 64-digit `version` under `[vm.template]`.
+Omitting this selector retains ordinary cold startup. The template's sealed
+rootfs is resolved automatically; an explicit `--rootfs` must equal the returned
+sealed path. `vm.prepared_rootfs` and `vm.image` cannot be combined with it.
+
+CLI template runs require Linux x86_64, automatic VM networking, stdin redirected
+from `/dev/null`, and matching build, firmware, host boot identity, CPU and RAM
+settings. The catalog must be outside the workspace and stage. Each launch uses
+a fresh managed workspace, private writes and COW RAM, fresh network endpoints,
+instance identity and entropy; normal review/apply and instance control remain.
+Interactive input, PTYs, native execution checkpoints, CPU QoS overrides and
+explicit RAM backing/paging/pool profiles are unsupported. Incompatible requests
+fail without falling back to cold startup.
+
 ### Sealed rootfs {#prepared-rootfs}
 
 `vm.prepared_rootfs` selects a physical base durably retained by
@@ -351,6 +369,9 @@ Field names and types are checked against the Rust serde structures during the d
 | `container.mounts[].source` | `PathBuf` | `required` | Host path |
 | `container.mounts[].target` | `PathBuf` | `required` | Container path |
 | `container.mounts[].read_only` | `bool` | `false` | Read-only bind mount |
+| `vm.template` | `Option<VmTemplate>` | `unset` | Fixed inert VM template selector; CLI only; omitted keeps cold startup |
+| `vm.template.catalog` | `PathBuf` | `unset` | Required when selected; private existing template catalog, outside workspace and stage |
+| `vm.template.version` | `String` | `unset` | Required when selected; exact immutable 64-digit lowercase generation ID returned by preparation; aliases rejected |
 | `vm.control_socket` | `Option<PathBuf>` | `unset` | Host-only live Attempt endpoint; default automatic private socket; existing same-UID 0700 parent and new path required; `--vm-control-socket` |
 | `vm.ram_backing` | `Option<PathBuf>` | `unset` | New RAM backing path; existing files rejected; `--vm-ram-backing` |
 | `vm.ram_compression` | `bool` | `false` | Seekable compressed backing; `--vm-ram-compression` |

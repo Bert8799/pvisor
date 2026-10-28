@@ -1,4 +1,5 @@
 benchmark_id,role,entry,status
+B-TEMPLATE-CLI,engineering A/B,startup/template_cli.json,explicit-python-cli-template-pairs
 B-LAZY-STARTUP,user-facing,startup/lazy_startup.json,requires-single-condition-command
 B-LAZY-STARTUP,user-facing,startup/image_compare.json,explicit-python-paired-prepared-images
 B-LAZY-STARTUP,user-facing,startup/image_lazy_compare.json,explicit-python-paired-cold-warm-images

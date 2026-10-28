@@ -60,6 +60,12 @@ pub struct VmConfig {
 /// Runtime services with the same signatures on every supported target.
 pub struct VmPlatform;
 pub trait RuntimeSupport {
+    /// Exact immutable Rust supervisor bytes used by ordinary VM boot, when
+    /// embedded in this build. None means no built-in guest is available. Safe
+    /// to borrow concurrently for the executable's lifetime; performs no I/O,
+    /// allocation or VM initialization. Template preparers can copy these bytes
+    /// to private storage to keep cold/template supervisor inputs identical.
+    fn embedded_guest() -> Option<&'static [u8]>;
     fn capabilities() -> Capabilities;
     /// Initialize process logging before constructing the VM.
     fn init_logging(filter: &str);
@@ -384,6 +390,18 @@ pub trait FrozenMemory {
 /// Inspect opaque state and rebind captured filesystems to caller-owned copies.
 /// Rebinding preserves the old state on error; it does not copy or publish files.
 pub trait SnapshotState {
+    /// Discard the host filesystem binding of a never-used virtio-fs device.
+    /// The restored builder must attach the same tag/topology with fresh,
+    /// caller-authorized backing retained through teardown. Only a snapshot
+    /// explicitly proving zero filesystem requests is accepted; legacy or used
+    /// servers fail. The caller must capture before the guest starts mounting
+    /// this device (for example before an inert template receives a task), so no
+    /// guest inode, handle or pending mount can refer to the old backing.
+    /// Transport and RAM state are preserved. Returns the number of matching
+    /// devices; require exactly one. Invalid tags, unsupported platforms and
+    /// used servers return an error without changing the snapshot. This does
+    /// not authorize rebinding a mounted filesystem or copy any backing data.
+    fn reset_unmounted_filesystem(&mut self, tag: &str) -> io::Result<usize>;
     /// Bind fresh host Unix endpoints to a captured, empty vsock device. Each
     /// tuple is (guest port, host Unix path, host-listen flag); true creates a new
     /// host listener during activation, false selects a guest-to-host target.

@@ -345,7 +345,7 @@ async fn execute_restored(attempt: pvisor::job_service::RestoredAttempt) -> anyh
             if let Some(proxy) = resolve_proxy(config)? {
                 builder = builder.gateway(
                     GatewayDriverConfig::new(proxy)
-                        .output_dir(&stage)
+                        .output_dir(stage)
                         .gateway_enabled(config.gateway.mode == GatewayMode::Capture),
                 );
             }

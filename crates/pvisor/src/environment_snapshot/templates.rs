@@ -59,6 +59,11 @@ pub struct TemplateSpec {
     /// resolver lower inside the captured tree. False retains plain-root recipes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub native_overlay: bool,
+    /// A pristine, unmounted workspace device is present. Restore may bind a
+    /// fresh managed stage before handing off a task; no workspace is captured.
+    /// False preserves the original root-only recipe and its device topology.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workspace_device: bool,
 }
 
 fn is_false(value: &bool) -> bool {

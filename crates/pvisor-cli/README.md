@@ -71,6 +71,43 @@ there is no user-wide digest admission or generation socket. For upgrade, drain
 old Jobs and stop the old `--pvisor-internal-host` with the old binary first.
 New CLIs read old records without live control as disk state only.
 
+## Prepared VM templates
+
+On Linux x86_64, prepare an inert template with the same CLI that will run it:
+
+```bash
+pvisor cache prepare-template --rootfs /path/to/source-rootfs \
+  --catalog /private/templates --work-dir /private/preparation
+```
+
+The source must be a quiescent independent image, without `init.krun` or template
+configuration. The command uses this executable's embedded guest and an isolated
+capture worker. Its private staging directory is reclaimed after the worker is
+reaped; a 90-second timeout terminates and reaps it. Failure near publication can
+leave a generation in the catalog: inspect it before retrying publication.
+The returned JSON identifies `catalog`, immutable `version` and sealed `rootfs`.
+Select that version in the run configuration:
+
+```toml
+[vm.template]
+catalog = "/private/templates"
+version = "REPLACE_WITH_RETURNED_64_HEX_VERSION"
+```
+
+Run with `pvisor run --vm --config template.toml --stage NEW_STAGE --cpu 2
+--memory 128MiB -- /bin/sh </dev/null` from the task workspace. The rootfs is
+resolved from the selected generation; an explicit `--rootfs` must equal its
+returned sealed path. Resource settings, build, firmware and host boot identity
+must match preparation. The catalog must be outside the workspace and stage.
+
+This path retains the normal CLI owner, instance control, Run Bundle and
+workspace review/apply. Each launch binds a fresh workspace and private root
+writes, fresh network endpoints, task identity and entropy; RAM uses private COW.
+It requires automatic VM networking and stdin redirected from `/dev/null`.
+Interactive input, PTYs, execution checkpoints, CPU QoS and explicit RAM
+backing/paging/pool profiles are unsupported. Unsupported requests fail without
+falling back to cold boot. Root-only Daemon templates remain a separate profile.
+
 ## Docker command profile (experimental)
 
 `pvisor docker` adds a separate container workflow. Existing top-level Job

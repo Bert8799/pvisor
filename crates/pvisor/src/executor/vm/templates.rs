@@ -24,6 +24,7 @@ pub(super) struct Prepared {
     pub ram: Arc<File>,
     pub ram_path: PathBuf,
     root: OverlayDeviceSpec,
+    workspace_device: bool,
     launch: Launch,
     _lease: TemplateLease,
     claimed: std::sync::atomic::AtomicBool,
@@ -37,6 +38,9 @@ impl std::fmt::Debug for Prepared {
 }
 
 impl Prepared {
+    pub(super) fn root_overlay(&self) -> OverlayDeviceSpec {
+        self.root.clone()
+    }
     pub(super) fn rootfs(&self) -> PathBuf {
         self.root
             .lowers
@@ -154,6 +158,7 @@ pub(super) fn prepare(
         ram,
         ram_path,
         root: restored_root,
+        workspace_device: spec.workspace_device,
         launch: Launch {
             binding: lease.binding(),
             source,
@@ -173,11 +178,14 @@ pub(super) fn apply(
 ) -> anyhow::Result<()> {
     ensure!(
         runner.restore.is_none()
-            && runner.workspace.is_none()
             && runner.checkpoint.is_none()
             && runner.cpu_qos.is_none()
             && runner.guest.network.is_some(),
-        "template launch cannot override workspace, checkpoint or CPU QoS profiles"
+        "template launch cannot override checkpoint or CPU QoS profiles"
+    );
+    ensure!(
+        runner.workspace.is_some() == prepared.workspace_device,
+        "template workspace device profile mismatch"
     );
     ensure!(
         !prepared
@@ -185,12 +193,10 @@ pub(super) fn apply(
             .swap(true, std::sync::atomic::Ordering::AcqRel),
         "template executor was already consumed"
     );
-    let mut root = prepared.root.clone();
-    root.access_policy = runner.root.access_policy.clone();
-    root.excluded = runner.root.excluded.clone();
-    // The original temporary overlay's exclusions are host authority paths;
-    // none can grant access to the catalog or the copied capsule's backing.
-    runner.root = root;
+    ensure!(
+        runner.root.lowers == prepared.root.lowers && runner.root.upper == prepared.root.upper,
+        "template root backing changed"
+    );
     let mut launch = prepared.launch.clone();
     launch.instance_id = instance_id.into();
     runner.template = Some(launch);
@@ -226,6 +232,17 @@ pub(super) fn machine_restore(
         state.rebind_filesystem_policy("/dev/root", &spec.root.access_policy)? == 1,
         "template policy is missing"
     );
+    if let Some(workspace) = &spec.workspace {
+        ensure!(
+            lease.version().spec.workspace_device,
+            "template lacks an unused workspace device"
+        );
+        ensure!(
+            state.reset_unmounted_filesystem("pvisor-workspace")? == 1,
+            "template workspace device is missing or already used"
+        );
+        ensure!(!workspace.lowers.is_empty(), "workspace lower is missing");
+    }
     let ports = spec
         .vsock_ports
         .iter()
@@ -259,6 +276,10 @@ pub(super) fn runner_lease(spec: &RunnerSpec) -> anyhow::Result<Option<TemplateL
     ensure!(
         recipe.native_overlay && recipe.cpus == spec.cpus && recipe.memory_mib == spec.memory_mib,
         "template runner resource profile mismatch"
+    );
+    ensure!(
+        recipe.workspace_device == spec.workspace.is_some(),
+        "template workspace topology changed"
     );
     let lowers = ["network-lower", "rootfs"]
         .iter()
@@ -346,6 +367,7 @@ fn entropy() -> anyhow::Result<[u8; 32]> {
 }
 
 /// This function is invoked only in the daemon's isolated, synchronous preparer.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn capture(
     executor: &super::supported::VmExecutor,
     catalog: TemplateCatalog,
@@ -354,6 +376,7 @@ pub(super) fn capture(
     guest: &Path,
     stage: &Path,
     generation: &str,
+    workspace_device: bool,
 ) -> anyhow::Result<()> {
     use pvisor_vm::api::{SnapshotCapture, SnapshotControl, VmConfiguration, VmRuntime};
     use std::{io::Write, os::fd::AsRawFd, os::unix::fs::OpenOptionsExt};
@@ -391,6 +414,7 @@ pub(super) fn capture(
         stdio_ports: [true; 3],
         network_mac: Some(pvisor_overlaynet::vm::VM_MAC),
         native_overlay: true,
+        workspace_device,
     };
     let capsule = stage.canonicalize()?.join("capsule");
     spec.prepare_rootfs(&image, guest, &capsule)?;
@@ -402,6 +426,13 @@ pub(super) fn capture(
     vm.disable_implicit_init()?;
     vm.snapshot_profile()?;
     super::supported::add_vm_overlay(&mut vm, "/dev/root", &overlay, None)?;
+    if workspace_device {
+        let unused = capsule.join("unused-workspace");
+        fs::create_dir(&unused)?;
+        // PID 1 has no workspace configuration before handoff, so this device
+        // is discovered but never mounted or issued a filesystem request.
+        vm.filesystem("pvisor-workspace", &unused, 0)?;
+    }
     let (input, input_vm) = std::os::unix::net::UnixStream::pair()?;
     let (mut output, output_vm) = std::os::unix::net::UnixStream::pair()?;
     let (mut errors, errors_vm) = std::os::unix::net::UnixStream::pair()?;

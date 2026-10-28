@@ -761,6 +761,7 @@ class ReferenceBaselinesTests(unittest.TestCase):
                 resources.enter_context(tempfile.TemporaryDirectory(prefix="pvisor-test-"))
             ).resolve()
             import json
+            import os
             from types import SimpleNamespace
 
             import reference_baselines as runner
@@ -775,6 +776,9 @@ class ReferenceBaselinesTests(unittest.TestCase):
                 cpu_affinity="",
                 docker_root_pid=None,
             )
+            observed_read, observed_write = os.pipe()
+            resources.callback(os.close, observed_read)
+            resources.callback(os.close, observed_write)
 
             class ChangedAffinityBudget:
                 observations = 0
@@ -793,6 +797,8 @@ class ReferenceBaselinesTests(unittest.TestCase):
                 def witness_all_members(self, pids):
                     self.observations += 1
                     if self.observations > 1:
+                        if self.observations == 2:
+                            os.write(observed_write, b"1")
                         raise BudgetViolation("existing PID created an unrestricted thread")
                     return self.processes(pids)
 
@@ -802,7 +808,22 @@ class ReferenceBaselinesTests(unittest.TestCase):
 
             def launch(argv, *args, **kwargs):
                 if argv[:2] == ["/bin/sh", "-c"]:
-                    argv = [*argv[:-1], argv[-1] + "; sleep 0.12"]
+                    # Keep the successful child alive until the second actual
+                    # observation. A fixed sleep races slow /proc scans and
+                    # loaded CI workers; the timeout still fails closed.
+                    output = (
+                        b"REFERENCE_READY\n"
+                        b'REFERENCE_RESULT {"mode":"ready","correctness":"passed"}\n'
+                    )
+                    script = (
+                        "import os,select,sys; "
+                        f"os.write(1, {output!r}); "
+                        f"ready = select.select([{observed_read}], [], [], 10)[0]; "
+                        "sys.exit(90) if not ready else None; "
+                        f"os.read({observed_read}, 1)"
+                    )
+                    argv = [sys.executable, "-c", script]
+                    kwargs["pass_fds"] = (observed_read,)
                 return original(argv, *args, **kwargs)
 
             resources.enter_context(mock.patch.object(runner.subprocess, "Popen", launch))
@@ -815,6 +836,7 @@ class ReferenceBaselinesTests(unittest.TestCase):
                     0,
                 )
             trial = args.output / "trials/ready-native-000"
+            assert budget.observations >= 2
             record = json.loads((trial / "resource-budget.json").read_text())
             assert record["live_observations"]
             assert record["violations"]

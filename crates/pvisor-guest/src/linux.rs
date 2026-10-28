@@ -340,6 +340,7 @@ fn run() -> io::Result<i32> {
         )?;
     }
     if let Some(target) = &config.workspace {
+        fs::create_dir_all(target)?;
         mount("pvisor-workspace", target, "virtiofs", 0)?;
     }
     if let Some(target) = &config.payloads_dir {

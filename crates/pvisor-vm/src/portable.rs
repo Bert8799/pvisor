@@ -10,6 +10,12 @@ use std::{
 };
 
 impl RuntimeSupport for VmPlatform {
+    fn embedded_guest() -> Option<&'static [u8]> {
+        #[cfg(feature = "init-blob")]
+        { Some(include_bytes!(env!("PVISOR_GUEST_BINARY"))) }
+        #[cfg(not(feature = "init-blob"))]
+        { None }
+    }
     fn init_logging(filter: &str) {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter))
             .format_timestamp_micros()
@@ -678,6 +684,17 @@ impl FrozenMemory for FrozenMachine<'_> {
     }
 }
 impl SnapshotState for MachineSnapshot {
+    fn reset_unmounted_filesystem(&mut self, tag: &str) -> io::Result<usize> {
+        #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            self.rebind(tag, |device, tag| device.reset_unmounted_filesystem(tag))
+        }
+        #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
+        {
+            let _ = tag;
+            Err(unsupported("unmounted filesystem reset"))
+        }
+    }
     fn rebind_vsock_ports(&mut self, ports: &[(u32, PathBuf, bool)]) -> io::Result<usize> {
         #[cfg(any(
             all(target_os = "macos", target_arch = "aarch64"),

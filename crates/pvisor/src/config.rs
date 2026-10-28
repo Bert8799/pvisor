@@ -285,10 +285,27 @@ pub struct PreparedBase {
 /// unsupported; this alias does not change `vm.prepared_rootfs` JSON/TOML keys.
 pub type PreparedRootfs = PreparedBase;
 
+/// Explicit CLI selection of an immutable inert VM template. The frontend
+/// authenticates and leases this version before constructing `from_template`;
+/// passing an unresolved selector to `VmExecutor::new` is an error. Linux
+/// x86_64 only, with a workspace-capable template and closed stdin. No cold
+/// fallback occurs. Retained Job configuration records the exact version.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VmTemplate {
+    /// Private existing template catalog, independent of guest workspace/stage.
+    pub catalog: PathBuf,
+    /// Exact 64-digit lowercase generation ID; never a mutable alias.
+    pub version: String,
+}
+
 /// libkrun process isolation over a pVisor-provided Linux rootfs OverlayFS.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VmSettings {
+    /// Optional CLI template selection; omitted keeps ordinary cold startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<VmTemplate>,
     /// Host-only live control endpoint; omitted uses an automatic private socket.
     /// The existing parent must be private (0700); existing paths are never overwritten.
     pub control_socket: Option<PathBuf>,
@@ -389,6 +406,7 @@ impl VmSettings {
 impl Default for VmSettings {
     fn default() -> Self {
         Self {
+            template: None,
             control_socket: None,
             ram_backing: None,
             ram_compression: false,

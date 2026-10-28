@@ -229,6 +229,21 @@ VM executor 时启用实验性的 Linux x86_64 实例本地 live 压缩；
 
 `[vm].snapshot_filesystem_pool` 为首次启动及从快照恢复的 VM capture 启用不可变 lower 引用，也覆盖不同 VM 的首次 capture。首次 seal 后，控制连接持有已验证的 owner；后续 capture 验证完整原 lower 并复用已封存的 pool 树，不扩大 runner 的访问范围。原生调用方应使用宿主管理的绝对路径，与 Job store 位于同一卷，并处于所有 VM 可写根和快照 store 之外。首次缓存未命中时，每个不可变摘要创建一棵 pool 树；并发未命中按摘要串行，命中不产生临时 lower 副本。此选项启用的原生 v5 快照以独立持有的 64 KiB 压缩块保留私有文件内容，复用未变化的内容；恢复时重建私有可写 inode，并保留完整元数据及硬链接关系。运行中的块 owner 在父快照退役和 GC 后仍然有效。封存先按解码后的内容标识查找 pool 块，命中时完整校验并直接复用，仅未命中才压缩；完整 RAM 压缩封存也使用这一路径。原生 capture 直接编码经过宿主认证的冻结私有目录，不产生中间私有数据树；导入、恢复和暂停任务的文件导出均不打开记录中的原始私有路径。完整数据校验仍保留；延迟和密度收益需要实测。此配置不支持网络、共享内存池、普通与 live 冷 RAM 压缩及显式 RAM backing。备份须保留 pool 与相关 Job store，或导出完整快照。
 
+### VM 模板 {#vm-template}
+
+`vm.template` 选择由同一 CLI 的 `pvisor cache prepare-template` 命令创建的
+等待任务的 VM 模板。设置 `[run] executor = "vm"`，在 `[vm.template]` 中提供
+准备命令返回的 `catalog` 和不可变的 64 位 `version`。省略选择器保持普通冷启动。
+模板的封存 rootfs 自动解析；显式 `--rootfs` 必须与准备结果返回的封存路径一致。
+该选择器不能与 `vm.prepared_rootfs` 或 `vm.image` 组合。
+
+CLI 模板运行要求 Linux x86_64、自动 VM 网络、stdin 从 `/dev/null` 重定向，
+以及匹配的制品、固件、宿主启动身份、CPU 和 RAM 配置。catalog 必须位于
+workspace 和 stage 之外。每次启动使用新的受管理工作区、独立写入和 COW RAM，
+重新分配网络端点、实例身份与随机熵，保留正常 review/apply 和实例控制。
+交互输入、PTY、原生执行 checkpoint、CPU QoS 覆盖和显式 RAM backing/paging/pool
+配置不受支持。不兼容的请求直接失败，不回退成冷启动。
+
 ### 封存 rootfs {#prepared-rootfs}
 
 `vm.prepared_rootfs` 选择由 `pvisor cache prepare-rootfs` 持久保留的物理基底。
@@ -327,6 +342,9 @@ backing/control 路径。首次准备复制并完整校验，后续认证小记�
 | `container.mounts[].source` | `PathBuf` | `必需` | 宿主路径 |
 | `container.mounts[].target` | `PathBuf` | `必需` | 容器路径 |
 | `container.mounts[].read_only` | `bool` | `false` | 只读 bind mount |
+| `vm.template` | `Option<VmTemplate>` | `未设置` | 固定的等待任务 VM 模板选择器；仅 CLI 使用；省略保持冷启动 |
+| `vm.template.catalog` | `PathBuf` | `未设置` | 选择时必填；已有私有模板 catalog，位于 workspace 和 stage 之外 |
+| `vm.template.version` | `String` | `未设置` | 选择时必填；准备返回的固定不可变 generation ID，64 位小写十六进制；拒绝 alias |
 | `vm.control_socket` | `Option<PathBuf>` | `未设置` | 仅宿主可用的 live Attempt 端点；默认自动私有 socket；须已有同 UID 0700 父目录及新路径；`--vm-control-socket` |
 | `vm.ram_backing` | `Option<PathBuf>` | `未设置` | 新建 RAM backing 路径；拒绝已有文件；`--vm-ram-backing` |
 | `vm.ram_compression` | `bool` | `false` | Seekable 压缩 backing；`--vm-ram-compression` |

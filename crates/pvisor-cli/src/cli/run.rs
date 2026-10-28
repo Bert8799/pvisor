@@ -1251,6 +1251,53 @@ async fn delegated_shutdown_signal() {
     }
 }
 
+fn open_vm_template(
+    config: &mut RunConfig,
+) -> anyhow::Result<Option<pvisor::environment_snapshot::templates::TemplateLease>> {
+    use pvisor::environment_snapshot::templates::{PROFILE, TemplateCatalog};
+    let Some(selected) = &config.vm.template else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "CLI templates require Linux x86_64"
+    );
+    anyhow::ensure!(
+        config.run.executor == RunExecutorKind::Vm
+            && config.vm.prepared_rootfs.is_none()
+            && config.vm.image.is_none()
+            && config.overlaynet.mode == OverlayNetMode::Auto,
+        "vm.template requires the VM executor, automatic VM networking and no other image selector"
+    );
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let input = std::fs::metadata("/proc/self/fd/0")?;
+    let null = std::fs::metadata("/dev/null")?;
+    anyhow::ensure!(
+        input.file_type().is_char_device() && input.rdev() == null.rdev(),
+        "CLI template handoff requires closed stdin; redirect stdin from /dev/null"
+    );
+    let mut settings = config.vm.clone();
+    settings.template = None;
+    let mut compatibility = VmExecutor::checkpoint_compatibility(&settings)?;
+    compatibility.profile = PROFILE.into();
+    let lease = TemplateCatalog::new(&selected.catalog)?
+        .acquire_version(&selected.version, &compatibility)?;
+    anyhow::ensure!(
+        lease.version().spec.workspace_device,
+        "CLI requires a workspace-capable template prepared by this CLI build"
+    );
+    let root = lease.environment().owned_layer_path(Path::new("rootfs"))?;
+    if let Some(requested) = &config.vm.rootfs {
+        anyhow::ensure!(
+            requested.canonicalize()? == root,
+            "template rootfs must match the prepared generation's returned rootfs path"
+        );
+    }
+    config.vm.rootfs = Some(root);
+    config.vm.rootfs_immutable = true;
+    Ok(Some(lease))
+}
+
 async fn execute_config(
     mut config: RunConfig,
     run_id: String,
@@ -1261,6 +1308,7 @@ async fn execute_config(
     config.features.validate(config.run.executor)?;
     normalize_filesystem_config(&mut config)?;
     validate_prepared_workspace_request(&config)?;
+    let template_owner = open_vm_template(&mut config)?;
     if config.run.executor == RunExecutorKind::Vm {
         config.vm.control_socket =
             super::host_service::vm_control_socket(config.vm.control_socket.as_deref())?;
@@ -1404,6 +1452,15 @@ async fn execute_config(
         super::host_service::reject_guest_exposure(sources)?;
     }
     let storage = resolve_run_storage(&select_run_storage(&config, &workspace, &run_id)?)?;
+    if let Some(selected) = &config.vm.template {
+        let catalog = selected.catalog.canonicalize()?;
+        for source in [&workspace, &storage] {
+            anyhow::ensure!(
+                !source.starts_with(&catalog) && !catalog.starts_with(source),
+                "template catalog must be outside the guest workspace and stage"
+            );
+        }
+    }
     policy_source.load_defaults(&mut config, &workspace, personal_config_root().as_deref())?;
     if config
         .policies
@@ -1549,7 +1606,12 @@ async fn execute_config(
         RunExecutorKind::Container => Arc::new(ContainerExecutor::new(config.container.clone())?),
         RunExecutorKind::Vm => {
             pvisor::startup_mark_run("cli.vm_inputs_ready", &run_id);
-            let mut executor = VmExecutor::new(config.vm.clone())?;
+            let mut settings = config.vm.clone();
+            settings.template = None;
+            let mut executor = match template_owner {
+                Some(lease) => VmExecutor::from_template(settings, lease, &storage)?,
+                None => VmExecutor::new(settings)?,
+            };
             if let Some(base) = prepared_rootfs_owner {
                 executor = executor.with_rootfs_base(base)?;
             }
@@ -1645,7 +1707,11 @@ async fn execute_config(
     }
     let RunInvocation::Process(process) = &mut spec.invocation;
     process.args = program_args.to_vec();
-    process.stdin = StdioMode::Inherit;
+    process.stdin = if config.vm.template.is_some() {
+        StdioMode::Null
+    } else {
+        StdioMode::Inherit
+    };
     process.stdout = match config.run.stdio {
         RunStdio::Inherit => StdioMode::Inherit,
         RunStdio::Capture => StdioMode::Capture,
@@ -2967,7 +3033,11 @@ fn validate(config: &RunConfig, safe: bool) -> anyhow::Result<()> {
         ContainerExecutor::new(config.container.clone())?;
     }
     if config.run.executor == RunExecutorKind::Vm {
-        VmExecutor::new(config.vm.clone())?;
+        let mut settings = config.vm.clone();
+        // The frontend separately authenticates the selector and constructs
+        // from_template; ordinary settings validation must not consume it.
+        settings.template = None;
+        VmExecutor::new(settings)?;
         let rootfs = config
             .vm
             .rootfs
