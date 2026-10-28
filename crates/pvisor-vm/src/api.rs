@@ -759,10 +759,12 @@ pub struct OverlayConfig {
 
 /// Opaque backend state, preserving the existing serialized machine-state format.
 /// Deserialize is not validation: restore validates CPU/device/RAM state internally.
+/// Owns compact JSON bytes rather than an expanded generic tree; cloning owns
+/// an independent copy. Rebinding commits replacement bytes only on success.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct MachineSnapshot {
-    pub(crate) state: serde_json::Value,
+    pub(crate) state: Box<serde_json::value::RawValue>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

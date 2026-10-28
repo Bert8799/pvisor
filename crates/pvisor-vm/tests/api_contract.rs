@@ -6,6 +6,79 @@ use pvisor_vm::api::{
 use syn::visit::{self, Visit};
 
 #[test]
+fn snapshot_json_remains_an_owned_opaque_wire_payload() {
+    use api::SnapshotState;
+    let json = String::from(
+        r#"{
+        "version":1, "cpus":[null,null], "devices":[],
+        "kernel_layout":null,
+        "ram":[{"base":0,"len":65536,"file_offset":0}],
+        "future_extension":{"integer":18446744073709551615,"text":"opaque"}
+    }"#,
+    );
+    let expected: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let snapshot: api::MachineSnapshot = serde_json::from_str(&json).unwrap();
+    let cloned = snapshot.clone();
+    drop(snapshot);
+    drop(json);
+    assert_eq!(serde_json::to_value(&cloned).unwrap(), expected);
+    assert_eq!(cloned.cpu_count().unwrap(), 2);
+    assert!(!cloned.has_kernel_layout().unwrap());
+    let ram = cloned.ram_mappings().unwrap();
+    assert_eq!(ram.len(), 1);
+    assert_eq!((ram[0].base, ram[0].len, ram[0].file_offset), (0, 65536, 0));
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(65536).unwrap();
+    let restore = api::MachineRestore {
+        state: cloned,
+        ram_file: std::sync::Arc::new(file),
+    };
+    assert!(
+        restore.validate(2).is_err(),
+        "opaque payload is not valid CPU/device state"
+    );
+}
+
+#[test]
+fn snapshot_queries_reject_malformed_inventories_and_geometry() {
+    use api::SnapshotState;
+    for json in [r#"{}"#, r#"{"cpus":3,"ram":null}"#] {
+        let snapshot: api::MachineSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.cpu_count().is_err());
+        assert!(snapshot.ram_mappings().is_err());
+    }
+    for geometry in [
+        serde_json::json!(true),
+        serde_json::json!(3),
+        serde_json::json!([]),
+        serde_json::json!("bad"),
+    ] {
+        let snapshot: api::MachineSnapshot =
+            serde_json::from_value(serde_json::json!({"kernel_layout":geometry})).unwrap();
+        assert_eq!(
+            snapshot.has_kernel_layout().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[test]
+fn snapshot_rebind_failure_preserves_serialized_bytes() {
+    use api::{SnapshotRebind, SnapshotState};
+    let mut value = serde_json::json!({"version":1,"cpus":[],"devices":[],"ram":[]});
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        value["pio_devices"] = serde_json::json!([]);
+    }
+    let json = serde_json::to_string_pretty(&value).unwrap();
+    let mut snapshot: api::MachineSnapshot = serde_json::from_str(&json).unwrap();
+    let before = serde_json::to_vec(&snapshot).unwrap();
+    assert!(snapshot
+        .rebind_all(&[SnapshotRebind::VsockPorts { ports: &[] }])
+        .is_err());
+    assert_eq!(serde_json::to_vec(&snapshot).unwrap(), before);
+}
+
+#[test]
 fn embedded_guest_is_an_immutable_optional_bootstrap() {
     use api::RuntimeSupport;
     let bytes = api::VmPlatform::embedded_guest();
