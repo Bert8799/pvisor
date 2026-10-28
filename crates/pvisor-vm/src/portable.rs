@@ -12,9 +12,13 @@ use std::{
 impl RuntimeSupport for VmPlatform {
     fn embedded_guest() -> Option<&'static [u8]> {
         #[cfg(feature = "init-blob")]
-        { Some(include_bytes!(env!("PVISOR_GUEST_BINARY"))) }
+        {
+            Some(include_bytes!(env!("PVISOR_GUEST_BINARY")))
+        }
         #[cfg(not(feature = "init-blob"))]
-        { None }
+        {
+            None
+        }
     }
     fn init_logging(filter: &str) {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter))
@@ -104,8 +108,8 @@ fn capabilities() -> Capabilities {
 mod cold_ram_tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     struct UnusedStore {
@@ -684,12 +688,76 @@ impl FrozenMemory for FrozenMachine<'_> {
     }
 }
 impl SnapshotState for MachineSnapshot {
+    fn rebind_all(&mut self, changes: &[SnapshotRebind<'_>]) -> io::Result<()> {
+        #[cfg(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        ))]
+        {
+            if changes.is_empty() {
+                return Ok(());
+            }
+            self.edit(|internal| {
+                for change in changes {
+                    let count = match change {
+                        SnapshotRebind::FilesystemSharedLowers {
+                            tag,
+                            copies,
+                            shared_lowers,
+                        } => Self::rebind_filesystem(internal, tag, |device, tag| {
+                            device.rebind_filesystem_shared_lowers(tag, copies, shared_lowers)
+                        })?,
+                        SnapshotRebind::FilesystemExclusions { tag, paths } => {
+                            Self::rebind_filesystem(internal, tag, |device, tag| {
+                                device.rebind_filesystem_exclusions(tag, paths)
+                            })?
+                        }
+                        SnapshotRebind::FilesystemPolicy { tag, policy } => {
+                            Self::rebind_filesystem(internal, tag, |device, tag| {
+                                device.rebind_filesystem_policy(tag, policy)
+                            })?
+                        }
+                        SnapshotRebind::UnmountedFilesystem { tag } => {
+                            Self::rebind_filesystem(internal, tag, |device, tag| {
+                                device.reset_unmounted_filesystem(tag)
+                            })?
+                        }
+                        SnapshotRebind::VsockPorts { ports } => {
+                            Self::rebind_ports(internal, ports)?
+                        }
+                    };
+                    if count != 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "snapshot rebind must match exactly one device",
+                        ));
+                    }
+                }
+                Ok(())
+            })
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        )))]
+        {
+            let _ = changes;
+            Err(unsupported("batch snapshot rebinding"))
+        }
+    }
+
     fn reset_unmounted_filesystem(&mut self, tag: &str) -> io::Result<usize> {
-        #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        ))]
         {
             self.rebind(tag, |device, tag| device.reset_unmounted_filesystem(tag))
         }
-        #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
+        #[cfg(not(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        )))]
         {
             let _ = tag;
             Err(unsupported("unmounted filesystem reset"))
@@ -701,37 +769,7 @@ impl SnapshotState for MachineSnapshot {
             all(target_os = "linux", target_arch = "x86_64")
         ))]
         {
-            use std::os::unix::ffi::OsStrExt;
-            let mut unique = std::collections::BTreeSet::new();
-            if ports.len() > 64
-                || ports.iter().any(|(port, path, _)| {
-                    *port == 0
-                        || !unique.insert(*port)
-                        || !path.is_absolute()
-                        || path.as_os_str().as_bytes().contains(&0)
-                        || path.as_os_str().as_bytes().len() >= 104
-                        || path
-                            .components()
-                            .any(|part| matches!(part, std::path::Component::ParentDir))
-                })
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid fresh vsock port mapping",
-                ));
-            }
-            let mut internal: crate::vmm::snapshot::MachineSnapshot =
-                serde::Deserialize::deserialize(&self.state).map_err(io::Error::other)?;
-            let mut count = 0;
-            for mapping in &mut internal.devices {
-                if let crate::devices::snapshot::BusDeviceSnapshot::Virtio(device) =
-                    &mut mapping.device
-                {
-                    count += usize::from(device.rebind_vsock_ports(ports)?);
-                }
-            }
-            self.state = serde_json::to_value(internal).map_err(io::Error::other)?;
-            Ok(count)
+            self.edit(|internal| Self::rebind_ports(internal, ports))
         }
         #[cfg(not(any(
             all(target_os = "macos", target_arch = "aarch64"),
@@ -966,13 +1004,62 @@ impl SnapshotState for MachineSnapshot {
         }
     }
 }
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
 impl MachineSnapshot {
-    #[cfg(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "linux", target_arch = "x86_64")
-    ))]
+    fn edit<T>(
+        &mut self,
+        action: impl FnOnce(&mut crate::vmm::snapshot::MachineSnapshot) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut internal =
+            serde::Deserialize::deserialize(&self.state).map_err(io::Error::other)?;
+        let result = action(&mut internal)?;
+        self.state = serde_json::to_value(internal).map_err(io::Error::other)?;
+        Ok(result)
+    }
     fn rebind(
         &mut self,
+        tag: &str,
+        action: impl Fn(&mut crate::devices::virtio::MmioSnapshot, &[u8; 36]) -> io::Result<bool>,
+    ) -> io::Result<usize> {
+        self.edit(|internal| Self::rebind_filesystem(internal, tag, action))
+    }
+    fn rebind_ports(
+        internal: &mut crate::vmm::snapshot::MachineSnapshot,
+        ports: &[(u32, PathBuf, bool)],
+    ) -> io::Result<usize> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut unique = std::collections::BTreeSet::new();
+        if ports.len() > 64
+            || ports.iter().any(|(port, path, _)| {
+                *port == 0
+                    || !unique.insert(*port)
+                    || !path.is_absolute()
+                    || path.as_os_str().as_bytes().contains(&0)
+                    || path.as_os_str().as_bytes().len() >= 104
+                    || path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid fresh vsock port mapping",
+            ));
+        }
+        let mut count = 0;
+        for mapping in &mut internal.devices {
+            if let crate::devices::snapshot::BusDeviceSnapshot::Virtio(device) = &mut mapping.device
+            {
+                count += usize::from(device.rebind_vsock_ports(ports)?);
+            }
+        }
+        Ok(count)
+    }
+    fn rebind_filesystem(
+        internal: &mut crate::vmm::snapshot::MachineSnapshot,
         tag: &str,
         action: impl Fn(&mut crate::devices::virtio::MmioSnapshot, &[u8; 36]) -> io::Result<bool>,
     ) -> io::Result<usize> {
@@ -984,8 +1071,6 @@ impl MachineSnapshot {
         }
         let mut bytes = [0; 36];
         bytes[..tag.len()].copy_from_slice(tag.as_bytes());
-        let mut internal: crate::vmm::snapshot::MachineSnapshot =
-            serde_json::from_value(self.state.clone()).map_err(io::Error::other)?;
         let mut count = 0;
         for mapping in &mut internal.devices {
             if let crate::devices::snapshot::BusDeviceSnapshot::Virtio(device) = &mut mapping.device
@@ -993,10 +1078,10 @@ impl MachineSnapshot {
                 count += usize::from(action(device, &bytes)?);
             }
         }
-        self.state = serde_json::to_value(internal).map_err(io::Error::other)?;
         Ok(count)
     }
 }
+
 impl RestoreState for MachineRestore {
     fn validate(&self, cpu_count: usize) -> Result<(), String> {
         #[cfg(any(

@@ -180,6 +180,9 @@ response: inspect the catalog selection before retrying. Pass `--expected OLD_ID
 to conditionally update an alias; omission is create-only. Never overwrite a
 generation. Alias removal/collection retain the catalog's lease rules.
 
+Worker supervision uses the runtime's shared template preparer; staging and
+publication arguments remain owned by this frontend.
+
 The JSON result contains `spec.image_sha256`. Add the selection to the existing
 prepared-image manifest, retaining its bootstrap/service contract:
 

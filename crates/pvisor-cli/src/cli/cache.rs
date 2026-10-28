@@ -159,55 +159,31 @@ fn prepare_template(args: &TemplateArgs) -> anyhow::Result<()> {
         .prefix("template-build-")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(work)?;
+    // A private seekable output avoids waiting on a worker blocked by a full pipe.
+    let mut output = tempfile::tempfile_in(stage.path())?;
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .args(std::env::args_os().skip(1))
         .arg("--template-worker-stage")
         .arg(stage.path())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped());
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let parent = std::process::id() as libc::pid_t;
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut child = command.spawn()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("template preparation timed out; inspect catalog before retry");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+        .stdout(output.try_clone()?);
+    pvisor::environment_snapshot::templates::run_preparer(
+        &mut command,
+        std::time::Duration::from_secs(90),
+    )?;
+    use std::io::{Read, Seek};
     anyhow::ensure!(
-        status.success(),
-        "template preparation failed; inspect catalog before retry"
+        output.metadata()?.len() <= 1 << 20,
+        "template worker result exceeds limit"
     );
-    use std::io::Read;
-    let mut output = Vec::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .take(1 << 20)
-        .read_to_end(&mut output)?;
-    let version: TemplateVersion = serde_json::from_slice(&output)?;
+    output.rewind()?;
+    let mut bytes = Vec::new();
+    output.take((1 << 20) + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 1 << 20,
+        "template worker result exceeds limit"
+    );
+    let version: TemplateVersion = serde_json::from_slice(&bytes)?;
     let mut compatibility = pvisor::VmExecutor::checkpoint_compatibility(&settings)?;
     compatibility.profile = PROFILE.into();
     let lease =

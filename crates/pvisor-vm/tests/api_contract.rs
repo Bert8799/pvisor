@@ -334,3 +334,35 @@ fn embedded_kernel_identity_matches_uncompressed_image() {
     }
     assert_eq!(api::VmPlatform::embedded_kernel_sha256(), digest);
 }
+
+#[test]
+fn snapshot_batch_contract_rejects_missing_devices_without_changing_state() {
+    use api::{SnapshotRebind, SnapshotState};
+    let mut original = serde_json::json!({
+        "version": 1, "cpus": [], "devices": [], "ram": []
+    });
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        original["pio_devices"] = serde_json::json!([]);
+    }
+    let mut state: api::MachineSnapshot = serde_json::from_value(original.clone()).unwrap();
+    let empty = state.rebind_all(&[]);
+    if cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )) {
+        empty.unwrap();
+        for changes in [
+            vec![SnapshotRebind::VsockPorts { ports: &[] }],
+            vec![SnapshotRebind::UnmountedFilesystem { tag: "workspace" }],
+            vec![SnapshotRebind::FilesystemExclusions {
+                tag: "",
+                paths: &[],
+            }],
+        ] {
+            assert!(state.rebind_all(&changes).is_err());
+            assert_eq!(serde_json::to_value(&state).unwrap(), original);
+        }
+    } else {
+        assert_eq!(empty.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+}

@@ -1247,30 +1247,32 @@ impl RunExecutor for VmExecutor {
             || temporary.path().join("root-upper"),
             |template| template.root_overlay().upper,
         );
-        let root_work = temporary.path().join("root-work");
-        if let Err(error) =
-            std::fs::create_dir_all(&root_upper).and_then(|()| std::fs::create_dir_all(&root_work))
-        {
-            return failed_to_start(format!("prepare libkrun root overlay: {error}"));
-        }
         let mut root_overlay = if let Some(template) = &self.template {
             let mut root = template.root_overlay();
             root.access_policy = root_overlay.access_policy;
             root
-        } else if root_overlay.upper.as_os_str().is_empty() {
-            OverlayDeviceSpec {
-                lowers: root_overlay.lowers,
-                lower_mutability: root_overlay.lower_mutability,
-                apply_target: root_overlay.apply_target,
-                baseline_lower: root_overlay.baseline_lower,
-                upper: root_upper.clone(),
-                work: Some(root_work.clone()),
-                preimages: root_overlay.preimages,
-                excluded: root_overlay.excluded,
-                access_policy: root_overlay.access_policy,
-            }
         } else {
-            root_overlay
+            let root_work = temporary.path().join("root-work");
+            if let Err(error) = std::fs::create_dir_all(&root_upper)
+                .and_then(|()| std::fs::create_dir_all(&root_work))
+            {
+                return failed_to_start(format!("prepare libkrun root overlay: {error}"));
+            }
+            if root_overlay.upper.as_os_str().is_empty() {
+                OverlayDeviceSpec {
+                    lowers: root_overlay.lowers,
+                    lower_mutability: root_overlay.lower_mutability,
+                    apply_target: root_overlay.apply_target,
+                    baseline_lower: root_overlay.baseline_lower,
+                    upper: root_upper.clone(),
+                    work: Some(root_work),
+                    preimages: root_overlay.preimages,
+                    excluded: root_overlay.excluded,
+                    access_policy: root_overlay.access_policy,
+                }
+            } else {
+                root_overlay
+            }
         };
         if let Some(selected) = &self.settings.prepared_rootfs {
             let checked =

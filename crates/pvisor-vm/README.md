@@ -45,6 +45,8 @@ pristine 标记，旧快照缺少该证据时拒绝重置。恢复保留新 buil
 不沿用旧 workspace 的 inode/handle 表；已使用设备拒绝重置，失败不改变快照。
 普通文件系统快照恢复及其 backing 校验不变。
 
+`SnapshotState::rebind_all` 按顺序在同一事务中修改设备绑定，只解析、重建一次机器状态。每项必须匹配唯一设备；任何一步失败都保留整份原状态，沿用单项操作的 backing、pristine 和 vsock 校验，不替代最终恢复校验。
+
 ## 核心接口模型
 
 所有定义集中在 `src/api.rs`，实现集中在私有适配器中。文件系统配置使用 `PathBuf`，UTF-8 校验及内部设备格式转换由运行时完成。

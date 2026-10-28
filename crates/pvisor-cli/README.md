@@ -85,6 +85,9 @@ configuration. The command uses this executable's embedded guest and an isolated
 capture worker. Its private staging directory is reclaimed after the worker is
 reaped; a 90-second timeout terminates and reaps it. Failure near publication can
 leave a generation in the catalog: inspect it before retrying publication.
+Capture worker supervision is shared with the daemon. Worker JSON is collected
+in a private temporary file and read with a 1 MiB limit after reaping, avoiding
+a full stdout pipe blocking publication.
 The returned JSON identifies `catalog`, immutable `version` and sealed `rootfs`.
 Select that version in the run configuration:
 

@@ -123,6 +123,51 @@ fn mapped_or_tsi_vsock_snapshots_cannot_be_relabelled_as_fresh_endpoints() {
 }
 
 #[test]
+fn batched_snapshot_rebinding_matches_single_changes_and_rolls_back_late_failure() {
+    use crate::api::{SnapshotRebind, SnapshotState};
+    let source = empty_vsock_machine(false, false);
+    let original = serde_json::to_value(&source).unwrap();
+    let ports = [(44772, "/tmp/new-owner.sock".into(), true)];
+    let mut sequential = source.clone();
+    sequential.rebind_vsock_ports(&ports).unwrap();
+    let mut batched = source.clone();
+    batched
+        .rebind_all(&[SnapshotRebind::VsockPorts { ports: &ports }])
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(batched).unwrap(),
+        serde_json::to_value(sequential).unwrap()
+    );
+    for second in [
+        SnapshotRebind::UnmountedFilesystem { tag: "missing" },
+        SnapshotRebind::UnmountedFilesystem { tag: "" },
+        SnapshotRebind::VsockPorts { ports: &ports },
+    ] {
+        let mut failed = source.clone();
+        assert!(failed
+            .rebind_all(&[SnapshotRebind::VsockPorts { ports: &ports }, second])
+            .is_err());
+        assert_eq!(serde_json::to_value(failed).unwrap(), original);
+    }
+    let mut duplicate = original.clone();
+    let device = duplicate["devices"][0].clone();
+    duplicate["devices"].as_array_mut().unwrap().push(device);
+    let mut state: crate::api::MachineSnapshot = serde_json::from_value(duplicate.clone()).unwrap();
+    assert!(state
+        .rebind_all(&[SnapshotRebind::VsockPorts { ports: &ports }])
+        .is_err());
+    assert_eq!(serde_json::to_value(state).unwrap(), duplicate);
+    for (mapped, tsi) in [(true, false), (false, true)] {
+        let mut state = empty_vsock_machine(mapped, tsi);
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(state
+            .rebind_all(&[SnapshotRebind::VsockPorts { ports: &ports }])
+            .is_err());
+        assert_eq!(serde_json::to_value(state).unwrap(), before);
+    }
+}
+
+#[test]
 fn machine_ram_inventory_checks_offsets_overlap_and_exact_file_size() {
     let valid = restore();
     valid.validate_ram_file().unwrap();

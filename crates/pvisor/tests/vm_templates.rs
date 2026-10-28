@@ -426,3 +426,36 @@ fn interrupted_build_and_alias_publication_are_reclaimed_after_writer_exit() {
     assert_eq!(catalog.collect().unwrap(), 1);
     assert!(!pending.exists());
 }
+
+#[test]
+fn template_preparer_reaps_success_failure_and_timeout() {
+    use pvisor::environment_snapshot::templates::run_preparer;
+    use std::{process::Command, time::Duration};
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("pid");
+    for script in [
+        "echo $$ > \"$1\"; exit 0",
+        "echo $$ > \"$1\"; exit 9",
+        "echo $$ > \"$1\"; exec sleep 30",
+    ] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script, "preparer"]).arg(&pid_file);
+        let result = run_preparer(&mut command, Duration::from_secs(1));
+        assert_eq!(result.is_ok(), script.ends_with("exit 0"));
+        let pid: libc::pid_t = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        fs::remove_file(&pid_file).unwrap();
+    }
+}

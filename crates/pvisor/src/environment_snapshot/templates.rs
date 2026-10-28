@@ -22,6 +22,63 @@ use std::{
 const SCHEMA: u32 = 1;
 const RECORD_LIMIT: u64 = 64 * 1024;
 
+/// Run one isolated template capture command synchronously, with closed stdin.
+/// Blocks the calling thread; arguments, stdout/stderr destinations and private
+/// staging belong to the caller. Linux installs a parent-death kill with
+/// a parent-race check. Waits at most `timeout` before killing the direct worker;
+/// every return after spawning reaps it, including wait errors and nonzero exit.
+/// The worker must not detach children. Abrupt parent death may leave staging.
+/// Publication can precede failure, so inspect the catalog before retrying.
+pub fn run_preparer(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .context("template preparation timeout is too large")?;
+    command.stdin(std::process::Stdio::null());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        // Only async-signal-safe syscalls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+    }
+    struct Worker(std::process::Child);
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut worker = Worker(command.spawn()?);
+    loop {
+        if let Some(status) = worker.0.try_wait()? {
+            ensure!(
+                status.success(),
+                "template preparation failed: {status}; inspect catalog before retry"
+            );
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "template preparation timed out; inspect catalog before retry"
+        );
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+    }
+}
+
 /// Storage role for inert template captures. Execution checkpoints and prepared
 /// filesystem bases must not authenticate as this profile. Device eligibility
 /// and machine validation remain VMM responsibilities.

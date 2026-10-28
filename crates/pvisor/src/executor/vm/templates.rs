@@ -220,38 +220,38 @@ pub(super) fn machine_restore(
         launch.source.join("rootfs"),
         launch.source.join("network-lower"),
     ];
-    ensure!(
-        state.rebind_filesystem_shared_lowers("/dev/root", &launch.copies, &shared)? == 1,
-        "template root device is missing"
-    );
-    ensure!(
-        state.rebind_filesystem_exclusions("/dev/root", &spec.root.excluded)? == 1,
-        "template exclusions are missing"
-    );
-    ensure!(
-        state.rebind_filesystem_policy("/dev/root", &spec.root.access_policy)? == 1,
-        "template policy is missing"
-    );
-    if let Some(workspace) = &spec.workspace {
-        ensure!(
-            lease.version().spec.workspace_device,
-            "template lacks an unused workspace device"
-        );
-        ensure!(
-            state.reset_unmounted_filesystem("pvisor-workspace")? == 1,
-            "template workspace device is missing or already used"
-        );
-        ensure!(!workspace.lowers.is_empty(), "workspace lower is missing");
-    }
     let ports = spec
         .vsock_ports
         .iter()
         .map(|(port, path)| (*port, path.clone(), true))
         .collect::<Vec<_>>();
-    ensure!(
-        state.rebind_vsock_ports(&ports)? == 1,
-        "template vsock is missing"
-    );
+    let mut changes = vec![
+        pvisor_vm::api::SnapshotRebind::FilesystemSharedLowers {
+            tag: "/dev/root",
+            copies: &launch.copies,
+            shared_lowers: &shared,
+        },
+        pvisor_vm::api::SnapshotRebind::FilesystemExclusions {
+            tag: "/dev/root",
+            paths: &spec.root.excluded,
+        },
+        pvisor_vm::api::SnapshotRebind::FilesystemPolicy {
+            tag: "/dev/root",
+            policy: &spec.root.access_policy,
+        },
+    ];
+    if let Some(workspace) = &spec.workspace {
+        ensure!(
+            lease.version().spec.workspace_device,
+            "template lacks an unused workspace device"
+        );
+        ensure!(!workspace.lowers.is_empty(), "workspace lower is missing");
+        changes.push(pvisor_vm::api::SnapshotRebind::UnmountedFilesystem {
+            tag: "pvisor-workspace",
+        });
+    }
+    changes.push(pvisor_vm::api::SnapshotRebind::VsockPorts { ports: &ports });
+    state.rebind_all(&changes)?;
     let restore = pvisor_vm::api::MachineRestore {
         state,
         ram_file: Arc::new(ram),

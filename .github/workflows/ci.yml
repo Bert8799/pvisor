@@ -301,10 +301,10 @@ jobs:
       - name: Record isolated core budget
         run: |
           just build release
-          # Per-container VMs, shared guest supervision and the payload
-          # injection / launch-contract extension bring the runtime closure
-          # to ~220,700 lines; retain ~1,300 lines of headroom.
-          just check-core-budget target/release/pvisor --max-dependencies 235 --max-workspace-lines 222000 --max-core-items 301 > target/pvisor-core-budget.json
+          # Inert templates, atomic device rebinding and their safety tests bring
+          # the runtime closure to ~222,800 physical source lines (including
+          # comments and tests); retain ~1,200 lines of headroom.
+          just check-core-budget target/release/pvisor --max-dependencies 235 --max-workspace-lines 224000 --max-core-items 301 > target/pvisor-core-budget.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

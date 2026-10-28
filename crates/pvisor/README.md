@@ -479,6 +479,11 @@ staging directory. It must never be called inside a service/Tokio host.
 `VmExecutor::from_template` retains a generation lease, materializes private
 upper/work, shares the generation's sealed read-only lowers, and uses the normal
 self-exec runner, live controls and cancellation.
+Template device rebinding uses one atomic machine-state transaction. The runner
+uses the already materialized private upper/work without creating an unused
+second work directory. CLI and daemon capture commands share `run_preparer`
+for parent-death protection, bounded waiting and guaranteed worker reaping;
+frontends retain staging and output ownership.
 Each executor admits one Attempt; reuse after success or failure is rejected.
 The actual VMM child also acquires the fixed generation before its sandbox and
 retains it through teardown, fencing GC independently of supervisor survival.

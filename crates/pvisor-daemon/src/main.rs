@@ -149,42 +149,12 @@ fn prepare_template(args: &TemplateArgs) -> anyhow::Result<()> {
     command
         .args(std::env::args_os().skip(1))
         .arg("--template-worker-stage")
-        .arg(stage.path())
-        .stdin(std::process::Stdio::null());
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let parent = std::process::id() as libc::pid_t;
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut child = command.spawn()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    let result = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("template preparation timed out; inspect catalog selection before retry");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+        .arg(stage.path());
+    pvisor::environment_snapshot::templates::run_preparer(
+        &mut command,
+        std::time::Duration::from_secs(90),
+    )?;
     stage.close()?;
-    anyhow::ensure!(
-        result.success(),
-        "template preparation failed; inspect catalog selection before retry"
-    );
     Ok(())
 }
 

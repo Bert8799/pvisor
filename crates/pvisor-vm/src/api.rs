@@ -387,9 +387,58 @@ pub trait FrozenMemory {
     fn set_device_prepare(&self, handler: Option<Arc<MemoryPrepare>>) -> Result<(), String>;
 }
 
+/// One borrowed change to a captured device; no backing is copied or published.
+/// The caller authorizes paths/endpoints and retains their backing through VM
+/// teardown. Each variant has the validation and ownership requirements of the
+/// corresponding `SnapshotState` operation.
+pub enum SnapshotRebind<'a> {
+    /// Rebind private copies while retaining verified immutable lowers.
+    FilesystemSharedLowers {
+        /// Captured filesystem tag, nonempty, NUL-free and at most 36 bytes.
+        tag: &'a str,
+        /// Supervisor-verified old-to-new private backing paths.
+        copies: &'a [(PathBuf, PathBuf)],
+        /// Inventory-verified, leased immutable lower paths.
+        shared_lowers: &'a [PathBuf],
+    },
+    /// Add exclusions without exposing previously excluded authority.
+    FilesystemExclusions {
+        /// Captured filesystem tag.
+        tag: &'a str,
+        /// Relative paths; saved inode paths cannot become hidden.
+        paths: &'a [PathBuf],
+    },
+    /// Replace the restored filesystem's access policy.
+    FilesystemPolicy {
+        /// Captured filesystem tag.
+        tag: &'a str,
+        /// Validated policy applied by the caller to the new instance.
+        policy: &'a pvisor_overlay_core::FileAccessPolicy,
+    },
+    /// Discard only a provably never-used filesystem's host binding.
+    UnmountedFilesystem {
+        /// Tag to attach to fresh authorized backing during restored build.
+        tag: &'a str,
+    },
+    /// Bind fresh endpoints to an empty, zero-TSI vsock device.
+    VsockPorts {
+        /// Unique guest ports, absolute Unix paths and host-listen flags.
+        ports: &'a [(u32, PathBuf, bool)],
+    },
+}
+
 /// Inspect opaque state and rebind captured filesystems to caller-owned copies.
 /// Rebinding preserves the old state on error; it does not copy or publish files.
 pub trait SnapshotState {
+    /// Apply ordered changes in one transaction, parsing machine state once.
+    /// Each change must match exactly one device; missing/duplicate devices,
+    /// invalid inputs or any device rejection leave the whole snapshot unchanged.
+    /// Empty changes are a no-op. Requires exclusive access to this snapshot;
+    /// does not activate a VM or validate CPU/RAM state. Backing checks may read
+    /// host files, but never copy or publish them.
+    /// Backing verification and leases remain the caller's responsibility.
+    /// Unsupported platforms return Unsupported, including for an empty batch.
+    fn rebind_all(&mut self, changes: &[SnapshotRebind<'_>]) -> io::Result<()>;
     /// Discard the host filesystem binding of a never-used virtio-fs device.
     /// The restored builder must attach the same tag/topology with fresh,
     /// caller-authorized backing retained through teardown. Only a snapshot
