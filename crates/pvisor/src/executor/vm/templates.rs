@@ -98,6 +98,7 @@ pub(super) fn prepare(
         lease.environment().manifest().ram_blocks.is_none(),
         "native templates require a raw shared RAM baseline, without eager decode"
     );
+    crate::util::startup_mark("template.compatibility_begin");
     let mut expected = super::supported::VmExecutor::checkpoint_compatibility(settings)?;
     expected.profile = crate::environment_snapshot::templates::PROFILE.into();
     ensure!(
@@ -109,6 +110,8 @@ pub(super) fn prepare(
             && spec.network_mac == Some(pvisor_overlaynet::vm::VM_MAC),
         "native template build, resources or device profile mismatch"
     );
+    crate::util::startup_mark("template.compatibility_ready");
+    crate::util::startup_mark("template.filesystem_begin");
     fs::create_dir_all(storage)?;
     let preparation = storage.canonicalize()?.join("template-restore");
     fs::DirBuilder::new()
@@ -122,11 +125,14 @@ pub(super) fn prepare(
             .environment()
             .materialize_layer(Path::new(name), &capsule.join(name))?;
     }
+    crate::util::startup_mark("template.filesystem_ready");
     use std::os::unix::ffi::OsStrExt;
     let source = PathBuf::from(std::ffi::OsStr::from_bytes(
         &lease.environment().manifest().source_root,
     ));
+    crate::util::startup_mark("template.ram_verify_begin");
     let ram = Arc::new(lease.environment().template_ram_file()?);
+    crate::util::startup_mark("template.ram_verify_ready");
     // Path is used only for authority exclusions/physical observation. The exact
     // read-only inode is passed to the child by descriptor and mapped MAP_PRIVATE.
     let ram_path = fs::read_link(format!(
@@ -213,9 +219,11 @@ pub(super) fn machine_restore(
     lease: &TemplateLease,
 ) -> anyhow::Result<pvisor_vm::api::MachineRestore> {
     use pvisor_vm::api::{RestoreState, SnapshotState};
+    crate::util::startup_mark("template.machine_decode_begin");
     let launch = spec.template.as_ref().context("missing template launch")?;
     let mut state: pvisor_vm::api::MachineSnapshot =
         serde_json::from_slice(&lease.environment().machine_bytes()?)?;
+    crate::util::startup_mark("template.machine_decode_ready");
     let shared = [
         launch.source.join("rootfs"),
         launch.source.join("network-lower"),
@@ -251,14 +259,18 @@ pub(super) fn machine_restore(
         });
     }
     changes.push(pvisor_vm::api::SnapshotRebind::VsockPorts { ports: &ports });
+    crate::util::startup_mark("template.machine_rebind_begin");
     state.rebind_all(&changes)?;
+    crate::util::startup_mark("template.machine_rebind_ready");
     let restore = pvisor_vm::api::MachineRestore {
         state,
         ram_file: Arc::new(ram),
     };
+    crate::util::startup_mark("template.machine_validate_begin");
     restore
         .validate(spec.cpus as usize)
         .map_err(anyhow::Error::msg)?;
+    crate::util::startup_mark("template.machine_validate_ready");
     Ok(restore)
 }
 
@@ -270,6 +282,7 @@ pub(super) fn runner_lease(spec: &RunnerSpec) -> anyhow::Result<Option<TemplateL
         launch.binding.id == launch.boot.template_id,
         "template runner identity mismatch"
     );
+    crate::util::startup_mark("template.runner_lease_begin");
     let lease = TemplateCatalog::new(&launch.binding.catalog)?
         .acquire_version(&launch.binding.id, &launch.binding.compatibility)?;
     let recipe = &lease.version().spec;
@@ -289,6 +302,7 @@ pub(super) fn runner_lease(spec: &RunnerSpec) -> anyhow::Result<Option<TemplateL
         lowers == spec.root.lowers,
         "template runner shared lower binding changed"
     );
+    crate::util::startup_mark("template.runner_lease_ready");
     Ok(Some(lease))
 }
 

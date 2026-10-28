@@ -30,19 +30,30 @@ const RAM_CHILD_FD: RawFd = 200;
 const READONLY_FLUSH_ENV: &str = "PVISOR_VM_FS_READONLY_FLUSH_ELISION";
 
 fn runner_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
-    // Keep both source descriptors above the fixed destinations, avoiding dup2
-    // clobbering one socket when the parent's fd table happens to be crowded.
-    let duplicate = unsafe {
-        libc::fcntl(
-            fd,
-            libc::F_DUPFD_CLOEXEC,
-            crate::diagnostics::INHERITED_LOG_FD + 1,
-        )
-    };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error());
+    let reserved = [
+        NETWORK_CHILD_FD,
+        CONTROL_CHILD_FD,
+        RAM_CHILD_FD,
+        crate::diagnostics::INHERITED_LOG_FD,
+    ];
+    // Prefer an unused low descriptor: forcing 202 in a multithreaded parent
+    // can expand Linux's fd table and wait for an RCU grace period. Only the
+    // single-threaded child needs the fixed destinations. Never use any of
+    // those destinations as sources: pre-exec dup2 must not clobber a later
+    // mapping, including when the parent's descriptor table is crowded.
+    let mut minimum = 3;
+    loop {
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        if !reserved.contains(&duplicate.as_raw_fd()) {
+            return Ok(duplicate);
+        }
+        minimum = reserved.iter().max().unwrap() + 1;
+        // Drop this unused reserved descriptor before retrying above the block.
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1662,12 +1673,14 @@ impl RunExecutor for VmExecutor {
         };
         let runner_path = runner_file.path();
         crate::util::startup_mark_run("vm.spec_write_ready", spec.run_id.as_str());
+        crate::util::startup_mark_run("vm.network_take_begin", spec.run_id.as_str());
         let mut vm_network = match context.take_vm_network() {
             Ok(network) => network,
             Err(error) => {
                 return failed_to_start(error.to_string());
             }
         };
+        crate::util::startup_mark_run("vm.network_take_ready", spec.run_id.as_str());
         if vm_network_enabled && vm_network.is_none() {
             return failed_to_start("pVisor VM network attachment is missing".into());
         }
@@ -1695,6 +1708,7 @@ impl RunExecutor for VmExecutor {
             Ok(fd) => fd,
             Err(error) => return failed_to_start(format!("duplicate VM network socket: {error}")),
         };
+        crate::util::startup_mark_run("vm.runner_channels_ready", spec.run_id.as_str());
         let mut command = Command::new(executable);
         command
             .env(RUNNER_SPEC_ENV, runner_path)
@@ -1705,6 +1719,7 @@ impl RunExecutor for VmExecutor {
             .stderr(stdio(invocation.stderr))
             .kill_on_drop(true)
             .process_group(0);
+        crate::util::startup_mark_run("vm.runner_command_ready", spec.run_id.as_str());
         configure_prepared_rootfs_flush_environment(
             &mut command,
             self,
@@ -2723,10 +2738,12 @@ fn run_linked_krun(
             // Keep the input descriptor alive through VM execution. The console
             // retains its own fd owner; the writer has a bounded host timeout.
             std::thread::Builder::new().name("pvisor-template-task".into()).spawn(move || {
+                crate::util::startup_mark("template.task_send_begin");
                 if let Err(error) = pvisor_guest::control::write_frame(&mut writer, &task) {
                     eprintln!("template task delivery failed: {error}");
                     std::process::exit(1);
                 }
+                crate::util::startup_mark("template.task_send_ready");
             })?;
         }
         if spec.restore.is_some() || spec.template.is_some() {
@@ -3080,6 +3097,80 @@ fn guest_path_in_root(root: &Path, target: &Path) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runner_sources_use_low_fds_and_skip_every_reserved_destination() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        const ROLE: &str = "PVISOR_RUNNER_FD_TEST_CHILD";
+        // Fill only a fresh test process's table, independent of parallel tests
+        // or a caller's existing descriptors. Never overwrite an occupied fd.
+        if std::env::var_os(ROLE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "executor::vm::supported::tests::runner_sources_use_low_fds_and_skip_every_reserved_destination",
+                    "--nocapture",
+                ])
+                .env(ROLE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let source = tempfile::tempfile().unwrap();
+        let check = |fd: &OwnedFd| {
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(
+                unsafe { libc::fstat(fd.as_raw_fd(), metadata.as_mut_ptr()) },
+                0
+            );
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                unsafe { metadata.assume_init() }.st_ino,
+                source.metadata().unwrap().ino()
+            );
+        };
+        let low = super::runner_fd(source.as_raw_fd()).unwrap();
+        assert!(low.as_raw_fd() < super::NETWORK_CHILD_FD);
+        check(&low);
+        drop(low);
+        let duplicate = || {
+            let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(fd >= 0);
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let mut occupied = Vec::new();
+        loop {
+            let fd = duplicate();
+            if fd.as_raw_fd() >= super::NETWORK_CHILD_FD {
+                assert_eq!(fd.as_raw_fd(), super::NETWORK_CHILD_FD);
+                break;
+            }
+            occupied.push(fd);
+        }
+        for reserved in [
+            super::NETWORK_CHILD_FD,
+            super::CONTROL_CHILD_FD,
+            super::RAM_CHILD_FD,
+            crate::diagnostics::INHERITED_LOG_FD,
+        ] {
+            let high = super::runner_fd(source.as_raw_fd()).unwrap();
+            assert!(high.as_raw_fd() > crate::diagnostics::INHERITED_LOG_FD);
+            check(&high);
+            // The skipped reservation was closed, not leaked or overwritten.
+            let fd = duplicate();
+            assert_eq!(fd.as_raw_fd(), reserved);
+            occupied.push(fd);
+        }
+        assert_eq!(
+            super::runner_fd(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
     mod network_resolver {
         use super::super::{OverlayDeviceSpec, add_vm_overlay, prepare_network_resolver};
         use pvisor_overlay_core::LayerMutability::{self, Immutable, Mutable};

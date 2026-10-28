@@ -536,6 +536,7 @@ impl TemplateCatalog {
             version.spec.compatibility == *expected,
             "template compatibility mismatch"
         );
+        crate::util::startup_mark("template.environment_open_begin");
         let environment = SnapshotStore::new(
             &self
                 .root
@@ -544,6 +545,7 @@ impl TemplateCatalog {
                 .join("store"),
         )?
         .open_for_restore(&version.snapshot_id, expected)?;
+        crate::util::startup_mark("template.environment_open_ready");
         Ok(TemplateLease {
             version,
             environment,

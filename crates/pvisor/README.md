@@ -484,6 +484,16 @@ uses the already materialized private upper/work without creating an unused
 second work directory. CLI and daemon capture commands share `run_preparer`
 for parent-death protection, bounded waiting and guaranteed worker reaping;
 frontends retain staging and output ownership.
+Runner source descriptors prefer unused low numbers while excluding every
+reserved child destination (network, control, RAM and diagnostics). Crowded
+source tables fall back above that reserved range. The child retains the same
+fixed descriptor protocol; all temporary sources remain close-on-exec. This
+avoids forcing a high-numbered table expansion in a multithreaded Linux owner,
+without changing channel ownership, cancellation or COW RAM sharing.
+`PVISOR_STARTUP_TIMING` also covers template catalog open, compatibility,
+private filesystem preparation, RAM verification, machine decoding/rebinding/
+validation and task delivery. These host-monotonic diagnostic markers retain
+PID identities; set it to `0` for performance sampling.
 Each executor admits one Attempt; reuse after success or failure is rejected.
 The actual VMM child also acquires the fixed generation before its sandbox and
 retains it through teardown, fencing GC independently of supervisor survival.
