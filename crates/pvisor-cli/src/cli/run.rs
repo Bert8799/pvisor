@@ -548,7 +548,7 @@ struct OverlayNetOverrides {
         default_missing_value = "proxy"
     )]
     overlaynet: Option<OverlayNetMode>,
-    /// Explicit proxy listen address; supplying it enables OverlayNet.
+    /// Explicit proxy listen address; port 0 allocates at startup. Enables OverlayNet.
     #[arg(long, value_name = "ADDR")]
     overlaynet_listen: Option<String>,
     #[arg(long, value_parser = super::values::overlay_net_policy(), hide = true)]
@@ -2084,7 +2084,7 @@ fn valid_environment_name(name: &str) -> bool {
         && !name.as_bytes()[0].is_ascii_digit()
 }
 
-fn apply_safe_defaults(config: &mut RunConfig) -> anyhow::Result<()> {
+fn apply_safe_defaults(config: &mut RunConfig) {
     // Preserve Codex account/routing discovery through CODEX_* and provider variables.
     config.run.inherit_env = config
         .run
@@ -2094,10 +2094,12 @@ fn apply_safe_defaults(config: &mut RunConfig) -> anyhow::Result<()> {
         .and_then(|name| name.to_str())
         == Some("codex");
     if config.overlaynet.listen == OverlayNetSettings::default().listen {
-        config.overlaynet.listen = free_loopback_address()?;
+        // Bind the real listener once, at startup. Probing a free port here
+        // and closing it leaves a race with concurrent Jobs before preparation.
+        config.overlaynet.listen = "127.0.0.1:0".into();
     }
     if config.gateway.admin_listen == pvisor::GatewaySettings::default().admin_listen {
-        config.gateway.admin_listen = free_loopback_address()?;
+        config.gateway.admin_listen = "127.0.0.1:0".into();
     }
     if config.run.agent == "agent"
         && let Some(program) = config.run.command.first()
@@ -2108,12 +2110,6 @@ fn apply_safe_defaults(config: &mut RunConfig) -> anyhow::Result<()> {
             .unwrap_or("agent")
             .to_owned();
     }
-    Ok(())
-}
-
-fn free_loopback_address() -> anyhow::Result<String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.to_string())
 }
 
 /// Resolve ordinary defaults/config, then the opt-in preset, then explicit CLI values.
@@ -2140,7 +2136,7 @@ fn apply_run_options(config: &mut RunConfig, args: RunArgs) -> anyhow::Result<()
         config.filesystem = FilesystemMode::Sandbox;
     }
     apply_cli(config, args.clone())?;
-    apply_safe_defaults(config)?;
+    apply_safe_defaults(config);
     Ok(())
 }
 
@@ -3074,15 +3070,16 @@ fn validate(config: &RunConfig, safe: bool) -> anyhow::Result<()> {
     if config.overlaynet.mode == OverlayNetMode::Proxy
         || config.gateway.mode == GatewayMode::Capture
     {
-        let listen: std::net::SocketAddr = config.overlaynet.listen.parse().with_context(|| {
-            format!(
-                "invalid OverlayNet listen address {}",
-                config.overlaynet.listen
-            )
-        })?;
-        if listen.port() == 0 {
-            bail!("OverlayNet port 0 is not supported; choose an explicit free port");
-        }
+        config
+            .overlaynet
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| {
+                format!(
+                    "invalid OverlayNet listen address {}",
+                    config.overlaynet.listen
+                )
+            })?;
     }
     if config.overlaynet.policy != OverlayNetPolicy::Allowlist
         && (!config.overlaynet.allow.is_empty() || !config.overlaynet.rules.is_empty())
@@ -4348,6 +4345,87 @@ level = "warn"
     }
 
     #[test]
+    fn ephemeral_proxy_ports_survive_cli_config_and_safe_defaults() {
+        for options in [
+            vec!["--safe"],
+            vec!["--overlaynet-listen", "127.0.0.1:0"],
+            #[cfg(feature = "gateway")]
+            vec![
+                "--gateway-mode",
+                "capture",
+                "--overlaynet-listen",
+                "127.0.0.1:0",
+                "--gateway-admin-listen",
+                "127.0.0.1:0",
+            ],
+        ] {
+            let mut args = options;
+            args.extend(["--", "/bin/true"]);
+            let mut config = RunConfig::default();
+            apply_run_options(&mut config, preset_args(&args)).unwrap();
+            assert_eq!(config.overlaynet.listen, "127.0.0.1:0");
+            assert_eq!(config.gateway.admin_listen, "127.0.0.1:0");
+            validate(&config, false).unwrap();
+        }
+        let mut config = RunConfig::default();
+        apply_run_options(
+            &mut config,
+            preset_args(&[
+                "--safe",
+                "--overlaynet-listen",
+                "127.0.0.1:18080",
+                "--gateway-admin-listen",
+                "127.0.0.1:19090",
+                "--",
+                "/bin/true",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(config.overlaynet.listen, "127.0.0.1:18080");
+        assert_eq!(config.gateway.admin_listen, "127.0.0.1:19090");
+    }
+
+    #[tokio::test]
+    async fn proxy_preparation_does_not_rebind_a_released_port_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = RunConfig::default();
+        apply_run_options(
+            &mut config,
+            preset_args(&["--overlaynet", "proxy", "--", "/bin/sh", "-c", "exit 0"]),
+        )
+        .unwrap();
+        // Simulate a concurrent Job claiming what a preflight probe selected.
+        // Port 0 now lets the actual listener choose a different, retained port.
+        let competing = std::net::TcpListener::bind(&config.overlaynet.listen).unwrap();
+        let occupied = competing.local_addr().unwrap();
+        let visor = PVisor::builder()
+            .storage(root.path())
+            .network(
+                NetworkDriverConfig::new(OverlayNetMode::Proxy, NetworkConfig::default())
+                    .listen(&config.overlaynet.listen),
+            )
+            .build();
+        // Use the shell built-in on both Linux and macOS; /bin/true is not
+        // available on macOS (its standalone true lives under /usr/bin).
+        let mut spec =
+            RunSpec::process(format!("run-{}", uuid::Uuid::new_v4()), "probe", "/bin/sh");
+        let RunInvocation::Process(process) = &mut spec.invocation;
+        process.args = vec!["-c".into(), "exit 0".into()];
+        let run = pvisor::job_service::RuntimeJobService::start_managed(&visor, spec, config)
+            .await
+            .unwrap();
+        let result = run.wait().await.unwrap();
+        assert_eq!(result.state, RunState::Completed, "{result:#?}");
+        assert_eq!(result.exit_code, Some(0), "{result:#?}");
+        let record = pvisor::RunRecord::read(root.path()).unwrap();
+        let bound: std::net::SocketAddr = record.overlaynet_listen.unwrap().parse().unwrap();
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
+        assert_ne!(bound, occupied);
+        assert!(std::net::TcpStream::connect(occupied).is_ok());
+    }
+
+    #[test]
     fn safe_requires_isolation_without_a_separate_sandbox_option() {
         let args = preset_args(&["--safe", "--", "/bin/true"]);
         assert!(args.run.safe);
@@ -4896,7 +4974,7 @@ sandbox = "required""#
         ]);
         let mut config = RunConfig::default();
         apply_cli(&mut config, args).unwrap();
-        apply_safe_defaults(&mut config).unwrap();
+        apply_safe_defaults(&mut config);
         assert!(!config.run.inherit_env);
         assert_eq!(config.run.pass_env, ["EXPLICIT_TOKEN"]);
         assert_eq!(config.run.resource_limits.memory_bytes, Some(1_048_576));

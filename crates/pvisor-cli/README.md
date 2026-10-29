@@ -64,6 +64,12 @@ The explicit `--vm-socket` debug override still uses the older SDK exchange;
 its response wait currently ignores CLI cancellation. Runtime Overlay and native
 capture sockets also remain in use. See [internal channels and cleanup order](../../docs/src/en/design/architecture.md#owner-internal-control).
 
+Automatic loopback proxy and Gateway admin ports are allocated by the actual
+listeners at startup, without probing and releasing a temporary reservation.
+`--overlaynet-listen 127.0.0.1:0` and `--gateway-admin-listen 127.0.0.1:0` also
+request this allocation. Runtime-injected addresses and Run records contain the
+resolved listening port; an occupied custom fixed address still fails to bind.
+
 Help, version and feature queries emit no startup logs. Execution startup markers
 are emitted after command parsing and do not measure complete process entry.
 The frontend verifies and pins its own executable before launching its owner;

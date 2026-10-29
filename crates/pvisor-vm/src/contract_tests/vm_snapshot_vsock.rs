@@ -146,17 +146,51 @@ fn queued_external_response_rejects_snapshot_and_original_can_resume() {
         .unwrap_err()
         .contains("pending responses"));
     source.thaw().unwrap();
-    submit(&mem, 0, 0, &[0; 52], true);
-    // The thawed worker may drain RX before this thread; completion and the
-    // actual RST response are the contract, not which thread drains the queue.
-    wait(|| {
-        source.process_stream_rx();
-        used(&mem, 0) == 1
-    });
-    assert_eq!(used(&mem, 0), 1);
-    assert_eq!(mem.read_obj::<u16>(GuestAddress(0x10000 + 30)).unwrap(), 3);
-    freeze(&mut source);
-    assert!(source.capture_state().is_ok());
+    // Keep the original timestamp-capable RX capacity and live workers. The
+    // macOS timesync thread may consume the first buffer before RST delivery.
+    // Accept only its exact protocol shape, then require RST in the next buffer.
+    // Its ordinary interval is 60s, beyond the fixture's 5s completion deadline.
+    for index in 0..2u16 {
+        submit(&mem, 0, index, &[0; 52], true);
+        wait(|| {
+            source.process_stream_rx();
+            used(&mem, 0) == index + 1
+        });
+        let data = 0x10000 + u64::from(index) * 256;
+        assert_eq!(mem.read_obj::<u64>(GuestAddress(data)).unwrap(), 2);
+        assert_eq!(mem.read_obj::<u64>(GuestAddress(data + 8)).unwrap(), 3);
+        assert_eq!(
+            mem.read_obj::<u32>(GuestAddress(base(0) + 0x2004 + u64::from(index) * 8))
+                .unwrap(),
+            u32::from(index)
+        );
+        let response = (
+            mem.read_obj::<u16>(GuestAddress(data + 30)).unwrap(), // op
+            mem.read_obj::<u16>(GuestAddress(data + 28)).unwrap(), // type
+            mem.read_obj::<u32>(GuestAddress(data + 24)).unwrap(), // payload length
+            mem.read_obj::<u32>(GuestAddress(data + 16)).unwrap(), // source port
+            mem.read_obj::<u32>(GuestAddress(data + 20)).unwrap(), // destination port
+            mem.read_obj::<u32>(GuestAddress(base(0) + 0x2008 + u64::from(index) * 8))
+                .unwrap(), // used length
+        );
+        if response.0 == 5 {
+            assert_eq!(index, 0, "RST must follow the initial timesync packet");
+            assert_eq!(response, (5, 2, 8, 123, 123, 52));
+            assert_ne!(mem.read_obj::<u64>(GuestAddress(data + 44)).unwrap(), 0);
+            freeze(&mut source);
+            assert!(source
+                .capture_state()
+                .unwrap_err()
+                .contains("pending responses"));
+            source.thaw().unwrap();
+        } else {
+            assert_eq!(response, (3, 1, 0, 4321, 1234, 44));
+            freeze(&mut source);
+            assert!(source.capture_state().is_ok());
+            return;
+        }
+    }
+    panic!("pending RST was not delivered");
 }
 
 #[test]

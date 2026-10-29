@@ -114,11 +114,8 @@ pub(in crate::cli) async fn fork(args: ForkArgs) -> anyhow::Result<i32> {
     crate::cli::host_service::check_record(&source)?;
     // Fail before checkpoint/stage mutations when historical policy cannot be reconstructed.
     let (mut config, required_sandbox) = pvisor::job_service::policy::workspace_config(&source)?;
-    // Inherited policy omits attempt-local endpoints. Allocate before any stage
-    // mutation; normal launch validation must still reject user-supplied port 0.
-    if config.overlaynet.mode == pvisor::OverlayNetMode::Proxy {
-        config.overlaynet.listen = super::free_loopback_address()?;
-    }
+    // Inherited policy already selects port 0 for fresh attempt-local listeners.
+    // Leave allocation to their actual bind rather than probing a released port.
     let parent_isolation = source
         .executor
         .as_ref()
