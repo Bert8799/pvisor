@@ -10,6 +10,8 @@ pub mod checkpoint;
 pub(crate) mod completion;
 mod drivers;
 pub(crate) mod event;
+#[cfg(unix)]
+pub(crate) mod executable;
 pub(crate) mod execution;
 #[cfg(unix)]
 pub mod host_transport;

@@ -21,6 +21,9 @@ impl RuntimeSupport for VmPlatform {
     fn embedded_kernel() -> Option<KernelImage> {
         crate::firmware::embedded_kernel()
     }
+    fn embedded_kernel_sha256() -> Option<[u8; 32]> {
+        crate::firmware::embedded_kernel_sha256()
+    }
     fn firmware_name() -> &'static str {
         crate::firmware_store::firmware_name()
     }

@@ -37,19 +37,29 @@ const IDLE_CHILD_FD: RawFd = 202;
 const RAW_READY_CHILD_FD: RawFd = 203;
 
 pub(super) fn runner_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
-    // Keep every source descriptor above all fixed destinations, avoiding dup2
-    // clobbering one socket when the parent's fd table happens to be crowded.
-    let duplicate = unsafe {
-        libc::fcntl(
-            fd,
-            libc::F_DUPFD_CLOEXEC,
-            RAW_READY_CHILD_FD.max(crate::diagnostics::INHERITED_LOG_FD) + 1,
-        )
-    };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error());
+    let reserved = [
+        NETWORK_CHILD_FD,
+        CONTROL_CHILD_FD,
+        RAM_CHILD_FD,
+        IDLE_CHILD_FD,
+        RAW_READY_CHILD_FD,
+        crate::diagnostics::INHERITED_LOG_FD,
+    ];
+    // Low sources avoid parent fd-table growth; reserved destinations must not
+    // clobber a later mapping in the child.
+    let mut minimum = 3;
+    loop {
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        if !reserved.contains(&duplicate.as_raw_fd()) {
+            return Ok(duplicate);
+        }
+        minimum = reserved.iter().max().unwrap() + 1;
+        // Drop this unused reserved descriptor before retrying above the block.
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -902,7 +912,7 @@ impl VmExecutor {
 }
 
 fn resolve_firmware(settings: &VmSettings) -> anyhow::Result<Option<PathBuf>> {
-    if pvisor_vm::api::VmPlatform::embedded_kernel().is_some() {
+    if pvisor_vm::api::VmPlatform::embedded_kernel_sha256().is_some() {
         return Ok(None);
     }
     if let Some(directory) = &settings.library_dir {
@@ -954,7 +964,7 @@ fn configure_runner_firmware(
             .context("configure selected VM firmware")?;
     } else {
         anyhow::ensure!(
-            pvisor_vm::api::VmPlatform::embedded_kernel().is_some(),
+            pvisor_vm::api::VmPlatform::embedded_kernel_sha256().is_some(),
             "VM runner requires an explicitly selected local firmware file"
         );
     }
@@ -3416,6 +3426,84 @@ fn guest_path_in_root(root: &Path, target: &Path) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn runner_sources_use_low_fds_and_skip_every_reserved_destination() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        const ROLE: &str = "PVISOR_RUNNER_FD_TEST_CHILD";
+        // Fill only a fresh test process's table, independent of parallel tests
+        // or a caller's existing descriptors. Never overwrite an occupied fd.
+        if std::env::var_os(ROLE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "executor::vm::supported::tests::runner_sources_use_low_fds_and_skip_every_reserved_destination",
+                    "--nocapture",
+                ])
+                .env(ROLE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let source = tempfile::tempfile().unwrap();
+        let check = |fd: &OwnedFd| {
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(
+                unsafe { libc::fstat(fd.as_raw_fd(), metadata.as_mut_ptr()) },
+                0
+            );
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                unsafe { metadata.assume_init() }.st_ino,
+                source.metadata().unwrap().ino()
+            );
+        };
+        let low = super::runner_fd(source.as_raw_fd()).unwrap();
+        assert!(low.as_raw_fd() < super::NETWORK_CHILD_FD);
+        check(&low);
+        drop(low);
+        let duplicate = || {
+            let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(fd >= 0);
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let mut occupied = Vec::new();
+        loop {
+            let fd = duplicate();
+            if fd.as_raw_fd() >= super::NETWORK_CHILD_FD {
+                assert_eq!(fd.as_raw_fd(), super::NETWORK_CHILD_FD);
+                break;
+            }
+            occupied.push(fd);
+        }
+        for reserved in [
+            super::NETWORK_CHILD_FD,
+            super::CONTROL_CHILD_FD,
+            super::RAM_CHILD_FD,
+            crate::diagnostics::INHERITED_LOG_FD,
+            super::IDLE_CHILD_FD,
+            super::RAW_READY_CHILD_FD,
+        ] {
+            let high = super::runner_fd(source.as_raw_fd()).unwrap();
+            assert!(
+                high.as_raw_fd()
+                    > super::RAW_READY_CHILD_FD.max(crate::diagnostics::INHERITED_LOG_FD)
+            );
+            check(&high);
+            // The skipped reservation was closed, not leaked or overwritten.
+            let fd = duplicate();
+            assert_eq!(fd.as_raw_fd(), reserved);
+            occupied.push(fd);
+        }
+        assert_eq!(
+            super::runner_fd(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+    #[test]
     fn guest_environment_scrubs_before_explicit_overlay_and_unsets_last() {
         use super::*;
         let inherited = BTreeMap::from([
@@ -3613,9 +3701,37 @@ mod tests {
         let sources = (0..5)
             .map(|_| super::runner_fd(file.as_raw_fd()).unwrap())
             .collect::<Vec<_>>();
+        let numbers = sources
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(numbers.len(), 5);
         for source in sources {
-            assert!(source.as_raw_fd() > super::IDLE_CHILD_FD);
-            assert!(source.as_raw_fd() > crate::diagnostics::INHERITED_LOG_FD);
+            assert!(
+                ![
+                    super::NETWORK_CHILD_FD,
+                    super::CONTROL_CHILD_FD,
+                    super::RAM_CHILD_FD,
+                    crate::diagnostics::INHERITED_LOG_FD,
+                    super::IDLE_CHILD_FD,
+                    super::RAW_READY_CHILD_FD,
+                ]
+                .contains(&source.as_raw_fd())
+            );
+            assert_ne!(source.as_raw_fd(), file.as_raw_fd());
+            assert_eq!(
+                unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC
+            );
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::File::from(source).metadata().unwrap();
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (
+                    file.metadata().unwrap().dev(),
+                    file.metadata().unwrap().ino()
+                )
+            );
         }
     }
     #[test]

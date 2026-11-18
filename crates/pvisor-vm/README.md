@@ -339,6 +339,11 @@ Guest supervisor 的内嵌构建使用相对当前 crate 的源码和产物依�
 身份仍由 LOOKUP/READDIRPLUS 建立，目录 cookies、名称/类型快照和 hard-link
 身份关系保持不变。
 
+`RuntimeSupport::embedded_kernel_sha256` 返回构建时对实际未压缩内核字节
+（含 padding）计算的 SHA-256；没有内置内核时返回 `None`。存在性与兼容性查询
+可使用该接口，不触发解包或内核存储分配。`embedded_kernel` 仍在需要真实字节时
+惰性解包；动态固件与调用方提供的内核不使用这个摘要。
+
 ## 核心接口模型
 
 所有定义集中在 `src/api.rs`，实现集中在私有适配器中。文件系统配置使用 `PathBuf`，UTF-8 校验及内部设备格式转换由运行时完成。

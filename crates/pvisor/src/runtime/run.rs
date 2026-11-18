@@ -771,8 +771,14 @@ impl PVisor {
         };
         #[cfg(unix)]
         if let Some(server) = &control_server {
+            // This is a precomputation hint, never checkpoint admission. Ordinary
+            // process and network-enforced VM runs do not pay for SHA-256 here.
+            let checkpoint = cfg!(target_os = "linux")
+                && resolved.descriptor.kind == pvisor_core::ExecutorKind::VirtualMachine
+                && resolved.descriptor.supports_checkpoint
+                && !self.runtime.vm_network_is_enforcing();
             resolved.preparation.live_control =
-                Some(server.record().map_err(PVisorError::Prepare)?);
+                Some(server.record(checkpoint).map_err(PVisorError::Prepare)?);
             resolved.spec.metadata.insert(
                 super::instance_control::INSTANCE_CONTROL_DIRECTORY_METADATA.into(),
                 serde_json::to_value(server.directory())
@@ -928,7 +934,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        if pvisor_vm::api::VmPlatform::embedded_kernel().is_none() {
+        if pvisor_vm::api::VmPlatform::embedded_kernel_sha256().is_none() {
             std::fs::write(
                 temp.path()
                     .join(pvisor_vm::api::VmPlatform::firmware_name()),

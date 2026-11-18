@@ -369,6 +369,9 @@ impl RuntimeSupport for VmPlatform {
     fn embedded_kernel() -> Option<KernelImage> {
         crate::firmware::embedded_kernel()
     }
+    fn embedded_kernel_sha256() -> Option<[u8; 32]> {
+        crate::firmware::embedded_kernel_sha256()
+    }
     fn cold_ram_activity() -> ColdRamActivity {
         ColdRamActivity::default()
     }
