@@ -667,3 +667,129 @@ pub trait GuestExitReport {
     /// borrowed and reusable as bytes; the root device enforces one report only.
     fn report(&self, code: i32) -> io::Result<[u8; EXIT_REPORT_BYTES]>;
 }
+
+/// Current template handoff protocol version. Unknown versions fail closed.
+pub const TEMPLATE_VERSION: u32 = 1;
+/// Reserved environment key populated from the host's new instance identity.
+pub const TEMPLATE_INSTANCE_ENV: &str = "PVISOR_INSTANCE_ID";
+
+/// Alternative boot document at `/.pvisor-guest.json`.
+///
+/// Ordinary launch documents remain unchanged. A template document has exactly
+/// one `template` field, with no argv, workload environment or credentials.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum TemplateBootConfig {
+    /// Existing immediate workload launch.
+    Workload(Box<GuestConfig>),
+    /// Initialize only the guest platform, then await one framed task on stdin.
+    Template {
+        /// Versioned, non-secret template identity and console topology.
+        template: GuestTemplate,
+    },
+}
+
+/// Identity of an inert template. This document contains no per-instance data.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestTemplate {
+    /// Must equal [`TEMPLATE_VERSION`].
+    pub version: u32,
+    /// Host-defined content identity: exactly 64 lowercase hexadecimal digits.
+    /// The guest checks equality, not the underlying image digest.
+    pub template_id: String,
+    /// The existing stdin/stdout/stderr virtio-console topology. Input and output
+    /// ports are required for the handoff; stderr may use the ordinary console.
+    pub stdio_ports: [bool; 3],
+}
+
+/// A template's handoff listener is ready, not an application readiness signal.
+///
+/// The host may capture an otherwise eligible VM after receiving this frame.
+/// Device freeze, transport state and snapshot compatibility remain VMM duties.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateReady {
+    /// Protocol version.
+    pub version: u32,
+    /// GuestTemplate for which the guest is awaiting a task.
+    pub template_id: String,
+}
+
+/// Exactly one task, sent only after the host has restored an independent VM.
+///
+/// Framing uses [`GuestFrameWrite::write_frame`] and its 1 MiB encoded limit. EOF,
+/// truncation, invalid data or failed reseeding aborts this instance; callers
+/// must not retry a partial handoff. These bytes can contain workload secrets.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateTask {
+    /// Must equal [`TEMPLATE_VERSION`].
+    pub version: u32,
+    /// Must match the inert template's identity exactly.
+    pub template_id: String,
+    /// Fresh host-assigned instance identity, 1..=128 ASCII letters, digits,
+    /// hyphens or underscores; UUIDs and daemon sandbox IDs are accepted.
+    /// The host must ensure uniqueness; syntax alone is not a uniqueness proof.
+    pub instance_id: String,
+    /// Fresh bytes from the host CSPRNG, generated after restoring this instance.
+    /// A deterministic, repeated or template-captured seed violates the contract.
+    pub entropy: [u8; 32],
+    /// Complete launch options, replacing any previous task's options. Initial
+    /// stdin must be Closed and PTY disabled: stdin carries this handoff only.
+    /// `PVISOR_INSTANCE_ID` is reserved; host env is never inherited.
+    pub config: GuestConfig,
+}
+
+/// One-shot handoff on private host-owned console streams; never a task pool.
+///
+/// ```
+/// use pvisor_guest::api::{GuestConfig, GuestFrameRead, GuestFrameWrite,
+///     GuestTemplate, GuestTemplateProtocol, ProcessConfig, StdinMode,
+///     TemplateReady, TemplateTask, TEMPLATE_VERSION, TEMPLATE_INSTANCE_ENV};
+/// let template = GuestTemplate {
+///     version: TEMPLATE_VERSION, template_id: "a".repeat(64),
+///     stdio_ports: [true, true, false],
+/// };
+/// template.validate()?;
+/// let task = TemplateTask {
+///     version: TEMPLATE_VERSION, template_id: template.template_id.clone(),
+///     instance_id: "fresh-instance".into(), entropy: [42; 32],
+///     config: GuestConfig {
+///         argv: vec!["/bin/true".into()], cwd: "/".into(),
+///         process: Some(ProcessConfig { stdin: StdinMode::Closed, ..Default::default() }),
+///         ..Default::default()
+///     },
+/// };
+/// let mut input = Vec::new();
+/// input.write_frame(&task)?;
+/// let mut output = Vec::new();
+/// let launch = template.receive(&mut input.as_slice(), &mut output, |seed| {
+///     assert_eq!(seed, &[42; 32]);
+///     Ok(()) // The Linux supervisor performs the required kernel reseed.
+/// })?;
+/// let ready: TemplateReady = output.as_slice().read_frame()?;
+/// assert_eq!(ready.template_id, template.template_id);
+/// assert_eq!(launch.env[TEMPLATE_INSTANCE_ENV], "fresh-instance");
+/// let mut invalid = template;
+/// invalid.version += 1;
+/// assert!(invalid.validate().is_err());
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub trait GuestTemplateProtocol {
+    /// Validate protocol version, content identity and console topology without I/O.
+    fn validate(&self) -> io::Result<()>;
+    /// Advertise readiness, consume one bounded task and reseed before returning
+    /// launch options. Call once after Linux platform/console initialization.
+    /// The host owns timeouts, cancellation, instance uniqueness and fresh entropy.
+    /// Invalid tasks never call `reseed`; any error returns no launch options.
+    /// Partial input must not be retried. This starts no workload or sidecar.
+    /// Initial stdin must be closed, PTY and root-disk changes are unsupported.
+    /// Successful launch options contain the reserved fresh instance environment.
+    fn receive(
+        &self,
+        input: &mut impl Read,
+        output: &mut impl Write,
+        reseed: impl FnOnce(&[u8; 32]) -> io::Result<()>,
+    ) -> io::Result<GuestConfig>;
+}

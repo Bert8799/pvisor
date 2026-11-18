@@ -1,6 +1,6 @@
 //! Minimal PID 1: initialize the guest, supervise its workload, and report exit.
-use pvisor_guest::api::GuestValidation;
 use pvisor_guest::api::{CONFIG_PATH, GuestConfig, NetworkConfig};
+use pvisor_guest::api::{GuestTemplateProtocol, GuestValidation, TemplateBootConfig};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -625,6 +625,16 @@ fn workload(config: &GuestConfig) -> io::Result<i32> {
     code
 }
 
+fn reseed_template(entropy: &[u8; 32]) -> io::Result<()> {
+    // Mixing into the pool alone does not force an immediate CRNG update.
+    // RNDRESEEDCRNG is required before any task (or its sidecars) can run.
+    let mut random = OpenOptions::new().write(true).open("/dev/urandom")?;
+    random.write_all(entropy)?;
+    // Linux UAPI <linux/random.h>: _IO('R', 0x07). Not exported by libc.
+    const RNDRESEEDCRNG: u32 = 0x5207;
+    check(unsafe { libc::ioctl(random.as_raw_fd(), RNDRESEEDCRNG as _) })
+}
+
 fn startup_profile_enabled(config: &GuestConfig) -> bool {
     config
         .env
@@ -646,13 +656,29 @@ fn run() -> io::Result<i32> {
             "guest config exceeds 1 MiB",
         ));
     }
-    let config: GuestConfig = serde_json::from_slice(&bytes)?;
+    let boot: TemplateBootConfig = serde_json::from_slice(&bytes)?;
+    let (config, initialized) = match boot {
+        TemplateBootConfig::Workload(config) => (*config, false),
+        TemplateBootConfig::Template { template } => {
+            template.validate()?;
+            initialize(Some(template.stdio_ports))?;
+            let config = template.receive(
+                &mut io::stdin().lock(),
+                &mut io::stdout().lock(),
+                reseed_template,
+            )?;
+            (config, true)
+        }
+    };
     let profiling = startup_profile_enabled(&config);
-    let mut config_span = startup_profile::Span::since("guest.config", profiling.then_some(entry));
+    let mut config_span =
+        startup_profile::Span::since("guest.config", (profiling && !initialized).then_some(entry));
     config.validate()?; // Validate before any configuration side effects.
     config_span.complete();
     let mut startup = startup_profile::Span::start("guest.initialize", profiling);
-    initialize(config.stdio_ports)?;
+    if !initialized {
+        initialize(config.stdio_ports)?;
+    }
     if let Some(root) = &config.root_disk {
         root_disk::enter(root, config.network.as_ref())?;
         initialize_filesystems()?;
@@ -675,6 +701,9 @@ fn run() -> io::Result<i32> {
         )?;
     }
     if let Some(target) = &config.workspace {
+        if initialized {
+            fs::create_dir_all(target)?;
+        }
         mount("pvisor-workspace", target, "virtiofs", 0)?;
     }
     if let Some(target) = &config.payloads_dir {

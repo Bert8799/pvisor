@@ -144,3 +144,82 @@ mod tests {
         assert!(workload(&decoded).is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+mod template_tests {
+    use pvisor_guest::api::{
+        GuestConfig, GuestFrameRead, GuestFrameWrite, GuestTemplate, GuestTemplateProtocol,
+        ProcessConfig, StdinMode, TEMPLATE_VERSION, TemplateReady, TemplateTask,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    fn template() -> GuestTemplate {
+        GuestTemplate {
+            version: TEMPLATE_VERSION,
+            template_id: "a".repeat(64),
+            stdio_ports: [true, true, false],
+        }
+    }
+
+    fn task() -> TemplateTask {
+        TemplateTask {
+            version: TEMPLATE_VERSION,
+            template_id: "a".repeat(64),
+            instance_id: "sb-12345678-1234-4234-8234-123456789abc".into(),
+            entropy: [42; 32],
+            config: GuestConfig {
+                argv: vec!["/bin/true".into()],
+                cwd: "/".into(),
+                process: Some(ProcessConfig {
+                    stdin: StdinMode::Closed,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn frame(value: &impl serde::Serialize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        GuestFrameWrite::write_frame(&mut bytes, value).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn task_replaces_command_environment_and_directory_only_after_reseeding() {
+        let root = tempfile::tempdir().unwrap();
+        let mut request = task();
+        request.config.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "test \"$TASK_VALUE\" = 'literal $value' && test \"$PVISOR_INSTANCE_ID\" = \"$1\" && test -z \"${HOME+x}\" && pwd".into(),
+        "probe".into(),
+        request.instance_id.clone(),
+    ];
+        request.config.cwd = root.path().canonicalize().unwrap();
+        request
+            .config
+            .env
+            .insert("TASK_VALUE".into(), "literal $value".into());
+        let called = AtomicBool::new(false);
+        let mut output = Vec::new();
+        let config = template()
+            .receive(&mut &frame(&request)[..], &mut output, |entropy| {
+                assert_eq!(entropy, &[42; 32]);
+                called.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert!(called.load(Ordering::SeqCst));
+        let ready: TemplateReady = GuestFrameRead::read_frame(&mut &output[..]).unwrap();
+        assert_eq!(ready.version, TEMPLATE_VERSION);
+        assert_eq!(ready.template_id, request.template_id);
+        assert_eq!(config.argv, request.config.argv);
+        assert_eq!(config.env.len(), 2); // No captured or host environment.
+        let result = super::workload(&config).unwrap().output().unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            config.cwd.to_str().unwrap()
+        );
+    }
+}

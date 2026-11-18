@@ -5,3 +5,4 @@ pub mod api;
 mod control;
 mod exit_status;
 mod launch;
+mod template;

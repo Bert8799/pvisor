@@ -5,7 +5,7 @@ Rust PID 1 supervisor and the platform-independent launch message in `/.pvisor-g
 ## Public API
 
 Import only `pvisor_guest::api`. It owns launch, control, serial-credit and exit
-records plus five declaration-only traits. `GuestValidation::validate` checks the
+records plus declaration-only traits. `GuestValidation::validate` checks the
 whole launch, including every sidecar, without I/O or mutation. Host callers do
 not receive executable commands; command construction and process ownership stay
 inside the guest binary. Default launch records are non-launchable.
@@ -361,3 +361,62 @@ is connected, so it excludes the subsequent console wait. Logging can perturb
 startup. Collect profiled diagnostics separately
 from uninstrumented performance samples. See the
 [startup diagnostic tool](../../benchmark/startup/startup_profile.py).
+
+## Inert template handoff
+
+The optional boot document below initializes Linux virtual filesystems and
+console ports, then blocks on one task. It starts no workload, agent, sidecar,
+bridge, workload mount or network configuration before the handoff:
+
+```json
+{"template":{"version":1,"template_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdio_ports":[true,true,false]}}
+```
+
+The ordinary `GuestConfig` document remains supported. Template documents reject
+workload fields and credentials. The host binds the 64-digit content identity to
+its immutable inputs and machine topology; the guest verifies only syntax and
+the received task's matching identity. This is a separate template handoff
+protocol, not the existing port-1025 live-workload adapter.
+
+After setup the supervisor writes and flushes a framed `api::TemplateReady` on
+stdout, then reads exactly one `api::TemplateTask` from stdin. Both use the existing
+four-byte big-endian length and bounded JSON framing (1 MiB maximum). This Ready
+means **waiting for a task**, not application readiness or `REFERENCE_READY`.
+The host must capture before sending any task bytes; capture admission, device
+drain, console state and restore compatibility still belong to the host/VMM.
+
+The task supplies complete command, environment, working directory and launch
+options, a new instance ID (up to 128 ASCII letters, digits, hyphens or
+underscores) and 32 fresh host-CSPRNG bytes generated for
+that restored instance. Before any task setup or process starts, PID 1 mixes the
+bytes into `/dev/urandom` and requires Linux `RNDRESEEDCRNG` to succeed. Unsupported
+or denied reseeding aborts launch; it never falls back to cloned random state.
+`PVISOR_INSTANCE_ID` is injected from the task and cannot be overridden by its
+environment. Initial stdin must be `Closed`, with no PTY: the handoff owns stdin.
+Stdout becomes ordinary workload output after the readiness frame. The host must
+consume that frame separately. No host environment is inherited or shell text
+evaluated by the handoff. Existing launch validation, supervision and final
+virtio-fs synchronization apply after receipt. A workspace mountpoint is created
+in the private guest root only after this handoff, immediately before mounting
+the freshly bound workspace device; no old workspace is mounted during capture.
+
+Malformed, oversized, truncated, foreign-template or invalid tasks fail closed
+before reseeding. Failed reseeding returns no launch options. There is no second
+task, acknowledgement retry or instance recycling. The host owns timeouts,
+cancellation, instance uniqueness, seed quality and termination of abandoned VMs.
+
+The native executor and Daemon's optional local template selection use this
+protocol with versioned catalog leases, shared read-only baselines, private
+writes and fresh network backends. Ordinary execution restore retains its
+separate original-task/no-network contract. The handoff does not reset arbitrary
+image/application identity, cached user-space randomness or existing network
+connections: capture must precede application startup, and images must contain
+no per-instance secrets. Bootstrap code must use the new instance identity and
+task credentials rather than treating shared image files or the fixed virtual
+MAC/IP/CID as globally unique identities. Protocol tests alone do not establish
+snapshot cloning, SDK conformance, startup gains or high-density deployment.
+
+Public declarations live in `api`: `TemplateBootConfig`, `GuestTemplate`, `TemplateReady`,
+`TemplateTask` and `GuestTemplateProtocol`. The implementation is private. Ordinary
+root-disk launches remain supported; changing root disks during handoff is rejected.
+The task-config diagnostic starts after handoff and excludes the inert wait.

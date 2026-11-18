@@ -141,6 +141,7 @@ fn public_behavior_has_one_canonical_surface() {
         ("GuestFrameWrite", vec!["write_frame"]),
         ("GuestSignal", vec!["parse_signal"]),
         ("GuestExitReport", vec!["report"]),
+        ("GuestTemplateProtocol", vec!["validate", "receive"]),
     ])
     .into_iter()
     .map(|(name, methods)| {
@@ -166,7 +167,9 @@ fn public_behavior_has_one_canonical_surface() {
             "EXIT_CLAIM_IOCTL",
             "EXIT_REPORT_IOCTL",
             "EXIT_TOKEN_BYTES",
-            "EXIT_REPORT_BYTES"
+            "EXIT_REPORT_BYTES",
+            "TEMPLATE_VERSION",
+            "TEMPLATE_INSTANCE_ENV"
         ]
     );
 }
