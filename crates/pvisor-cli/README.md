@@ -253,6 +253,12 @@ The explicit `--vm-socket` debug override still uses the older SDK exchange;
 its response wait currently ignores CLI cancellation. Runtime Overlay and native
 capture sockets also remain in use. See [internal channels and cleanup order](../../docs/src/en/design/architecture.md#owner-internal-control).
 
+Automatic loopback proxy and Gateway admin ports are allocated by the actual
+listeners at startup, without probing and releasing a temporary reservation.
+`--overlaynet-listen 127.0.0.1:0` and `--gateway-admin-listen 127.0.0.1:0` also
+request this allocation. Runtime-injected addresses and Run records contain the
+resolved listening port; an occupied custom fixed address still fails to bind.
+
 Help, version and feature queries emit no startup logs. Execution startup markers
 are disabled by default; set `PVISOR_STARTUP_TIMING=1` to enable checkpoints,
 persistence timings and frontend/owner correlation records. This changes diagnostics
@@ -426,6 +432,46 @@ CLI contracts. With KVM and matching GNU firmware available, set
 `mise run test -- pvisor-cli -- -E 'binary(stage_cli)' --run-ignored only` for the
 native host-root workflow. It writes only isolated temporary fixtures and never
 applies to the real host root.
+
+## Prepared VM templates
+
+On Linux x86_64, prepare an inert template with the same CLI that will run it:
+
+```bash
+pvisor cache prepare-template --rootfs /path/to/source-rootfs \
+  --catalog /private/templates --work-dir /private/preparation
+```
+
+The source must be a quiescent independent image, without `init.krun` or template
+configuration. The command uses this executable's embedded guest and an isolated
+capture worker. Its private staging directory is reclaimed after the worker is
+reaped; a 90-second timeout terminates and reaps it. Failure near publication can
+leave a generation in the catalog: inspect it before retrying publication.
+Worker JSON is collected
+in a private temporary file and read with a 1 MiB limit after reaping, avoiding
+a full stdout pipe blocking publication.
+The returned JSON identifies `catalog`, immutable `version` and sealed `rootfs`.
+Select that version in the run configuration:
+
+```toml
+[vm.template]
+catalog = "/private/templates"
+version = "REPLACE_WITH_RETURNED_64_HEX_VERSION"
+```
+
+Run with `pvisor spawn --vm --config template.toml --stage NEW_STAGE --cpu 2
+--memory 128MiB -- /bin/sh </dev/null` from the task workspace. The rootfs is
+resolved from the selected generation; an explicit `--rootfs` must equal its
+returned sealed path. Resource settings, build, firmware and host boot identity
+must match preparation. The catalog must be outside the workspace and stage.
+
+This path retains the normal CLI owner, instance control, Run Bundle and
+workspace review/apply. Each launch binds a fresh workspace and private root
+writes, fresh network endpoints, task identity and entropy; RAM uses private COW.
+It requires automatic VM networking and stdin redirected from `/dev/null`.
+Interactive input, PTYs, execution checkpoints, CPU QoS and explicit RAM
+backing/paging/pool profiles are unsupported. Unsupported requests fail without
+falling back to cold boot. Root-only templates use a separate preparation profile.
 
 ## Docker command profile (experimental)
 

@@ -580,7 +580,7 @@ struct OverlayNetOverrides {
         default_missing_value = "proxy"
     )]
     overlaynet: Option<OverlayNetMode>,
-    /// Explicit proxy listen address; supplying it enables OverlayNet.
+    /// Explicit proxy listen address; port 0 allocates at startup. Enables OverlayNet.
     #[arg(long, value_name = "ADDR")]
     overlaynet_listen: Option<String>,
     #[arg(long, value_parser = super::values::overlay_net_policy(), hide = true)]
@@ -1310,6 +1310,53 @@ async fn delegated_shutdown_signal() {
     }
 }
 
+fn open_vm_template(
+    config: &mut RunConfig,
+) -> anyhow::Result<Option<pvisor::environment_snapshot::templates::TemplateLease>> {
+    use pvisor::environment_snapshot::templates::{PROFILE, TemplateCatalog};
+    let Some(selected) = &config.vm.template else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "CLI templates require Linux x86_64"
+    );
+    anyhow::ensure!(
+        config.run.executor == RunExecutorKind::Vm
+            && config.vm.prepared_rootfs.is_none()
+            && config.vm.image.is_none()
+            && config.overlaynet.mode == OverlayNetMode::Auto,
+        "vm.template requires the VM executor, automatic VM networking and no other image selector"
+    );
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let input = std::fs::metadata("/proc/self/fd/0")?;
+    let null = std::fs::metadata("/dev/null")?;
+    anyhow::ensure!(
+        input.file_type().is_char_device() && input.rdev() == null.rdev(),
+        "CLI template handoff requires closed stdin; redirect stdin from /dev/null"
+    );
+    let mut settings = config.vm.clone();
+    settings.template = None;
+    let mut compatibility = VmExecutor::checkpoint_compatibility(&settings)?;
+    compatibility.profile = PROFILE.into();
+    let lease = TemplateCatalog::new(&selected.catalog)?
+        .acquire_version(&selected.version, &compatibility)?;
+    anyhow::ensure!(
+        lease.version().spec.workspace_device,
+        "CLI requires a workspace-capable template prepared by this CLI build"
+    );
+    let root = lease.environment().owned_layer_path(Path::new("rootfs"))?;
+    if let Some(requested) = &config.vm.rootfs {
+        anyhow::ensure!(
+            requested.canonicalize()? == root,
+            "template rootfs must match the prepared generation's returned rootfs path"
+        );
+    }
+    config.vm.rootfs = Some(root);
+    config.vm.rootfs_immutable = true;
+    Ok(Some(lease))
+}
+
 async fn execute_config(
     mut config: RunConfig,
     run_id: String,
@@ -1327,6 +1374,7 @@ async fn execute_config(
     config.features.validate(config.run.executor)?;
     normalize_filesystem_config(&mut config)?;
     validate_prepared_workspace_request(&config)?;
+    let template_owner = open_vm_template(&mut config)?;
     // Resolve the same workspace used by the eventual executor before reading
     // policy defaults. Overlay bases can select a workspace different from cwd.
     let workspace = resolve_execution_workspace(&config, stage_launch.is_some())?;
@@ -1472,6 +1520,15 @@ async fn execute_config(
     let storage = resolve_run_storage(&select_run_storage(&config, &workspace, &run_id)?)?;
     if let Some(path) = &result_file {
         validate_result_file_destination(path, &storage)?;
+    }
+    if let Some(selected) = &config.vm.template {
+        let catalog = selected.catalog.canonicalize()?;
+        for source in [&workspace, &storage] {
+            anyhow::ensure!(
+                !source.starts_with(&catalog) && !catalog.starts_with(source),
+                "template catalog must be outside the guest workspace and stage"
+            );
+        }
     }
     if config
         .policies
@@ -1628,7 +1685,12 @@ async fn execute_config(
         RunExecutorKind::Container => Arc::new(ContainerExecutor::new(config.container.clone())?),
         RunExecutorKind::Vm => {
             pvisor::startup_mark_run("cli.vm_inputs_ready", &run_id);
-            let mut executor = VmExecutor::new(config.vm.clone())?;
+            let mut settings = config.vm.clone();
+            settings.template = None;
+            let mut executor = match template_owner {
+                Some(lease) => VmExecutor::from_template(settings, lease, &storage)?,
+                None => VmExecutor::new(settings)?,
+            };
             if let Some(base) = prepared_rootfs_owner {
                 executor = executor.with_rootfs_base(base)?;
             }
@@ -1689,7 +1751,9 @@ async fn execute_config(
     super::agent::project(&config, &mut spec)?;
     let RunInvocation::Process(process) = &mut spec.invocation;
     process.args = program_args.to_vec();
-    process.stdin = if stage_launch.as_ref().is_none_or(|stage| stage.interactive) {
+    process.stdin = if config.vm.template.is_some() {
+        StdioMode::Null
+    } else if stage_launch.as_ref().is_none_or(|stage| stage.interactive) {
         StdioMode::Inherit
     } else {
         StdioMode::Null
@@ -2117,7 +2181,7 @@ fn valid_environment_name(name: &str) -> bool {
         && !name.as_bytes()[0].is_ascii_digit()
 }
 
-fn apply_safe_defaults(config: &mut RunConfig) -> anyhow::Result<()> {
+fn apply_safe_defaults(config: &mut RunConfig) {
     // Preserve Codex account/routing discovery through CODEX_* and provider variables.
     config.run.inherit_env = config
         .run
@@ -2127,10 +2191,12 @@ fn apply_safe_defaults(config: &mut RunConfig) -> anyhow::Result<()> {
         .and_then(|name| name.to_str())
         == Some("codex");
     if config.overlaynet.listen == OverlayNetSettings::default().listen {
-        config.overlaynet.listen = free_loopback_address()?;
+        // Bind the real listener once, at startup. Probing a free port here
+        // and closing it leaves a race with concurrent launches before preparation.
+        config.overlaynet.listen = "127.0.0.1:0".into();
     }
     if config.gateway.admin_listen == pvisor::GatewaySettings::default().admin_listen {
-        config.gateway.admin_listen = free_loopback_address()?;
+        config.gateway.admin_listen = "127.0.0.1:0".into();
     }
     if config.run.agent == "agent"
         && let Some(program) = config.run.command.first()
@@ -2141,12 +2207,6 @@ fn apply_safe_defaults(config: &mut RunConfig) -> anyhow::Result<()> {
             .unwrap_or("agent")
             .to_owned();
     }
-    Ok(())
-}
-
-fn free_loopback_address() -> anyhow::Result<String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.to_string())
 }
 
 /// Resolve ordinary defaults/config, then the opt-in preset, then explicit CLI values.
@@ -2166,7 +2226,7 @@ fn apply_run_options(config: &mut RunConfig, args: RunArgs) -> anyhow::Result<()
     }
     apply_cli(config, args.clone())?;
     reject_ask_config(config)?;
-    apply_safe_defaults(config)?;
+    apply_safe_defaults(config);
     Ok(())
 }
 
@@ -3111,7 +3171,11 @@ fn validate(config: &RunConfig, safe: bool) -> anyhow::Result<()> {
         ContainerExecutor::new(config.container.clone())?;
     }
     if config.run.executor == RunExecutorKind::Vm {
-        VmExecutor::new(config.vm.clone())?;
+        let mut settings = config.vm.clone();
+        // The frontend separately authenticates the selector and constructs
+        // from_template; ordinary settings validation must not consume it.
+        settings.template = None;
+        VmExecutor::new(settings)?;
         let rootfs = config
             .vm
             .rootfs
@@ -3148,15 +3212,16 @@ fn validate(config: &RunConfig, safe: bool) -> anyhow::Result<()> {
     if config.overlaynet.mode == OverlayNetMode::Proxy
         || config.gateway.mode == GatewayMode::Capture
     {
-        let listen: std::net::SocketAddr = config.overlaynet.listen.parse().with_context(|| {
-            format!(
-                "invalid OverlayNet listen address {}",
-                config.overlaynet.listen
-            )
-        })?;
-        if listen.port() == 0 {
-            bail!("OverlayNet port 0 is not supported; choose an explicit free port");
-        }
+        config
+            .overlaynet
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| {
+                format!(
+                    "invalid OverlayNet listen address {}",
+                    config.overlaynet.listen
+                )
+            })?;
     }
     if config.overlaynet.policy != OverlayNetPolicy::Allowlist
         && (!config.overlaynet.allow.is_empty() || !config.overlaynet.rules.is_empty())
@@ -4822,6 +4887,87 @@ level = "warn"
     }
 
     #[test]
+    fn ephemeral_proxy_ports_survive_cli_config_and_safe_defaults() {
+        for options in [
+            vec!["--safe"],
+            vec!["--overlaynet-listen", "127.0.0.1:0"],
+            #[cfg(feature = "gateway")]
+            vec![
+                "--gateway-mode",
+                "capture",
+                "--overlaynet-listen",
+                "127.0.0.1:0",
+                "--gateway-admin-listen",
+                "127.0.0.1:0",
+            ],
+        ] {
+            let mut args = options;
+            args.extend(["--", "/bin/true"]);
+            let mut config = RunConfig::default();
+            apply_run_options(&mut config, preset_args(&args)).unwrap();
+            assert_eq!(config.overlaynet.listen, "127.0.0.1:0");
+            assert_eq!(config.gateway.admin_listen, "127.0.0.1:0");
+            validate(&config, false).unwrap();
+        }
+        let mut config = RunConfig::default();
+        apply_run_options(
+            &mut config,
+            preset_args(&[
+                "--safe",
+                "--overlaynet-listen",
+                "127.0.0.1:18080",
+                "--gateway-admin-listen",
+                "127.0.0.1:19090",
+                "--",
+                "/bin/true",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(config.overlaynet.listen, "127.0.0.1:18080");
+        assert_eq!(config.gateway.admin_listen, "127.0.0.1:19090");
+    }
+
+    #[tokio::test]
+    async fn proxy_preparation_does_not_rebind_a_released_port_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = RunConfig::default();
+        apply_run_options(
+            &mut config,
+            preset_args(&["--overlaynet", "proxy", "--", "/bin/sh", "-c", "exit 0"]),
+        )
+        .unwrap();
+        // Simulate a concurrent launch claiming what a preflight probe selected.
+        // Port 0 now lets the actual listener choose a different, retained port.
+        let competing = std::net::TcpListener::bind(&config.overlaynet.listen).unwrap();
+        let occupied = competing.local_addr().unwrap();
+        let visor = PVisor::builder()
+            .storage(root.path())
+            .network(
+                NetworkDriverConfig::new(OverlayNetMode::Proxy, NetworkConfig::default())
+                    .listen(&config.overlaynet.listen),
+            )
+            .build();
+        // Use the shell built-in on both Linux and macOS; /bin/true is not
+        // available on macOS (its standalone true lives under /usr/bin).
+        let mut spec =
+            RunSpec::process(format!("run-{}", uuid::Uuid::new_v4()), "probe", "/bin/sh");
+        let RunInvocation::Process(process) = &mut spec.invocation;
+        process.args = vec!["-c".into(), "exit 0".into()];
+        let run = pvisor::session_service::SessionService::start_managed(&visor, spec, config)
+            .await
+            .unwrap();
+        let result = run.wait().await.unwrap();
+        assert_eq!(result.state, RunState::Completed, "{result:#?}");
+        assert_eq!(result.exit_code, Some(0), "{result:#?}");
+        let record = pvisor::RunRecord::read(root.path()).unwrap();
+        let bound: std::net::SocketAddr = record.overlaynet_listen.unwrap().parse().unwrap();
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
+        assert_ne!(bound, occupied);
+        assert!(std::net::TcpStream::connect(occupied).is_ok());
+    }
+
+    #[test]
     fn safe_requires_isolation_without_a_separate_sandbox_option() {
         let args = preset_args(&["--safe", "--", "/bin/true"]);
         assert!(args.run.safe);
@@ -5370,7 +5516,7 @@ sandbox = "required""#
         ]);
         let mut config = RunConfig::default();
         apply_cli(&mut config, args).unwrap();
-        apply_safe_defaults(&mut config).unwrap();
+        apply_safe_defaults(&mut config);
         assert!(!config.run.inherit_env);
         assert_eq!(config.run.pass_env, ["EXPLICIT_TOKEN"]);
         assert_eq!(config.run.resource_limits.memory_bytes, Some(1_048_576));

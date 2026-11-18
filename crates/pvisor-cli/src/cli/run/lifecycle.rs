@@ -127,11 +127,7 @@ pub(in crate::cli) async fn fork(args: ForkArgs) -> anyhow::Result<i32> {
             None
         }
     };
-    // Inherited policy omits execution-local endpoints. Allocate before any stage
-    // mutation; normal launch validation must still reject user-supplied port 0.
-    if config.overlaynet.mode == pvisor::OverlayNetMode::Proxy {
-        config.overlaynet.listen = super::free_loopback_address()?;
-    }
+    // Reconstructed policy selects ephemeral listeners at their actual bind.
     let parent_isolation = source
         .executor
         .as_ref()
