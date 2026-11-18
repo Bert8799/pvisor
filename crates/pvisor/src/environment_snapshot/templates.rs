@@ -174,6 +174,7 @@ impl TemplateSpec {
         }
         let id = digest(&serde_json::to_vec(self)?);
         Template {
+            environment_root: false,
             version: pvisor_guest::api::TEMPLATE_VERSION,
             template_id: id.clone(),
             stdio_ports: self.stdio_ports,
@@ -185,6 +186,7 @@ impl TemplateSpec {
     /// Construct the credential-free boot descriptor for this generation.
     pub fn boot(&self) -> anyhow::Result<Template> {
         Ok(Template {
+            environment_root: false,
             version: pvisor_guest::api::TEMPLATE_VERSION,
             template_id: self.id()?,
             stdio_ports: self.stdio_ports,

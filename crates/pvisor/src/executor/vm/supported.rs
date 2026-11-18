@@ -3560,6 +3560,7 @@ fn guest_config(
         }
     }
     pvisor_guest::api::GuestConfig {
+        environment_root: false,
         argv: std::iter::once(program.to_owned())
             .chain(args.iter().cloned())
             .collect(),

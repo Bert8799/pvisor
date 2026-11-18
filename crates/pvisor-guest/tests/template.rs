@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn template() -> GuestTemplate {
     GuestTemplate {
+        environment_root: false,
         version: TEMPLATE_VERSION,
         template_id: "a".repeat(64),
         stdio_ports: [true, true, false],
@@ -254,4 +255,38 @@ fn independent_handoffs_do_not_retain_another_instances_environment() {
     for handle in handles {
         handle.join().unwrap();
     }
+}
+
+#[test]
+fn environment_device_requires_matching_template_before_reseeding() {
+    for template_root in [false, true] {
+        for task_root in [false, true] {
+            let mut template = template();
+            template.environment_root = template_root;
+            let mut task = task();
+            task.config.environment_root = task_root;
+            let seeded = AtomicBool::new(false);
+            let result = template.receive(&mut Cursor::new(frame(&task)), &mut Vec::new(), |_| {
+                seeded.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), template_root == task_root);
+            assert_eq!(seeded.load(Ordering::SeqCst), template_root == task_root);
+            if let Ok(config) = result {
+                assert_eq!(config.environment_root, task_root);
+            }
+        }
+    }
+    assert!(
+        serde_json::to_value(template())
+            .unwrap()
+            .get("environment_root")
+            .is_none()
+    );
+    assert!(
+        serde_json::to_value(task().config)
+            .unwrap()
+            .get("environment_root")
+            .is_none()
+    );
 }

@@ -84,6 +84,12 @@ pub struct TemporaryFilesystem {
 /// checks it before any workload/sidecar effects. Unknown fields
 /// are rejected. Optional fields retain legacy defaults when absent.
 pub struct GuestConfig {
+    /// Template-only handoff to the previously unused `pvisor-environment`
+    /// filesystem. Must match the template descriptor; ordinary boot rejects it.
+    /// The Linux supervisor mounts the fixed device after validation/reseeding,
+    /// then initializes task filesystems there. No caller-selected mount path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub environment_root: bool,
     /// Nonempty program followed by literal NUL-free arguments; no shell expansion.
     pub argv: Vec<String>,
     /// Literal environment; names must be nonempty without equals/NUL, values NUL-free.
@@ -693,6 +699,11 @@ pub enum TemplateBootConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuestTemplate {
+    /// Capture contains an unused environment filesystem. The host must rebind
+    /// it before restore; task root switches only after identity validation and
+    /// entropy reseeding. False retains the original root and serialized form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub environment_root: bool,
     /// Must equal [`TEMPLATE_VERSION`].
     pub version: u32,
     /// Host-defined content identity: exactly 64 lowercase hexadecimal digits.
@@ -748,6 +759,7 @@ pub struct TemplateTask {
 ///     GuestTemplate, GuestTemplateProtocol, ProcessConfig, StdinMode,
 ///     TemplateReady, TemplateTask, TEMPLATE_VERSION, TEMPLATE_INSTANCE_ENV};
 /// let template = GuestTemplate {
+///     environment_root: false,
 ///     version: TEMPLATE_VERSION, template_id: "a".repeat(64),
 ///     stdio_ports: [true, true, false],
 /// };

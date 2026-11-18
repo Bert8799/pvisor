@@ -420,3 +420,14 @@ Public declarations live in `api`: `TemplateBootConfig`, `GuestTemplate`, `Templ
 `TemplateTask` and `GuestTemplateProtocol`. The implementation is private. Ordinary
 root-disk launches remain supported; changing root disks during handoff is rejected.
 The task-config diagnostic starts after handoff and excludes the inert wait.
+
+
+### Template environment root
+
+`GuestTemplate.environment_root` binds the handoff to a previously unused
+`pvisor-environment` filesystem device. The task must select the same mode before
+reseeding; mismatches never return launch options. After restore, PID 1 mounts
+that fixed device, enters it and initializes `/dev`, `/proc`, `/sys` and task
+mounts while retaining its captured console descriptors and original exit-token
+root handle. Ordinary launches reject environment-root selection. False values
+retain the old wire shape and ordinary root-disk setup stays separate.

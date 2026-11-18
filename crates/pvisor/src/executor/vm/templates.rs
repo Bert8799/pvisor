@@ -557,6 +557,7 @@ mod tests {
             },
             source: "/tmp/source".into(),
             boot: pvisor_guest::api::GuestTemplate {
+                environment_root: false,
                 version: 1,
                 template_id: "a".repeat(64),
                 stdio_ports: [true; 3],

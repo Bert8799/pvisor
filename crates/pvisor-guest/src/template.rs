@@ -66,7 +66,8 @@ impl GuestTemplateProtocol for GuestTemplate {
             ));
         }
         let config = &mut task.config;
-        if config.root_disk.is_some()
+        if config.environment_root != self.environment_root
+            || config.root_disk.is_some()
             || config.env.contains_key(TEMPLATE_INSTANCE_ENV)
             || config
                 .stdio_ports

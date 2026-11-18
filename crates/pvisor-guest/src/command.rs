@@ -154,6 +154,7 @@ mod template_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     fn template() -> GuestTemplate {
         GuestTemplate {
+            environment_root: false,
             version: TEMPLATE_VERSION,
             template_id: "a".repeat(64),
             stdio_ports: [true, true, false],

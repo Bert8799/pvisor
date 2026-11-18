@@ -674,6 +674,12 @@ fn run() -> io::Result<i32> {
     let mut config_span =
         startup_profile::Span::since("guest.config", (profiling && !initialized).then_some(entry));
     config.validate()?; // Validate before any configuration side effects.
+    if config.environment_root && !initialized {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "environment root requires a matching template handoff",
+        ));
+    }
     config_span.complete();
     let mut startup = startup_profile::Span::start("guest.initialize", profiling);
     if !initialized {
@@ -681,6 +687,22 @@ fn run() -> io::Result<i32> {
     }
     if let Some(root) = &config.root_disk {
         root_disk::enter(root, config.network.as_ref())?;
+        initialize_filesystems()?;
+    }
+    if config.environment_root {
+        let target = Path::new("/.pvisor-environment");
+        fs::create_dir(target)?;
+        mount_with_options(
+            "pvisor-environment",
+            target,
+            "virtiofs",
+            0,
+            Some("dax=never"),
+        )?;
+        std::env::set_current_dir(target)?;
+        check(unsafe { libc::chroot(c".".as_ptr()) })?;
+        std::env::set_current_dir("/")?;
+        // Keep the captured console descriptors: virtio-console is exclusive-open.
         initialize_filesystems()?;
     }
     startup.complete();
