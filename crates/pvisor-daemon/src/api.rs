@@ -141,6 +141,13 @@ pub struct PreparedImage {
     /// No execd/envd is launched. Requires a pooled image; old manifests omit it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub native_guest: bool,
+    /// Optional absolute guest working directory; omission uses `/` as in ordinary launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Operator-selected inert template; never an OpenSandbox snapshot API.
+    /// The operator must bind its captured inventory to this pinned pooled image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<NativeTemplate>,
 }
 
 /// Storage selection, fixed for the lifetime of this pool state directory.
@@ -290,4 +297,35 @@ pub trait MemoryPoolService: Sized {
     /// Blocks while serving; service loss can terminate dependent VMs (including
     /// macOS compression). No mode reconnects or replaces live RAM ownership.
     fn run(directory: &Path) -> Result<()>;
+}
+
+/// Trusted manifest binding to a native template catalog and immutable image.
+/// This record is validated at native admission; constructing it does not open
+/// the catalog or establish that the capture matches the selected pooled image.
+///
+/// ```
+/// use pvisor_daemon::api::NativeTemplate;
+/// let selection = NativeTemplate {
+///     catalog: "/private/templates".into(), name: "agent".into(),
+///     image_sha256: "a".repeat(64),
+/// };
+/// let wire = serde_json::to_value(&selection)?;
+/// let copy: NativeTemplate = serde_json::from_value(wire.clone())?;
+/// assert_eq!(copy.name, selection.name);
+/// assert_eq!(copy.image_sha256, selection.image_sha256);
+/// let mut unknown = wire;
+/// unknown["secret"] = serde_json::json!("not a selection field");
+/// assert!(serde_json::from_value::<NativeTemplate>(unknown).is_err());
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTemplate {
+    /// Existing private, absolute host catalog directory, independent of state.
+    pub catalog: PathBuf,
+    /// Mutable alias selected once at admission; the exact version is persisted.
+    pub name: String,
+    /// Image inventory digest printed by template preparation. Updating image
+    /// content requires a new capture and manifest digest; no per-create scan.
+    pub image_sha256: String,
 }

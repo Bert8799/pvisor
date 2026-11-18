@@ -133,6 +133,8 @@ struct Identity {
     boot_id: String,
     #[serde(default)]
     memory_pool: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template_version: Option<String>,
 }
 
 /// Durable proof published only with exclusive ownership and an empty native
@@ -547,11 +549,7 @@ impl Runtime for NativeRuntime {
             .write(true)
             .open("/dev/kvm")
             .context("native VM requires usable /dev/kvm")?;
-        let version = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xAE00, 0) };
-        if version < 0 {
-            return Err(std::io::Error::last_os_error()).context("query KVM API version");
-        }
-        ensure!(version == 12, "unsupported KVM API version {version}");
+        verify_kvm_api(&kvm)?;
         Ok(())
     }
 
@@ -570,6 +568,11 @@ impl Runtime for NativeRuntime {
             image.e2b == spec.e2b,
             "prepared image service profile changed"
         );
+        let template_lease =
+            acquire_image_template(&image, spec, self.memory_pool.as_deref(), None)?;
+        let template_version = template_lease
+            .as_ref()
+            .map(|lease| lease.version().id.clone());
         let generation = uuid::Uuid::new_v4().to_string();
         let group_path = self
             .config
@@ -593,6 +596,7 @@ impl Runtime for NativeRuntime {
                 cgroup_inode: 0,
                 boot_id: current_boot_id()?,
                 memory_pool: self.memory_pool.clone(),
+                template_version,
             };
             make_run_spec(&identity)?;
             publish_new(&directory.join("preparing.json"), &identity)?;
@@ -931,23 +935,45 @@ impl NativeRuntimeService for NativeRuntime {
         let run_dir = sandbox_dir.join("run");
         private_directory(&run_dir)?;
         // Scratch belongs to this VM; the binding reads the shared V2 pool.
-        let pooled_root = pvisor::docker::Store::open(run_dir.join("image"))?
-            .open_image(&identity.image.pooled_image)?;
+        let template_lease = acquire_image_template(
+            &identity.image,
+            &identity.spec,
+            identity.memory_pool.as_deref(),
+            identity.template_version.as_deref(),
+        )?;
+        let pooled_root = if template_lease.is_none() {
+            Some(
+                pvisor::docker::Store::open(run_dir.join("image"))?
+                    .open_image(&identity.image.pooled_image)?,
+            )
+        } else {
+            None
+        };
         startup.insert("image_opened_us", startup_clock.elapsed().as_micros());
+        let rootfs = match &template_lease {
+            Some(lease) => lease.environment().owned_layer_path(Path::new("rootfs"))?,
+            None => pooled_root
+                .as_ref()
+                .context("pooled image owner missing")?
+                .rootfs()
+                .to_path_buf(),
+        };
         let settings = pvisor::VmSettings {
-            ram_backing: identity
-                .memory_pool
-                .is_none()
+            ram_backing: (identity.memory_pool.is_none() && template_lease.is_none())
                 .then(|| run_dir.join("live-ram")),
             memory_pool: identity.memory_pool.clone(),
-            rootfs: Some(pooled_root.rootfs().to_path_buf()),
-            rootfs_immutable: false,
+            rootfs: Some(rootfs),
+            rootfs_immutable: template_lease.is_some(),
             library_dir: identity.image.library_dir.clone(),
             memory_mib: u32::try_from(identity.spec.memory_bytes / MIB)?,
             cpus: u16::try_from(identity.spec.cpu_millis.div_ceil(1000).min(8))?,
             ..Default::default()
         };
-        let executor = pvisor::VmExecutor::new(settings)?.with_vsock_ports(vsock_ports)?;
+        let executor = match template_lease {
+            Some(lease) => pvisor::VmExecutor::from_template(settings, lease, &run_dir)?,
+            None => pvisor::VmExecutor::new(settings)?,
+        }
+        .with_vsock_ports(vsock_ports)?;
         startup.insert("executor_ready_us", startup_clock.elapsed().as_micros());
         let visor = supervisor_builder()
             .storage(run_dir)
@@ -1245,6 +1271,49 @@ fn native_status(status: pvisor_core::RunStatus) -> Result<RuntimeState> {
     }
 }
 
+fn acquire_image_template(
+    image: &PreparedImage,
+    spec: &RuntimeSpec,
+    memory_pool: Option<&Path>,
+    version: Option<&str>,
+) -> Result<Option<pvisor::environment_snapshot::templates::TemplateLease>> {
+    let Some(selected) = &image.template else {
+        ensure!(version.is_none(), "unexpected template version");
+        return Ok(None);
+    };
+    ensure!(
+        memory_pool.is_none(),
+        "template COW RAM cannot use the experimental memory pool"
+    );
+    trusted_private_directory(&selected.catalog)?;
+    let settings = pvisor::VmSettings {
+        rootfs: Some(image.rootfs.clone()),
+        rootfs_immutable: true,
+        library_dir: image.library_dir.clone(),
+        cpus: u16::try_from(spec.cpu_millis.div_ceil(1000))?,
+        memory_mib: u32::try_from(spec.memory_bytes / MIB)?,
+        ..Default::default()
+    };
+    let mut expected = pvisor::VmExecutor::checkpoint_compatibility(&settings)?;
+    expected.profile = pvisor::environment_snapshot::templates::PROFILE.into();
+    let catalog = pvisor::environment_snapshot::templates::TemplateCatalog::new(&selected.catalog)?;
+    let lease = match version {
+        Some(id) => catalog.acquire_version(id, &expected)?,
+        None => catalog.acquire(&selected.name, &expected)?,
+    };
+    let recipe = &lease.version().spec;
+    ensure!(
+        recipe.native_overlay
+            && recipe.cpus as u16 == settings.cpus
+            && recipe.memory_mib == settings.memory_mib
+            && recipe.image_sha256 == selected.image_sha256
+            && recipe.stdio_ports == [true; 3]
+            && recipe.network_mac == Some([2, 80, 86, 0, 0, 2]),
+        "prepared template image, sizing or topology mismatch"
+    );
+    Ok(Some(lease))
+}
+
 fn make_run_spec(identity: &Identity) -> Result<pvisor_core::RunSpec> {
     let image = &identity.image;
     let mut argv = if image.native_guest {
@@ -1297,10 +1366,22 @@ fn make_run_spec(identity: &Identity) -> Result<pvisor_core::RunSpec> {
     process.args = argv;
     process.env = env;
     process.inherit_env = false;
-    process.cwd = Some("/".into());
+    process.cwd = Some(
+        image
+            .cwd
+            .as_deref()
+            .unwrap_or(Path::new("/"))
+            .to_str()
+            .context("guest cwd must be UTF-8")?
+            .to_owned(),
+    );
     process.stdin = pvisor_core::StdioMode::Null;
     process.stdout = pvisor_core::StdioMode::Capture;
     process.stderr = pvisor_core::StdioMode::Capture;
+    run.metadata.insert(
+        "pvisor.vm.guest_cwd".into(),
+        serde_json::to_value(&process.cwd)?,
+    );
     // RAM is rounded DOWN; the enclosing cgroup also caps host overhead.
     run.runtime.resource_limits.memory_bytes = Some(identity.spec.memory_bytes / MIB * MIB);
     Ok(run)
@@ -2045,6 +2126,47 @@ fn validate_image_shape(image: &PreparedImage, state: &Path) -> Result<()> {
     );
     validate_argv_env(&image.entrypoint, &image.env)?;
     validate_argv_env(&image.cmd, &BTreeMap::new())?;
+    if let Some(cwd) = &image.cwd {
+        ensure!(
+            cwd.is_absolute()
+                && !cwd.as_os_str().as_encoded_bytes().contains(&0)
+                && !cwd
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir)),
+            "guest working directory must be absolute without parent traversal"
+        );
+    }
+    if let Some(template) = &image.template {
+        ensure!(
+            template.catalog.is_absolute()
+                && template.catalog.components().all(|part| matches!(
+                    part,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                ))
+                && !template.catalog.starts_with(state)
+                && !state.starts_with(&template.catalog)
+                && !template.catalog.starts_with(&image.rootfs)
+                && !image.rootfs.starts_with(&template.catalog),
+            "template catalog must be independent of image and state"
+        );
+        ensure!(
+            !template.name.is_empty()
+                && template.name.len() <= 128
+                && template
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+            "invalid native template alias"
+        );
+        ensure!(
+            template.image_sha256.len() == 64
+                && template
+                    .image_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid template image digest"
+        );
+    }
     if let Some(path) = &image.library_dir {
         ensure!(path.is_absolute(), "firmware directory must be absolute");
     }
@@ -2063,6 +2185,17 @@ fn validate_image(image: &PreparedImage, state: &Path) -> Result<()> {
         root != Path::new("/") && !state.starts_with(&root) && !root.starts_with(&state),
         "prepared rootfs must be independent of host root and daemon state"
     );
+    if let Some(template) = &image.template {
+        trusted_private_directory(&template.catalog)?;
+        let catalog = template.catalog.canonicalize()?;
+        ensure!(
+            !catalog.starts_with(&root)
+                && !root.starts_with(&catalog)
+                && !catalog.starts_with(&state)
+                && !state.starts_with(&catalog),
+            "canonical template catalog must be independent of image and state"
+        );
+    }
     ensure!(
         (image.native_guest && image.entrypoint.is_empty())
             || (!image.entrypoint.is_empty() && image.entrypoint[0].starts_with('/')),
@@ -2142,6 +2275,10 @@ fn validate_tombstone(tombstone: &Tombstone, directory: &Path) -> Result<()> {
     Ok(())
 }
 fn validate_launch_resources(identity: &Identity, directory: &Path) -> Result<()> {
+    ensure!(
+        identity.image.template.is_some() == identity.template_version.is_some(),
+        "template version binding is missing or unexpected"
+    );
     validate_spec(&identity.spec)?;
     validate_image(
         &identity.image,
@@ -2270,6 +2407,17 @@ fn reject_occupied_unclaimed_registry(directory: &Path, owner: &str) -> Result<(
         registry.sandboxes.is_empty(),
         "occupied sandbox registry has no native owner.json marker and may own live Podman containers; use a fresh state directory, or clean up every sandbox with the old Podman daemon before switching backends; do not delete state or reservations"
     );
+    Ok(())
+}
+
+fn verify_kvm_api(kvm: &File) -> Result<()> {
+    // KVM_GET_API_VERSION requires arg == 0. Omitting a C variadic argument
+    // leaves a register value here; Linux rejects nonzero values with EINVAL.
+    let version = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xAE00, 0 as libc::c_ulong) };
+    if version < 0 {
+        return Err(std::io::Error::last_os_error()).context("query KVM API version");
+    }
+    ensure!(version == 12, "unsupported KVM API version {version}");
     Ok(())
 }
 
@@ -2581,6 +2729,32 @@ mod tests {
     }
 
     const ID: &str = "sb-12345678-1234-4234-8234-123456789abc";
+    #[test]
+    fn kvm_preflight_reports_ioctl_failure_without_claiming_an_unsupported_version() {
+        let device = File::open("/dev/null").unwrap();
+        let error = verify_kvm_api(&device).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOTTY)
+        );
+        assert_eq!(error.to_string(), "query KVM API version");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires read/write access to a real /dev/kvm"]
+    fn native_kvm_preflight_accepts_the_current_api_with_a_zero_ioctl_argument() {
+        let device = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .unwrap();
+        verify_kvm_api(&device).unwrap();
+    }
+
     fn spec() -> RuntimeSpec {
         RuntimeSpec {
             id: ID.into(),
@@ -2614,6 +2788,8 @@ mod tests {
                 env: BTreeMap::from([("PATH".into(), "/guest/bin".into())]),
                 library_dir: None,
                 e2b: None,
+                cwd: None,
+                template: None,
                 pooled_image: pvisor::docker::Image {
                     reference: "fixture:latest".into(),
                     id: format!("sha256:{}", "1".repeat(64)),
@@ -2649,6 +2825,7 @@ mod tests {
             cgroup_inode: 1,
             boot_id: "32345678-1234-4234-8234-123456789abc".into(),
             memory_pool: None,
+            template_version: None,
         };
         (identity, directory)
     }
@@ -2900,6 +3077,76 @@ mod tests {
         assert!(validate_image_shape(&identity.image, &temp.path().join("state")).is_ok());
         identity.image.native_e2b = true;
         assert!(validate_image_shape(&identity.image, &temp.path().join("state")).is_err());
+    }
+
+    #[test]
+    fn inert_template_selection_validates_paths_digest_cwd_and_launch_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut identity, directory) = identity_fixture(temp.path());
+        let state = directory.parent().unwrap();
+        let catalog = temp.path().join("templates");
+        private_directory(&catalog).unwrap();
+        identity.image.cwd = Some("/work".into());
+        identity.image.template = Some(crate::api::NativeTemplate {
+            catalog: catalog.clone(),
+            name: "agent".into(),
+            image_sha256: "a".repeat(64),
+        });
+        validate_image(&identity.image, state).unwrap();
+        for case in [
+            "relative_cwd",
+            "parent_cwd",
+            "nul_cwd",
+            "image_overlap",
+            "state_overlap",
+            "alias_traversal",
+            "uppercase_digest",
+        ] {
+            let mut image = identity.image.clone();
+            match case {
+                "relative_cwd" => image.cwd = Some("relative".into()),
+                "parent_cwd" => image.cwd = Some("/work/../secret".into()),
+                "nul_cwd" => image.cwd = Some("/work\0".into()),
+                "image_overlap" => {
+                    image.template.as_mut().unwrap().catalog = image.rootfs.join("templates")
+                }
+                "state_overlap" => {
+                    image.template.as_mut().unwrap().catalog = state.join("templates")
+                }
+                "alias_traversal" => image.template.as_mut().unwrap().name = "../alias".into(),
+                "uppercase_digest" => {
+                    image.template.as_mut().unwrap().image_sha256 = "A".repeat(64)
+                }
+                _ => unreachable!(),
+            }
+            assert!(validate_image_shape(&image, state).is_err(), "case {case}");
+        }
+        assert!(
+            validate_launch_resources(&identity, &directory)
+                .unwrap_err()
+                .to_string()
+                .contains("template version binding")
+        );
+        assert!(
+            acquire_image_template(
+                &identity.image,
+                &identity.spec,
+                Some(Path::new("/pool")),
+                None
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("COW RAM")
+        );
+        identity.image.template = None;
+        identity.template_version = Some("a".repeat(64));
+        assert!(
+            validate_launch_resources(&identity, &directory)
+                .unwrap_err()
+                .to_string()
+                .contains("template version binding")
+        );
     }
 
     #[test]

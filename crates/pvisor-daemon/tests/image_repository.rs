@@ -67,6 +67,8 @@ impl Fixture {
             env: BTreeMap::new(),
             library_dir: None,
             e2b: None,
+            cwd: None,
+            template: None,
             pooled_image: pooled,
             native_opensandbox: false,
             native_e2b: false,

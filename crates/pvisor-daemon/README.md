@@ -828,6 +828,38 @@ No security audit or hostile multi-user assurance is claimed.
 
 ## State, concurrency and failure behavior
 
+### Native inert VM templates
+
+A prepared-image manifest may select an inert VM template instead of cold boot.
+This is an operator option; the public OpenSandbox snapshot/template APIs remain
+unsupported. Ordinary manifests retain their required pinned V2 image and pool.
+
+Use `pvisor-daemon template-prepare` with an independent, fully prepared source
+rootfs, trusted guest supervisor, private catalog/work directory and exact VM
+sizing. Prepare with the same daemon build, firmware and host boot used to run
+instances. The isolated worker has a 90-second deadline and is reaped by its
+parent; publication may precede an error, so inspect selection before retrying.
+
+Add a `template` object containing `catalog`, `name` and the returned
+`spec.image_sha256` to the generated manifest. Retain its V2 image binding and
+service settings. The operator must capture the same pinned image contents,
+including any required bootstrap; the inventory digest identifies that capture
+without rescanning the pool on every create. Optional `cwd` uses `/` when absent.
+The catalog must be independent of the image store and daemon state.
+
+Admission pins and persists the exact generation; the supervisor and VM runner
+acquire that version through teardown even if its alias changes. Instances share
+sealed lowers and COW RAM, with private writes, fresh network/vsock backends,
+execution identity and entropy. Sizing/topology mismatches fail without cold
+fallback. Shared memory pools cannot be combined with template COW RAM.
+
+The selected backend still performs its actual guest readiness, authentication
+and binding checks, including the native guest engine. Inert handoff Ready does
+not establish service readiness or SDK conformance. Existing cgroup admission,
+restart, cancellation and confirmed deletion contracts remain in force.
+
+### Ownership and reconciliation
+
 - One daemon exclusively locks a private state directory. Owner identity and
   sandbox records are atomically persisted before native creation/control.
 - Runtime operations use core `AgentCtlHostRequest`/`AgentCtlHostResponse` version-2

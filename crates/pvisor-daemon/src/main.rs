@@ -54,6 +54,8 @@ enum Command {
     Image(image_repository::Image),
     /// Configure ordered V2 image registries (not OCI/Docker registry endpoints).
     Registry(registries::Registry),
+    /// Prepare a credential-free native VM template in an isolated process.
+    TemplatePrepare(TemplateArgs),
     #[command(hide = true)]
     CacheWorker {
         #[arg(long)]
@@ -128,6 +130,75 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct TemplateArgs {
+    #[arg(long)]
+    rootfs: PathBuf,
+    /// Exact static pvisor-guest supervisor executable to install.
+    #[arg(long)]
+    guest: PathBuf,
+    #[arg(long)]
+    catalog: PathBuf,
+    #[arg(long)]
+    name: String,
+    /// Previously selected generation; omission means create-only.
+    #[arg(long)]
+    expected: Option<String>,
+    #[arg(long, default_value_t = 2)]
+    cpus: u16,
+    #[arg(long, default_value_t = 128)]
+    memory_mib: u32,
+    #[arg(long)]
+    library_dir: Option<PathBuf>,
+    /// Existing trusted host directory for automatically reclaimed build files.
+    #[arg(long)]
+    work_dir: PathBuf,
+    #[arg(long, hide = true)]
+    template_worker_stage: Option<PathBuf>,
+}
+
+fn prepare_template(args: &TemplateArgs) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    anyhow::ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "native templates require Linux x86_64"
+    );
+    if let Some(stage) = &args.template_worker_stage {
+        let executor = pvisor::VmExecutor::new(pvisor::VmSettings {
+            rootfs: Some(args.rootfs.canonicalize()?),
+            rootfs_immutable: true,
+            cpus: args.cpus,
+            memory_mib: args.memory_mib,
+            library_dir: args.library_dir.clone(),
+            ..Default::default()
+        })?;
+        return executor.capture_template(
+            pvisor::environment_snapshot::templates::TemplateCatalog::new(&args.catalog)?,
+            &args.name,
+            args.expected.as_deref(),
+            &args.guest.canonicalize()?,
+            stage,
+            &uuid::Uuid::new_v4().to_string(),
+        );
+    }
+    let work = args.work_dir.canonicalize()?;
+    let stage = tempfile::Builder::new()
+        .prefix("template-build-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(work)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(std::env::args_os().skip(1))
+        .arg("--template-worker-stage")
+        .arg(stage.path());
+    pvisor::environment_snapshot::templates::run_preparer(
+        &mut command,
+        std::time::Duration::from_secs(90),
+    )?;
+    stage.close()?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // The re-executed VM runner enters namespaces before any Tokio threads exist.
     if pvisor::run_krun_internal_if_requested()? {
@@ -162,6 +233,9 @@ fn main() -> anyhow::Result<()> {
     }
     if let Command::Registry(options) = args.command {
         return options.run();
+    }
+    if let Command::TemplatePrepare(template) = &args.command {
+        return prepare_template(template);
     }
     if let Command::CacheWorker {
         listen,
@@ -209,6 +283,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::PrepareImage(_)
         | Command::Image(_)
         | Command::Registry(_)
+        | Command::TemplatePrepare(_)
         | Command::Protocol
         | Command::MemoryPool { .. }
         | Command::CacheWorker { .. } => {
@@ -696,6 +771,36 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn template_preparation_requires_explicit_inputs_and_accepts_conditional_update() {
+        assert!(Args::try_parse_from(["pvisor-daemon", "template-prepare"]).is_err());
+        let args = [
+            "pvisor-daemon",
+            "template-prepare",
+            "--rootfs",
+            "/image",
+            "--guest",
+            "/guest",
+            "--catalog",
+            "/catalog",
+            "--name",
+            "agent",
+            "--work-dir",
+            "/work",
+            "--expected",
+            "old-version",
+        ];
+        assert!(matches!(
+            Args::try_parse_from(args).unwrap().command,
+            Command::TemplatePrepare(TemplateArgs {
+                cpus: 2,
+                memory_mib: 128,
+                expected: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -174,6 +174,8 @@ impl PrepareImage {
             env: image.env.clone(),
             library_dir: self.library_dir.map(|p| p.canonicalize()).transpose()?,
             e2b: e2b.clone(),
+            cwd: None,
+            template: None,
             pooled_image: image,
             native_opensandbox: !native_guest && e2b.is_none(),
             native_e2b: !native_guest && e2b.is_some(),
