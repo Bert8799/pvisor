@@ -110,6 +110,35 @@ pub struct VsockSnapshot {
     tsi_flags: u32,
 }
 
+impl VsockSnapshot {
+    pub(crate) fn rebind_unix_ports(
+        &mut self,
+        ports: &[(u32, PathBuf, bool)],
+    ) -> std::io::Result<()> {
+        if self.tsi_flags != 0
+            || self
+                .host_port_map
+                .as_ref()
+                .is_some_and(|map| !map.is_empty())
+            || self
+                .unix_ipc_port_map
+                .as_ref()
+                .is_some_and(|map| !map.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fresh vsock endpoints require an unmapped zero-TSI snapshot",
+            ));
+        }
+        let map = ports
+            .iter()
+            .map(|(port, path, listen)| (*port, (path.clone(), *listen)))
+            .collect();
+        self.unix_ipc_port_map = if ports.is_empty() { None } else { Some(map) };
+        Ok(())
+    }
+}
+
 pub struct VsockMuxer {
     worker_fault: Option<&'static str>,
     stop: Arc<AtomicBool>,

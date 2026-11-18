@@ -344,6 +344,22 @@ Guest supervisor 的内嵌构建使用相对当前 crate 的源码和产物依�
 可使用该接口，不触发解包或内核存储分配。`embedded_kernel` 仍在需要真实字节时
 惰性解包；动态固件与调用方提供的内核不使用这个摘要。
 
+`RuntimeSupport::embedded_guest` 借用普通启动实际使用的内置 guest 字节，不做 I/O
+或分配；没有 init-blob 时返回 `None`，避免模板准备使用另一个 supervisor 制品。
+
+`SnapshotState::reset_unmounted_filesystem` 只允许重置明确从未挂载、从未收到请求的
+模板设备。调用方须在首次 guest 挂载前捕获且确保没有待处理请求；快照持久化
+pristine 标记，旧快照缺少该证据时拒绝重置。恢复保留新 builder 配置的后端，
+不沿用旧 workspace 的 inode/handle 表；已使用设备拒绝重置，失败不改变快照。
+普通文件系统快照恢复及其 backing 校验不变。
+
+`SnapshotState::rebind_all` 按顺序在同一事务中修改设备绑定，只解析、重建一次机器状态。每项必须匹配唯一设备；任何一步失败都保留整份原状态，沿用单项操作的 backing、pristine 和 vsock 校验，不替代最终恢复校验。
+
+`MachineSnapshot` 保留紧凑的 JSON 字节，避免在捕获、读取、绑定和校验之间反复
+展开、克隆通用 JSON 树。设备绑定直接解析到原生结构，成功后序列化为替换字节；
+任何失败保留原字节。CPU、设备、RAM、pristine 与 backing 校验仍然执行，序列化
+结构兼容既有快照；反序列化仍不代表允许恢复。没有增加全局快照或 RAM 内容缓存。
+
 ## 核心接口模型
 
 所有定义集中在 `src/api.rs`，实现集中在私有适配器中。文件系统配置使用 `PathBuf`，UTF-8 校验及内部设备格式转换由运行时完成。
@@ -631,6 +647,33 @@ clock conversion 或 wake latch，不能自动卸载，也不证明 Linux runque
 当前 collector 的锁内时间戳采集、关闭时等待区间截断及禁用期间退出记账。
 当前源码尚无对应的真实 KVM 实测通过记录；macOS/HVF 尚未实际编译或运行
 验证。后续实测须使用独立制品和收据，不覆盖已有 binary、receipt 或实验数据。
+
+## Pristine network templates
+
+With the existing snapshot profile, a Unix-stream virtio-net backend can capture
+an inert template before any network traffic. The device stops and joins its
+worker before acknowledging freeze. Pending guest TX, backend input (including
+a partial frame header), deferred frames or any previous traffic reject capture.
+The capture phase copies queue indices without reading guest RAM after the RAM
+gate closes. Worker stop, panic and thaw errors remain explicit failures.
+
+Restore validates the saved MAC, feature negotiation and queue topology, creates
+a fresh caller-owned backend, and keeps its worker parked until thaw. Host
+descriptors, frames and connection state are not serialized. Ordinary network
+VMs do not opt into this capture path. The two existing fixed-size packet buffers
+remain single-owner allocations on the heap so returning parked workers does not
+copy large arrays through the thread stack; no packet cache or extra resident VM
+is introduced. This is not capture/restore of active network connections.
+
+`SnapshotState::rebind_vsock_ports` can attach fresh private host Unix endpoints
+to an empty, previously unmapped zero-TSI vsock snapshot. It preserves CID and
+queue state, validates bounded unique guest ports and absolute socket paths, and
+changes nothing on error. Existing mappings or TSI authority cannot be relabelled
+through this API. The caller retains endpoint authorization and private-directory
+ownership; restore still validates all machine state before resuming.
+
+These are VM-level prerequisites for daemon template creation. They do not add
+template selection to the daemon or relax ordinary execution checkpoint admission.
 
 ## Overlay protocol correctness
 

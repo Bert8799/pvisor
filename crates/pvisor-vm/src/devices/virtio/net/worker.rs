@@ -6,9 +6,10 @@ use crate::devices::virtio::net::unixstream::Unixstream;
 use crate::devices::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::devices::virtio::{DeviceQueue, InterruptTransport};
 
-use super::VNET_HDR_LEN;
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
+use super::snapshot::Stop;
+use super::VNET_HDR_LEN;
 
 use crate::utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use std::os::fd::AsRawFd;
@@ -19,6 +20,8 @@ use std::{cmp, result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
+    pub(super) stop: Option<Stop>,
+    pristine: bool,
     rx_q: DeviceQueue,
     tx_q: DeviceQueue,
     interrupt: InterruptTransport,
@@ -26,12 +29,12 @@ pub struct NetWorker {
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
 
-    rx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    rx_frame_buf: Box<[u8]>,
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
-    tx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    tx_frame_buf: Box<[u8]>,
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
     stream_tx: Option<super::tx_batch::TxBatch>,
@@ -73,6 +76,8 @@ impl NetWorker {
         };
 
         Ok(Self {
+            stop: None,
+            pristine: true,
             rx_q,
             tx_q,
 
@@ -80,11 +85,11 @@ impl NetWorker {
             backend,
             interrupt,
 
-            rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            rx_frame_buf: vec![0u8; MAX_BUFFER_SIZE].into_boxed_slice(),
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
 
-            tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            tx_frame_buf: vec![0u8; MAX_BUFFER_SIZE].into_boxed_slice(),
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             stream_tx,
@@ -92,14 +97,13 @@ impl NetWorker {
         })
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> std::io::Result<thread::JoinHandle<Self>> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
@@ -108,6 +112,15 @@ impl NetWorker {
         let backend_socket = self.backend.raw_socket_fd();
 
         let epoll = Epoll::new().unwrap();
+        if let Some(stop) = &self.stop {
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    stop.event.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, stop.event.as_raw_fd() as u64),
+                )
+                .unwrap();
+        }
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -130,9 +143,15 @@ impl NetWorker {
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
+            if self.stop.as_ref().is_some_and(Stop::requested) {
+                return self;
+            }
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
+                        if self.stop.as_ref().is_some_and(Stop::requested) {
+                            return self;
+                        }
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
@@ -258,6 +277,18 @@ impl NetWorker {
     }
 
     fn process_rx(&mut self) -> result::Result<(), RxError> {
+        // Only snapshot-profile workers check the first backend readiness. This
+        // catches partial frame headers before the backend's blocking read and
+        // never adds a polling syscall to ordinary workers or established flows.
+        if self.stop.is_some() && self.pristine {
+            if !self
+                .backend_ready()
+                .map_err(|_| RxError::Backend(ReadError::Internal(nix::Error::EIO)))?
+            {
+                return Ok(());
+            }
+            self.pristine = false;
+        }
         let mut signal_queue = false;
         // if we have a deferred frame we try to process it first,
         // if that is not possible, we don't continue processing other frames
@@ -343,6 +374,7 @@ impl NetWorker {
         let mut result = Ok(());
 
         while let Some(head) = tx_queue.pop(&self.mem) {
+            self.pristine = false;
             let head_index = head.index;
             // Addresses below outlive the descriptor walk.
             let _memory_access = head.memory_access.clone();
@@ -443,6 +475,7 @@ impl NetWorker {
                     let Some(head) = self.tx_q.queue.pop(&self.mem) else {
                         break;
                     };
+                    self.pristine = false;
                     let index = head.index;
                     if let Err(error) = batch.push(&self.mem, head) {
                         log::warn!("Rejecting malformed TX frame: {error}");
@@ -470,6 +503,39 @@ impl NetWorker {
                 .map_err(TxError::DeviceError)?;
         }
         result
+
+    }
+
+    fn backend_ready(&self) -> std::io::Result<bool> {
+        super::snapshot::backend_ready(self.backend.raw_socket_fd())
+    }
+
+    // Must run while CPUs are parked and the RAM gate is still OPEN.
+    pub(super) fn validate_pristine(&self) -> Result<(), String> {
+        if !self.pristine
+            || self.rx_has_deferred_frame
+            || self.tx_has_deferred_frame
+            || self.backend.has_unfinished_write()
+            || self.stream_tx.as_ref().is_some_and(|batch| !batch.empty())
+            || !self.tx_q.queue.is_empty(&self.mem)
+            || self.backend_ready().map_err(|e| e.to_string())?
+        {
+            return Err("network snapshot requires a template before any traffic".into());
+        }
+        Ok(())
+    }
+
+    // No guest reads here: capture runs with the RAM gate CLOSED.
+    pub(super) fn snapshot_queues(&self) -> Result<Vec<super::super::QueueSnapshot>, String> {
+        if !self.pristine
+            || self.stream_tx.as_ref().is_some_and(|batch| !batch.empty())
+            || self.backend_ready().map_err(|e| e.to_string())? {
+            return Err("network template backend became active".into());
+        }
+        Ok(vec![
+            self.rx_q.queue.capture_state(),
+            self.tx_q.queue.capture_state(),
+        ])
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.
@@ -600,6 +666,7 @@ mod tests {
             },
             0
         );
+        assert!(worker.validate_pristine().is_ok());
         let mut expected = Vec::new();
         for sequence in 0..40usize {
             let address = 0x10000 + sequence as u64 * 2048;
@@ -621,6 +688,8 @@ mod tests {
         worker.process_tx_queue_event();
         assert_eq!(tx.used.idx.get(), 32);
         assert!(worker.tx_has_deferred_frame);
+        assert!(worker.validate_pristine().is_err());
+        assert!(worker.snapshot_queues().is_err());
         // Guest is free to reuse completed buffers, even during a partial send.
         for sequence in 0..32 {
             mem.write_slice(&[0xee; 1526], GuestAddress(0x10000 + sequence * 2048))
@@ -646,6 +715,7 @@ mod tests {
         assert_eq!(tx.used.idx.get(), 42);
         assert!(worker.stream_tx.as_ref().unwrap().empty());
         assert!(!worker.tx_has_deferred_frame);
+        assert!(worker.validate_pristine().is_err());
     }
 
     #[test]

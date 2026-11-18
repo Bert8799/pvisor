@@ -794,6 +794,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn combined_rx_buffer_retains_timestamp_capacity_when_writing_reset() {
+        use super::super::{defs::uapi, muxer::MuxerRx, muxer_rxq::rx_to_pkt};
+        use crate::devices::virtio::{queue, Descriptor};
+        use vm_memory::{Bytes, GuestMemoryMmap};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8192)]).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 4096,
+                len: (VSOCK_PKT_HDR_SIZE + 8) as u32,
+                flags: queue::VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+            GuestAddress(0),
+        )
+        .unwrap();
+        let chain = DescriptorChain::checked_new(&mem, GuestAddress(0), 1, 0).unwrap();
+        let mut packet = VsockPacket::from_rx_virtq_head(&chain).unwrap();
+        // Preserve the timestamp-capable descriptor used by the snapshot race.
+        // An RST has no payload but must not shrink the available RX capacity.
+        assert_eq!(packet.buf().unwrap().len(), 8);
+        rx_to_pkt(
+            3,
+            MuxerRx::Reset {
+                local_port: 4321,
+                peer_port: 1234,
+            },
+            &mut packet,
+        );
+        assert_eq!(packet.op(), uapi::VSOCK_OP_RST);
+        assert_eq!(packet.type_(), uapi::VSOCK_TYPE_STREAM);
+        assert_eq!((packet.src_cid(), packet.dst_cid()), (2, 3));
+        assert_eq!((packet.src_port(), packet.dst_port()), (4321, 1234));
+        assert_eq!(packet.len(), 0);
+        assert_eq!(packet.hdr().len(), VSOCK_PKT_HDR_SIZE);
+        assert_eq!(packet.buf().unwrap().len(), 8);
+    }
+
+    #[test]
     fn packet_retains_memory_access_after_descriptor_is_dropped() {
         use crate::devices::virtio::{memory_gate, queue, Descriptor};
         use std::time::Duration;

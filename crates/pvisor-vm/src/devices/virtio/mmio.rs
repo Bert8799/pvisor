@@ -78,6 +78,26 @@ pub struct MmioSnapshot {
 }
 
 impl MmioSnapshot {
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    pub(crate) fn reset_unmounted_filesystem(&mut self, tag: &[u8]) -> std::io::Result<bool> {
+        if let super::DeviceSnapshotState::Fs { tag: saved_tag, server, .. } = &mut self.device.state {
+            if saved_tag == tag {
+                server.reset_unmounted()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    pub(crate) fn rebind_vsock_ports(
+        &mut self,
+        ports: &[(u32, std::path::PathBuf, bool)],
+    ) -> std::io::Result<bool> {
+        if let DeviceSnapshotState::Vsock(state) = &mut self.device.state {
+            state.rebind_unix_ports(ports)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
     /// Restore filesystem topology before registering queue kick eventfds.
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub(crate) fn filesystem_request_queues(

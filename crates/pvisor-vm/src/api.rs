@@ -70,6 +70,20 @@ pub struct VmConfig {
 pub struct VmPlatform;
 /// Process-local platform discovery and diagnostics; no VM is created by these queries.
 pub trait RuntimeSupport {
+    /// Exact immutable Rust supervisor bytes used by ordinary VM boot, when
+    /// embedded in this build. None means no built-in guest is available. Safe
+    /// to borrow concurrently for the executable's lifetime; performs no I/O,
+    /// allocation or VM initialization. Template preparers can copy these bytes
+    /// to private storage to keep cold/template supervisor inputs identical.
+    ///
+    /// ```
+    /// use pvisor_vm::api::{RuntimeSupport, VmPlatform};
+    /// if let Some(supervisor) = VmPlatform::embedded_guest() {
+    ///     assert!(!supervisor.is_empty());
+    ///     assert_eq!(Some(supervisor), VmPlatform::embedded_guest());
+    /// }
+    /// ```
+    fn embedded_guest() -> Option<&'static [u8]>;
     /// Report compiled architecture/backend primitives without probing host permissions.
     fn capabilities() -> Capabilities;
     /// Initialize process logging before constructing the VM.
@@ -635,9 +649,94 @@ pub trait FrozenMemory {
     fn set_device_prepare(&self, handler: Option<Arc<MemoryPrepare>>) -> Result<(), String>;
 }
 
+/// One borrowed change to a captured device; no backing is copied or published.
+/// The caller authorizes paths/endpoints and retains their backing through VM
+/// teardown. Each variant has the validation and ownership requirements of the
+/// corresponding `SnapshotState` operation.
+pub enum SnapshotRebind<'a> {
+    /// Rebind private copies while retaining verified immutable lowers.
+    FilesystemSharedLowers {
+        /// Captured filesystem tag, nonempty, NUL-free and at most 36 bytes.
+        tag: &'a str,
+        /// Supervisor-verified old-to-new private backing paths.
+        copies: &'a [(PathBuf, PathBuf)],
+        /// Inventory-verified, leased immutable lower paths.
+        shared_lowers: &'a [PathBuf],
+    },
+    /// Add exclusions without exposing previously excluded authority.
+    FilesystemExclusions {
+        /// Captured filesystem tag.
+        tag: &'a str,
+        /// Relative paths; saved inode paths cannot become hidden.
+        paths: &'a [PathBuf],
+    },
+    /// Replace the restored filesystem's access policy.
+    FilesystemPolicy {
+        /// Captured filesystem tag.
+        tag: &'a str,
+        /// Validated policy applied by the caller to the new instance.
+        policy: &'a pvisor_overlay_core::FileAccessPolicy,
+    },
+    /// Discard only a provably never-used filesystem's host binding.
+    UnmountedFilesystem {
+        /// Tag to attach to fresh authorized backing during restored build.
+        tag: &'a str,
+    },
+    /// Bind fresh endpoints to an empty, zero-TSI vsock device.
+    VsockPorts {
+        /// Unique guest ports, absolute Unix paths and host-listen flags.
+        ports: &'a [(u32, PathBuf, bool)],
+    },
+}
+
 /// Inspect opaque state and rebind captured filesystems to caller-owned copies.
 /// Rebinding preserves the old state on error; it does not copy or publish files.
 pub trait SnapshotState {
+    /// Apply ordered changes in one transaction, parsing machine state once.
+    /// Each change must match exactly one device; missing/duplicate devices,
+    /// invalid inputs or any device rejection leave the whole snapshot unchanged.
+    /// Empty changes are a no-op. Requires exclusive access to this snapshot;
+    /// does not activate a VM or validate CPU/RAM state. Backing checks may read
+    /// host files, but never copy or publish them.
+    /// Backing verification and leases remain the caller's responsibility.
+    /// Unsupported platforms return Unsupported, including for an empty batch.
+    ///
+    /// ```
+    /// use pvisor_vm::api::{MachineSnapshot, SnapshotRebind, SnapshotState};
+    /// let mut snapshot: MachineSnapshot = serde_json::from_str("{}")?;
+    /// let before = serde_json::to_vec(&snapshot)?;
+    /// assert!(snapshot.rebind_all(&[
+    ///     SnapshotRebind::UnmountedFilesystem { tag: "absent" }
+    /// ]).is_err());
+    /// assert_eq!(serde_json::to_vec(&snapshot)?, before);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    fn rebind_all(&mut self, changes: &[SnapshotRebind<'_>]) -> io::Result<()>;
+    /// Discard the host filesystem binding of a never-used virtio-fs device.
+    /// The restored builder must attach the same tag/topology with fresh,
+    /// caller-authorized backing retained through teardown. Only a snapshot
+    /// explicitly proving zero filesystem requests is accepted; legacy or used
+    /// servers fail. The caller must capture before the guest starts mounting
+    /// this device (for example before an inert template receives a task), so no
+    /// guest inode, handle or pending mount can refer to the old backing.
+    /// Transport and RAM state are preserved. Returns the number of matching
+    /// devices; require exactly one. Invalid tags, unsupported platforms and
+    /// used servers return an error without changing the snapshot. This does
+    /// not authorize rebinding a mounted filesystem or copy any backing data.
+    fn reset_unmounted_filesystem(&mut self, tag: &str) -> io::Result<usize>;
+    /// Bind fresh host Unix endpoints to a captured, empty vsock device. Each
+    /// tuple is (guest port, host Unix path, host-listen flag); true creates a new
+    /// host listener during activation, false selects a guest-to-host target.
+    /// Only zero-TSI states without prior host or Unix port mappings are accepted;
+    /// capture already excludes connections, listeners and pending responses.
+    /// CID and queue state are unchanged. Ports must be nonzero and unique (at
+    /// most 64); paths must be absolute, NUL-free, contain no parent traversal
+    /// and be shorter than 104 bytes.
+    /// The caller owns endpoint authorization, private parent directories and
+    /// their lifetime through VM teardown. No host sockets are cloned/connected
+    /// here. Returns the number of rebound devices; any error preserves all prior
+    /// snapshot bytes. Unsupported backends return Unsupported.
+    fn rebind_vsock_ports(&mut self, ports: &[(u32, PathBuf, bool)]) -> io::Result<usize>;
     /// Return validated captured CPU count; malformed snapshot data is InvalidData.
     fn cpu_count(&self) -> io::Result<usize>;
     /// Report whether a valid captured kernel layout is present; malformed state is an error.
@@ -1026,10 +1125,12 @@ pub struct OverlayConfig {
 
 /// Opaque backend state, preserving the existing serialized machine-state format.
 /// Deserialize is not validation: restore validates CPU/device/RAM state internally.
+/// Owns compact JSON bytes rather than an expanded generic tree; cloning owns
+/// an independent copy. Rebinding commits replacement bytes only on success.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct MachineSnapshot {
-    pub(crate) state: serde_json::Value,
+    pub(crate) state: Box<serde_json::value::RawValue>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

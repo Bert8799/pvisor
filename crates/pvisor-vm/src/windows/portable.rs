@@ -202,6 +202,15 @@ impl FrozenMemory for FrozenMachine<'_> {
 }
 
 impl SnapshotState for MachineSnapshot {
+    fn rebind_all(&mut self, changes: &[SnapshotRebind<'_>]) -> io::Result<()> {
+        Err(unsupported("rebind_all"))
+    }
+    fn reset_unmounted_filesystem(&mut self, tag: &str) -> io::Result<usize> {
+        Err(unsupported("reset_unmounted_filesystem"))
+    }
+    fn rebind_vsock_ports(&mut self, ports: &[(u32, PathBuf, bool)]) -> io::Result<usize> {
+        Err(unsupported("rebind_vsock_ports"))
+    }
     fn prepare_protected_workspace_seed(&mut self, tag: &str) -> io::Result<usize> {
         Err(unsupported("prepare_protected_workspace_seed"))
     }
@@ -354,6 +363,12 @@ impl GuestIdleControl for VmmHandle {
 }
 
 impl RuntimeSupport for VmPlatform {
+    fn embedded_guest() -> Option<&'static [u8]> {
+        #[cfg(feature = "init-blob")]
+        { Some(include_bytes!(env!("PVISOR_GUEST_BINARY"))) }
+        #[cfg(not(feature = "init-blob"))]
+        { None }
+    }
     fn capabilities() -> Capabilities {
         Capabilities {
             architecture: Architecture::X86_64,
