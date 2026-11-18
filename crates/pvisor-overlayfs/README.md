@@ -585,6 +585,10 @@ no handle/map scans; pending requests, lookups and live handles still pin nodes.
 
 Copy-up and apply contracts are documented in
 [`pvisor-overlay-core`](../pvisor-overlay-core/README.md).
+SETATTR ownership changes leave unspecified UID/GID fields unchanged through
+Core's no-follow helper, including recorded Linux symlinks whose logical owner
+differs from the native backing owner. Permission checks and native fallback
+remain in their existing paths.
 
 ## Links
 

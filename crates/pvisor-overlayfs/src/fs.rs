@@ -1434,8 +1434,8 @@ impl OverlayFs {
                 let metadata = fs::symlink_metadata(&upper)?;
                 sys::chown(
                     &upper,
-                    uid.unwrap_or_else(|| metadata.uid()),
-                    gid.unwrap_or_else(|| metadata.gid()),
+                    uid.unwrap_or(u32::MAX),
+                    gid.unwrap_or(u32::MAX),
                     metadata.file_type().is_symlink(),
                 )?;
             }

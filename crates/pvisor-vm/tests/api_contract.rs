@@ -202,6 +202,74 @@ fn read_only_filesystem_configuration_is_atomic_without_dax() {
     );
 }
 
+#[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
+#[test]
+fn native_shares_reject_logical_metadata_without_reserving_the_tag() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("link");
+    std::os::unix::fs::symlink("target", &path).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let owner = pvisor_overlay_core::backend::metadata_owner(root.path(), true).unwrap();
+    owner
+        .restore_symlink(
+            &path,
+            pvisor_overlay_core::backend::UnixIdentity {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o751,
+            },
+            &[],
+        )
+        .unwrap();
+    drop(owner);
+    let mut builder = VmBuilder::new(1, 128).unwrap();
+    assert_eq!(
+        builder
+            .filesystem("data", root.path(), 0)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        builder
+            .read_only_filesystem("data", root.path())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        builder
+            .immutable_filesystem("data", root.path(), 2 << 20)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let child = root.path().join("subtree");
+    assert_eq!(
+        builder
+            .managed_filesystem("data", root.path(), false)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        builder
+            .managed_filesystem("data", root.path(), true)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    std::fs::create_dir(&child).unwrap();
+    assert_eq!(
+        builder.filesystem("data", &child, 0).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let ordinary = tempfile::tempdir().unwrap();
+    builder.filesystem("data", ordinary.path(), 0).unwrap();
+    builder.snapshot_profile().unwrap();
+}
+
 #[test]
 fn immutable_dax_configuration_validates_before_attachment_and_rejects_snapshots() {
     let root = tempfile::tempdir().unwrap();

@@ -166,6 +166,21 @@ mise exec -- rustc --edition=2021 --target x86_64-unknown-linux-musl -C linker=r
   crates/pvisor-vm/src/probes/whp_guest.rs -o whp-guest
 ```
 
+## Qualified logical image metadata
+
+LinuxComplete overlays retain qualified image symlink ownership, permissions and
+xattrs through copy-up, aliases, reopen and snapshots. UID/GID changes use the
+same caller/owner checks as private native metadata: guest root and kernel-authorized
+requests may assign owners; other callers must retain their UID and use an allowed
+group. Rejection preserves logical ownership and mode.
+
+Qualified symlinks use Core's inode-bound records; ordinary private native trees
+retain their existing inode metadata catalog. Setters preserve unspecified fields,
+validate timestamps before mutation, and keep native xattr controls hidden. Plain
+writable/read-only/managed/DAX shares and LinuxSimplified overlays reject qualified
+logical trees before attachment rather than dropping metadata. Native and legacy
+cache sources retain their existing profiles.
+
 ## 必须遵守的 API 边界
 
 1. **唯一对外入口是 `pvisor_vm::api`。** `lib.rs` 只公开 `api`；其他模块属于私有实现，不允许其他 crate 直接访问，也不通过另一个公开模块绕过这个边界。

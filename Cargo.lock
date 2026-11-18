@@ -3080,6 +3080,7 @@ dependencies = [
  "pvisor-guest",
  "pvisor-overlay-core",
  "rand 0.9.4",
+ "rstest",
  "serde",
  "serde_json",
  "sha2 0.11.0",

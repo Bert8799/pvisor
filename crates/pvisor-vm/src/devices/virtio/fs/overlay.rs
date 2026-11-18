@@ -699,7 +699,7 @@ impl OverlaySnapshot {
             }
             let path = super::snapshot::relative_path(Path::new(&roots[*layer]), relative)?;
             let metadata = std::fs::symlink_metadata(path)?;
-            if !metadata.is_file() || metadata.nlink() < 2 {
+            if !(metadata.is_file() || metadata.file_type().is_symlink()) || metadata.nlink() < 2 {
                 return Err(invalid("copied overlay lost its lower hard-link origin"));
             }
             let identity = (metadata.dev(), metadata.ino());
@@ -1133,6 +1133,7 @@ pub struct OverlayFs {
     negative_entry_cache_roots: Vec<PathBuf>,
     negative_entry_cache_protected_prefixes: Vec<PathBuf>,
     virtual_metadata: bool,
+    logical_symlink_metadata: bool,
     #[cfg(target_os = "linux")]
     special_metadata: Option<super::linux::inode_metadata::Catalog>,
     snapshot_config: Config,
@@ -1698,6 +1699,12 @@ impl OverlayFs {
         }
         let lowers = cfg.lower_dirs.iter().map(PathBuf::from).collect::<Vec<_>>();
         let upper = PathBuf::from(&cfg.upper_dir);
+        let logical_symlink_metadata = lowers.iter().chain(std::iter::once(&upper)).try_fold(false, |found, root| {
+            backend::requires_unix_metadata(root).map(|required| found || required)
+        })?;
+        if logical_symlink_metadata && cfg.semantics == passthrough::PermissionSemantics::LinuxSimplified {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "logical image metadata requires LinuxComplete semantics"));
+        }
         let work = cfg.work_dir.as_ref().map(PathBuf::from);
         let preimages = cfg.preimage_dir.as_ref().map(PathBuf::from);
         let excluded = cfg.excluded_paths.iter().map(PathBuf::from).collect();
@@ -1761,7 +1768,7 @@ impl OverlayFs {
             .collect::<io::Result<Vec<_>>>()?;
         let mut nodes = Nodes::default();
         nodes.insert_path(PathBuf::new(), fuse::ROOT_ID);
-        let virtual_metadata = roots.iter().try_fold(private_host_root, |found, root| {
+        let virtual_metadata = roots.iter().try_fold(private_host_root || logical_symlink_metadata, |found, root| {
             backend::attributes(root).map(|attr| {
                 found
                     || attr.is_some()
@@ -1802,6 +1809,7 @@ impl OverlayFs {
             negative_entry_cache_roots: Vec::new(),
             negative_entry_cache_protected_prefixes: Vec::new(),
             virtual_metadata,
+            logical_symlink_metadata,
             #[cfg(target_os = "linux")]
             special_metadata: virtual_metadata
                 .then(|| {
@@ -1880,7 +1888,7 @@ impl OverlayFs {
     }
 
     /// Single-critical-section publication of a fresh creation: inode
-    /// allocation, the regular-file upper binding and the guest lookup
+    /// allocation, the file/link upper binding and the guest lookup
     /// reference previously took the nodes lock three times in a row.
     fn publish_created_inode(&self, path: &Path, attr: &bindings::stat64) -> u64 {
         let mut nodes = self.nodes.lock().unwrap();
@@ -1892,7 +1900,7 @@ impl OverlayFs {
                 inode
             }
         };
-        if attr.st_mode & libc::S_IFMT == libc::S_IFREG {
+        if matches!(attr.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK) {
             if attr.st_nlink > 1 || nodes.objects_by_inode.contains_key(&inode) {
                 nodes.bind_object(inode, (0, attr.st_dev as _, attr.st_ino));
             }
@@ -1909,7 +1917,7 @@ impl OverlayFs {
 
     fn inode_for_backing(&self, path: PathBuf, backing: &BackingResolution) -> u64 {
         let metadata = &backing.entry.metadata;
-        if !metadata.is_file() || metadata.nlink() < 2 {
+        if !(metadata.is_file() || metadata.file_type().is_symlink()) || metadata.nlink() < 2 {
             return self.allocate_inode(path);
         }
         let object = (backing.entry.layer, metadata.dev(), metadata.ino());
@@ -2456,6 +2464,68 @@ impl OverlayFs {
         Ok(entry)
     }
 
+    fn set_logical_symlink(
+        &self,
+        ctx: Context,
+        path: &Path,
+        inode: u64,
+        attr: bindings::stat64,
+        valid: SetattrValid,
+    ) -> io::Result<(bindings::stat64, Duration)> {
+        if valid.contains(SetattrValid::SIZE) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let time = |seconds, nanos, now| {
+            if now {
+                return Ok(std::time::SystemTime::now());
+            }
+            if !(0..1_000_000_000).contains(&nanos) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            Ok(pvisor_overlay_core::sys::unix_time(seconds, nanos))
+        };
+        #[allow(clippy::unnecessary_cast)] // stat64 timestamp types differ by host.
+        let (atime, mtime) = (
+            valid
+                .contains(SetattrValid::ATIME)
+                .then(|| {
+                    time(
+                        attr.st_atime as i64,
+                        attr.st_atime_nsec as i64,
+                        valid.contains(SetattrValid::ATIME_NOW),
+                    )
+                })
+                .transpose()?,
+            valid
+                .contains(SetattrValid::MTIME)
+                .then(|| {
+                    time(
+                        attr.st_mtime as i64,
+                        attr.st_mtime_nsec as i64,
+                        valid.contains(SetattrValid::MTIME_NOW),
+                    )
+                })
+                .transpose()?,
+        );
+        let upper = self.core.upper_path(path);
+        if valid.intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID) {
+            #[allow(clippy::unnecessary_cast)] // mode_t differs by host.
+            let mode = (attr.st_mode & 0o7777) as u16;
+            pvisor_overlay_core::sys::set_symlink_attributes(
+                &upper,
+                valid.contains(SetattrValid::UID).then_some(attr.st_uid),
+                valid.contains(SetattrValid::GID).then_some(attr.st_gid),
+                valid.contains(SetattrValid::MODE).then_some(mode),
+            )
+            .map_err(linux_error)?;
+        }
+        if atime.is_some() || mtime.is_some() {
+            pvisor_overlay_core::sys::set_times(&upper, atime, mtime, true).map_err(linux_error)?;
+        }
+        let entry = self.entry(ctx, path, inode)?;
+        Ok((entry.attr, TTL))
+    }
+
     fn backing_attributes(&self, path: &Path, attr: &mut bindings::stat64) -> io::Result<()> {
         let remote = backend::attributes(path).map_err(linux_error)?;
         if let Some(remote) = &remote {
@@ -2781,11 +2851,11 @@ impl OverlayFs {
 
     /// Passthrough resolution for a path whose fence drained and copy-up
     /// settled earlier in the same exclusive admission: only the inner inode
-    /// and the regular-file upper binding remain. Re-fencing and re-copying
+    /// and the file/link upper binding remain. Re-fencing and re-copying
     /// would repeat identical host work for every metadata-only setattr.
     fn writable_inner_settled(&self, ctx: Context, path: &Path) -> io::Result<u64> {
         let entry = self.inner_entry(Layer(0), path, ctx)?;
-        if entry.attr.st_mode & libc::S_IFMT == libc::S_IFREG {
+        if matches!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK) {
             let inode = self.nodes.lock().unwrap().by_path.get(path).copied();
             if let Some(inode) = inode {
                 self.bind_upper(path, inode, &entry.attr);
@@ -3351,7 +3421,7 @@ impl FileSystem for OverlayFs {
                 .ok_or_else(|| super::snapshot::invalid("hard-link source escaped lower"))?;
             use std::os::unix::fs::MetadataExt;
             let metadata = std::fs::symlink_metadata(path)?;
-            if !metadata.is_file()
+            if !(metadata.is_file() || metadata.file_type().is_symlink())
                 || metadata.nlink() < 2
                 || (metadata.dev(), metadata.ino()) != (*dev, *ino)
             {
@@ -3375,14 +3445,16 @@ impl FileSystem for OverlayFs {
             let mut directories = vec![root.clone()];
             while !missing.is_empty() && !directories.is_empty() {
                 for entry in std::fs::read_dir(directories.pop().unwrap())? {
-                    let path = entry?.path();
+                    let entry = entry?;
+                    if backend::is_metadata_entry(&entry.path())? { continue; }
+                    let path = entry.path();
                     let metadata = std::fs::symlink_metadata(&path)?;
                     if missing.is_empty() {
                         break;
                     }
                     if metadata.is_dir() {
                         directories.push(path);
-                    } else if metadata.is_file()
+                    } else if (metadata.is_file() || metadata.file_type().is_symlink())
                         && missing.remove(&(metadata.dev(), metadata.ino()))
                     {
                         hard_link_origins.push((
@@ -3666,7 +3738,7 @@ impl FileSystem for OverlayFs {
                     continue;
                 };
                 let meta = &backing.entry.metadata;
-                if meta.is_file() {
+                if meta.is_file() || meta.file_type().is_symlink() {
                     let (_, copied) = self
                         .core
                         .metadata_with_copied_hard_link(&path)
@@ -3679,7 +3751,7 @@ impl FileSystem for OverlayFs {
                     identity = Some(current);
                     nodes.bind_object(inode, (backing.entry.layer, meta.dev(), meta.ino()));
                 } else if state.node_aliases.iter().any(|(saved, _)| *saved == inode) {
-                    return Err(invalid("non-file overlay inode alias"));
+                    return Err(invalid("non-linkable overlay inode alias"));
                 }
             }
         }
@@ -4083,6 +4155,14 @@ impl FileSystem for OverlayFs {
                 native_valid.remove(SetattrValid::UID | SetattrValid::GID);
             }
         }
+        let upper = self.core.upper_path(&path);
+        if backend::logical_symlink_attributes(&upper).map_err(linux_error)?.is_some() {
+            let inner = self.writable_inner_settled(ctx, &path)?;
+            if inner != fuse::ROOT_ID {
+                self.layers[0].forget(ctx, inner, 1);
+            }
+            return self.set_logical_symlink(ctx, &path, inode, requested, valid);
+        }
         #[cfg(target_os = "linux")]
         let mut native_attr = attr;
         #[cfg(target_os = "macos")]
@@ -4179,6 +4259,25 @@ impl FileSystem for OverlayFs {
         }
         let created = created?;
         self.layers[0].forget(ctx, created.inode, 1);
+        #[cfg(target_os = "linux")]
+        if self.logical_symlink_metadata {
+            let parent_attr = self.entry(ctx, &self.path(parent)?, parent)?.attr;
+            let gid = if parent_attr.st_mode & libc::S_ISGID != 0 {
+                parent_attr.st_gid
+            } else {
+                ctx.gid
+            };
+            backend::restore_symlink_metadata(
+                &self.core.upper_path(&path),
+                backend::UnixIdentity {
+                    uid: ctx.uid,
+                    gid,
+                    mode: 0o777,
+                },
+                &[],
+            )
+            .map_err(linux_error)?;
+        }
         self.created_entry(path, created)
     }
 
@@ -4934,7 +5033,14 @@ impl FileSystem for OverlayFs {
             .prepare_metadata_change(&path)
             .map_err(linux_error)?;
         let inner = self.writable_inner(ctx, &path)?;
-        let result = self.layers[0].setxattr(ctx, inner, effective, value, flags);
+        let result = (|| {
+            let upper = self.core.upper_path(&path);
+            if backend::logical_symlink_attributes(&upper).map_err(linux_error)?.is_some() {
+                pvisor_overlay_core::sys::set_xattr(&upper, OsStr::from_bytes(effective.to_bytes()), value, flags as i32).map_err(linux_error)
+            } else {
+                self.layers[0].setxattr(ctx, inner, effective, value, flags)
+            }
+        })();
         if inner != fuse::ROOT_ID {
             self.layers[0].forget(ctx, inner, 1);
         }
@@ -4971,7 +5077,21 @@ impl FileSystem for OverlayFs {
         }
         let path = self.path(inode)?;
         let (layer, inner) = self.observed_inner(ctx, &path)?;
-        let result = self.layers[layer.0].getxattr(ctx, inner, effective, size);
+        let result = (|| {
+            let backing = self.roots[layer.0].join(&path);
+            if backend::logical_symlink_attributes(&backing).map_err(linux_error)?.is_some() {
+                let bytes = pvisor_overlay_core::sys::get_xattr(&backing, OsStr::from_bytes(effective.to_bytes())).map_err(linux_error)?;
+                if size == 0 {
+                    Ok(GetxattrReply::Count(bytes.len().try_into().map_err(|_| io::Error::from_raw_os_error(libc::E2BIG))?))
+                } else if bytes.len() > size as usize {
+                    Err(io::Error::from_raw_os_error(libc::ERANGE))
+                } else {
+                    Ok(GetxattrReply::Value(bytes))
+                }
+            } else {
+                self.layers[layer.0].getxattr(ctx, inner, effective, size)
+            }
+        })();
         if inner != fuse::ROOT_ID {
             self.layers[layer.0].forget(ctx, inner, 1);
         }
@@ -4985,17 +5105,28 @@ impl FileSystem for OverlayFs {
         let path = self.path(inode)?;
         let (layer, inner) = self.observed_inner(ctx, &path)?;
         let result = (|| {
-            let ListxattrReply::Count(count) = self.layers[layer.0].listxattr(ctx, inner, 0)?
-            else {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            };
-            let mut projected = Vec::new();
-            if count != 0 {
-                let ListxattrReply::Names(names) =
-                    self.layers[layer.0].listxattr(ctx, inner, count)?
-                else {
+            let backing = self.roots[layer.0].join(&path);
+            let logical = backend::logical_symlink_attributes(&backing).map_err(linux_error)?.is_some();
+            let names = if logical {
+                let mut names = Vec::new();
+                for name in pvisor_overlay_core::sys::list_xattrs(&backing).map_err(linux_error)? {
+                    names.extend(name);
+                    names.push(0);
+                }
+                names
+            } else {
+                let ListxattrReply::Count(count) = self.layers[layer.0].listxattr(ctx, inner, 0)? else {
                     return Err(io::Error::from_raw_os_error(libc::EIO));
                 };
+                if count == 0 { Vec::new() } else {
+                    let ListxattrReply::Names(names) = self.layers[layer.0].listxattr(ctx, inner, count)? else {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    };
+                    names
+                }
+            };
+            let mut projected = Vec::new();
+            {
                 for name in names
                     .split(|byte| *byte == 0)
                     .filter(|name| !name.is_empty())
@@ -5064,7 +5195,14 @@ impl FileSystem for OverlayFs {
             .prepare_metadata_change(&path)
             .map_err(linux_error)?;
         let inner = self.writable_inner(ctx, &path)?;
-        let result = self.layers[0].removexattr(ctx, inner, effective);
+        let result = (|| {
+            let upper = self.core.upper_path(&path);
+            if backend::logical_symlink_attributes(&upper).map_err(linux_error)?.is_some() {
+                pvisor_overlay_core::sys::remove_xattr(&upper, OsStr::from_bytes(effective.to_bytes())).map_err(linux_error)
+            } else {
+                self.layers[0].removexattr(ctx, inner, effective)
+            }
+        })();
         if inner != fuse::ROOT_ID {
             self.layers[0].forget(ctx, inner, 1);
         }
@@ -7077,6 +7215,12 @@ mod tests {
     mod host_writeback {
         use super::*;
         include!("overlay_host_writeback_tests.rs");
+    }
+
+    #[cfg(target_os = "linux")]
+    mod image_metadata {
+        use super::*;
+        include!("overlay_image_tests.rs");
     }
 
     #[cfg(target_os = "linux")]

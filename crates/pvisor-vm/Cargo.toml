@@ -115,6 +115,7 @@ imago = { version = "0.2.2", features = ["sync-wrappers"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 pvisor = { path = "../pvisor", default-features = false }
+rstest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 imago = { version = "0.2.2", features = ["sync-wrappers"] }

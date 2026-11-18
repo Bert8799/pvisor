@@ -272,6 +272,7 @@ pub trait VmConfiguration: Sized {
     /// writers. Data retains close-to-open caching and mmap support; simultaneous
     /// writes or already-open mappings across VMs require caller synchronization.
     /// Use `immutable_filesystem` for the supported read-only DAX contract.
+    /// Qualified logical image trees require a LinuxComplete overlay.
     fn filesystem(&mut self, tag: &str, path: &Path, shm_size: usize) -> io::Result<()>;
     /// Attach a host-enforced read-only directory without DAX or an immutability
     /// promise. All guest mutation requests fail even if the guest remounts it.
@@ -280,11 +281,13 @@ pub trait VmConfiguration: Sized {
     /// reopened files observe host changes. Already-open mappings across VMs
     /// require caller synchronization, as for writable passthrough attachments.
     /// Requires a nonempty unique tag and an absolute existing UTF-8 directory.
+    /// Qualified logical image trees require a LinuxComplete overlay.
     /// Invalid input leaves existing attachments unchanged. TEE/Nitro builds
     /// return Unsupported. This does not enable immutable-data caching or add
     /// the DAX profile's snapshot restrictions.
     fn read_only_filesystem(&mut self, tag: &str, path: &Path) -> io::Result<()>;
     /// Attach a caller-owned private directory with persistent guest identities.
+    /// Qualified logical image trees require a LinuxComplete overlay.
     /// The caller retains its root/mount identity, owns every backing inode and
     /// excludes host authority and external writers for the attachment lifetime.
     /// Multiple VMs may share the directory with caller-synchronized mutations;
@@ -327,6 +330,7 @@ pub trait VmConfiguration: Sized {
     /// padding beyond EOF, but normal file reads retain their original size.
     ///
     /// Requires Linux x86_64 without TEE/Nitro, an absolute existing directory,
+    /// without a logical image projection or persisted logical metadata,
     /// and a window of 2 MiB to 1 GiB in 2 MiB increments. Duplicate/empty tags
     /// and invalid inputs fail before attachment. Other platforms return
     /// Unsupported. DAX and snapshot profiles/restoration are mutually exclusive;
@@ -340,7 +344,9 @@ pub trait VmConfiguration: Sized {
         dax_window_size: usize,
     ) -> io::Result<()>;
     /// Attach a writable merged overlay. `shm_size` must be zero; DAX for this
-    /// merged view is Unsupported. Failure preserves previous attachments.
+    /// merged view is Unsupported. Qualified logical image trees require
+    /// LinuxComplete; LinuxSimplified rejects them before backing creation.
+    /// Failure preserves previous attachments.
     fn overlay(&mut self, tag: &str, overlay: OverlayConfig, shm_size: usize) -> io::Result<()>;
     /// Add owned immutable bytes to an existing filesystem tag; a leading slash
     /// is optional. Virtual parent directories must already exist; empty/dot/parent/

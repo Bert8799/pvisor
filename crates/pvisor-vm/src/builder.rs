@@ -547,6 +547,13 @@ impl<B: Backend> Builder<B> {
                 "empty or duplicate filesystem tag",
             ));
         }
+        if config.overlay.is_none() {
+            if let Some(root) = config.shared_dir.as_deref().map(std::path::Path::new).filter(|p|p.is_dir()) {
+                if pvisor_overlay_core::backend::requires_unix_metadata(root)? {
+                    return Err(io::Error::new(io::ErrorKind::Unsupported,"logical images require an overlay with LinuxComplete semantics"));
+                }
+            }
+        }
         #[cfg(feature = "init-blob")]
         if config.fs_id == "/dev/root" && self.implicit_init {
             config.virtual_entries.push(VirtualDirEntry {
