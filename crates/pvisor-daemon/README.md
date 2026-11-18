@@ -788,10 +788,11 @@ physical-memory budget.
 The launch callback joins the identity-bound cgroup **before exec**, using a pre-opened `cgroup.procs` FD under the owner lock and checking started/deletion/tombstone markers. Supervisor startup verifies membership instead of moving an already-running Tokio process; supervisor/Tokio allocations and subsequent VM/helper children are charged inside the sandbox budget. Direct hidden-command invocation outside that cgroup fails closed.
 
 Images are trusted local `images_dir/<key>.json` manifests, not registry
-references. Every manifest requires `pooled_image`, the owning Docker API's
-pinned V2 image contract. `rootfs` names its private Docker store directory;
-standalone unpacked roots and missing pool bindings are rejected. Recreate old
-templates with `prepare-image`; no compatibility reader or migration is provided.
+references. Ordinary manifests require `pooled_image`, the owning Docker API's
+pinned V2 image contract. Their `rootfs` names the private Docker store directory.
+Directory-backed inert templates use an explicit `source: "directory_template"`
+manifest with a required template selection and no pool binding. An ordinary
+manifest missing its pool binding is rejected.
 The template also declares bootstrap `entrypoint`, optional `cmd`/`env`, and an
 optional absolute `library_dir` for firmware. Requested argv, or `cmd` when
 empty, is appended to the bootstrap; request env overrides template env without
@@ -814,7 +815,7 @@ caches are neither written nor used as liveness proof.
 `prepare-image` supplies the managed bootstrap described above. Its manifest adds
 `pooled_image` (the owning Docker API's pinned image contract) and
 `native_opensandbox: true`; `rootfs` names its private Docker store. The backend is lazy and is not advertised as immutable DAX
-storage. Directory-root manifests are not supported. Python SDK initialization resolves both endpoints even without a
+storage. Directory templates use the separate source described below. Python SDK initialization resolves both endpoints even without a
 network policy. There is no full SDK-conformance or density evidence.
 
 Native OverlayNet supplies outbound VM networking; requested OpenSandbox network
@@ -840,12 +841,21 @@ sizing. Prepare with the same daemon build, firmware and host boot used to run
 instances. The isolated worker has a 90-second deadline and is reaped by its
 parent; publication may precede an error, so inspect selection before retrying.
 
-Add a `template` object containing `catalog`, `name` and the returned
+For a pooled manifest, add a `template` object with `catalog`, `name` and the returned
 `spec.image_sha256` to the generated manifest. Retain its V2 image binding and
 service settings. The operator must capture the same pinned image contents,
 including any required bootstrap; the inventory digest identifies that capture
 without rescanning the pool on every create. Optional `cwd` uses `/` when absent.
 The catalog must be independent of the image store and daemon state.
+
+For a directory template, write a mode-0600 local manifest with `source` set to
+`directory_template`, the prepared source `rootfs`, required `template` selection,
+and guest bootstrap `entrypoint`. It accepts the same optional command,
+environment, cwd, firmware and service-profile settings. Do not add a
+`pooled_image` binding: mixed sources are rejected. Admission leases the selected
+catalog generation; restore uses its sealed filesystem and COW RAM without
+opening a pool projection. Missing or incompatible templates fail before launch.
+This source is local and is not an image-repository publication format.
 
 Admission pins and persists the exact generation; the supervisor and VM runner
 acquire that version through teardown even if its alias changes. Instances share
@@ -1421,6 +1431,7 @@ density require their own validation.
 | `daemon/claims.rs` | Retained executor claim validation, replay fences and confirmed-cleanup tombstones |
 | `api.rs` | Public data and method declarations; explicit opaque owner exports |
 | `runtime.rs` | VM-only NativeRuntime, detached supervisor, IPC/cgroup identity and vsock bridges |
+| `image_source.rs` | Borrowed launch configuration and source-specific cold/restore selection |
 | `memory_pool.rs` | Daemon-owned bounded cold-page pool, private socket and restart reuse |
 | `main.rs` | Daemon CLI/configuration, listener and maintenance lifecycle |
 | `prepared_image.rs` | Operator-side static execd/envd checks, pool template preparation and atomic manifest publication |

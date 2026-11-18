@@ -32,8 +32,8 @@
 //! observation.json caches are neither written nor used as liveness proof.
 
 use crate::api::{
-    CreateError, E2bTemplate, NativeRuntimeConfig, NativeRuntimeService, PreparedImage, Runtime,
-    RuntimeSpec, RuntimeState, RuntimeValidation,
+    CreateError, E2bTemplate, NativeRuntimeConfig, NativeRuntimeService, PreparedImageSource,
+    Runtime, RuntimeSpec, RuntimeState, RuntimeValidation,
 };
 
 use std::{
@@ -126,7 +126,7 @@ struct Identity {
     token: String,
     generation: String,
     spec: RuntimeSpec,
-    image: PreparedImage,
+    image: PreparedImageSource,
     cgroup: PathBuf,
     cgroup_device: u64,
     cgroup_inode: u64,
@@ -500,10 +500,14 @@ impl Runtime for NativeRuntime {
             e2b: None,
         };
         validate_spec(&spec)?;
-        let image: PreparedImage =
+        let image: PreparedImageSource =
             read_json(&self.config.images_dir.join(format!("{image}.json")))?;
         validate_image(&image, &self.config.state_dir)?;
-        let template = image.e2b.context("image has no E2B envd profile")?;
+        let template = image
+            .config()
+            .e2b
+            .clone()
+            .context("image has no E2B envd profile")?;
         template.validate()?;
         spec.cpu_millis = template.cpu_millis;
         spec.memory_bytes = template.memory_bytes;
@@ -561,11 +565,11 @@ impl Runtime for NativeRuntime {
             !directory.try_exists()?,
             "sandbox ID was already used; never relaunch/reuse it"
         );
-        let image: PreparedImage =
+        let image: PreparedImageSource =
             read_json(&self.config.images_dir.join(format!("{}.json", spec.image)))?;
         validate_image(&image, &self.config.state_dir)?;
         ensure!(
-            image.e2b == spec.e2b,
+            *image.config().e2b == spec.e2b,
             "prepared image service profile changed"
         );
         let template_lease =
@@ -855,7 +859,7 @@ impl NativeRuntimeService for NativeRuntime {
             vec![EXECD_PORT, EGRESS_PORT]
         };
         let native_control = ports_dir.join("guest.sock");
-        if identity.image.native_guest {
+        if identity.image.config().native_guest {
             vsock_ports.insert(pvisor_guest::api::CONTROL_PORT, native_control.clone());
         }
         for port in ports {
@@ -863,7 +867,8 @@ impl NativeRuntimeService for NativeRuntime {
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
             endpoints.insert(port, format!("http://{}", listener.local_addr()?));
             if port == EGRESS_PORT
-                && (identity.image.native_opensandbox || identity.image.native_guest)
+                && (identity.image.config().native_opensandbox
+                    || identity.image.config().native_guest)
             {
                 let token = identity
                     .spec
@@ -875,8 +880,8 @@ impl NativeRuntimeService for NativeRuntime {
                     endpoints[&EXECD_PORT].clone(),
                     service_health_client("x-execd-access-token", Some(token))?,
                 ));
-            } else if identity.image.native_guest {
-                let mut env = identity.image.env.clone();
+            } else if identity.image.config().native_guest {
+                let mut env = identity.image.config().env.clone();
                 env.extend(identity.spec.env.clone());
                 env.retain(|key, _| {
                     !key.starts_with("PVISOR_")
@@ -911,14 +916,14 @@ impl NativeRuntimeService for NativeRuntime {
                 ));
             } else {
                 vsock_ports.insert(u32::from(port), path.clone());
-                if port == EXECD_PORT && identity.image.native_opensandbox {
+                if port == EXECD_PORT && identity.image.config().native_opensandbox {
                     let token = identity
                         .spec
                         .env
                         .get("PVISOR_EXECD_ACCESS_TOKEN")
                         .context("managed credential missing")?;
                     publications.spawn(managed_execd_bridge(listener, path, token.clone()));
-                } else if port == ENVD_PORT && identity.image.native_e2b {
+                } else if port == ENVD_PORT && identity.image.config().native_e2b {
                     let token = identity
                         .spec
                         .env
@@ -941,14 +946,12 @@ impl NativeRuntimeService for NativeRuntime {
             identity.memory_pool.as_deref(),
             identity.template_version.as_deref(),
         )?;
-        let pooled_root = if template_lease.is_none() {
-            Some(
-                pvisor::docker::Store::open(run_dir.join("image"))?
-                    .open_image(&identity.image.pooled_image)?,
-            )
-        } else {
-            None
-        };
+        let pooled_root =
+            if let Some(image) = identity.image.cold_image(template_lease.is_some())? {
+                Some(pvisor::docker::Store::open(run_dir.join("image"))?.open_image(image)?)
+            } else {
+                None
+            };
         startup.insert("image_opened_us", startup_clock.elapsed().as_micros());
         let rootfs = match &template_lease {
             Some(lease) => lease.environment().owned_layer_path(Path::new("rootfs"))?,
@@ -964,7 +967,7 @@ impl NativeRuntimeService for NativeRuntime {
             memory_pool: identity.memory_pool.clone(),
             rootfs: Some(rootfs),
             rootfs_immutable: template_lease.is_some(),
-            library_dir: identity.image.library_dir.clone(),
+            library_dir: identity.image.config().library_dir.clone(),
             memory_mib: u32::try_from(identity.spec.memory_bytes / MIB)?,
             cpus: u16::try_from(identity.spec.cpu_millis.div_ceil(1000).min(8))?,
             ..Default::default()
@@ -1026,8 +1029,8 @@ impl NativeRuntimeService for NativeRuntime {
             bail!("native live VM control verification failed");
         }
         startup.insert("controls_verified_us", startup_clock.elapsed().as_micros());
-        let client = if identity.image.native_opensandbox
-            || (identity.image.native_guest && identity.spec.e2b.is_none())
+        let client = if identity.image.config().native_opensandbox
+            || (identity.image.config().native_guest && identity.spec.e2b.is_none())
         {
             service_health_client(
                 "x-execd-access-token",
@@ -1044,7 +1047,7 @@ impl NativeRuntimeService for NativeRuntime {
                 None
             })?
         };
-        if identity.image.native_opensandbox {
+        if identity.image.config().native_opensandbox {
             let initialized = timeout(
                 READY_TIMEOUT,
                 initialize_execd(
@@ -1062,7 +1065,7 @@ impl NativeRuntimeService for NativeRuntime {
                 bail!("native execd binding initialization failed");
             }
         }
-        if identity.image.native_guest {
+        if identity.image.config().native_guest {
             let initialized = timeout(READY_TIMEOUT, async {
                 loop {
                     if probe_services(&client, &endpoints).await.is_ok() {
@@ -1078,7 +1081,7 @@ impl NativeRuntimeService for NativeRuntime {
                 bail!("native guest engine readiness failed");
             }
         }
-        if identity.image.native_e2b {
+        if identity.image.config().native_e2b {
             let initialized = timeout(
                 READY_TIMEOUT,
                 initialize_envd(&client, &endpoints[&ENVD_PORT], &identity),
@@ -1187,16 +1190,16 @@ async fn execute_control(
     let result = timeout(CONTROL_TIMEOUT, service.dispatch(command)).await??;
     let state = native_status(result.status)?;
     if state == RuntimeState::Running
-        && (identity.image.native_opensandbox
-            || (identity.image.native_guest && identity.spec.e2b.is_none()))
+        && (identity.image.config().native_opensandbox
+            || (identity.image.config().native_guest && identity.spec.e2b.is_none()))
         && !matches!(operation, Operation::Endpoint { .. })
     {
         let ready = probe(client, &format!("{}/ready", endpoints[&EXECD_PORT])).await?;
         validate_execd_binding(&ready, identity)?;
     }
     if state == RuntimeState::Running
-        && (identity.image.native_e2b
-            || (identity.image.native_guest && identity.spec.e2b.is_some()))
+        && (identity.image.config().native_e2b
+            || (identity.image.config().native_guest && identity.spec.e2b.is_some()))
         && !matches!(operation, Operation::Endpoint { .. })
     {
         let env = envd_environment(client, &endpoints[&ENVD_PORT]).await?;
@@ -1272,12 +1275,13 @@ fn native_status(status: pvisor_core::RunStatus) -> Result<RuntimeState> {
 }
 
 fn acquire_image_template(
-    image: &PreparedImage,
+    image: &PreparedImageSource,
     spec: &RuntimeSpec,
     memory_pool: Option<&Path>,
     version: Option<&str>,
 ) -> Result<Option<pvisor::environment_snapshot::templates::TemplateLease>> {
-    let Some(selected) = &image.template else {
+    let image = image.config();
+    let Some(selected) = image.template else {
         ensure!(version.is_none(), "unexpected template version");
         return Ok(None);
     };
@@ -1315,7 +1319,7 @@ fn acquire_image_template(
 }
 
 fn make_run_spec(identity: &Identity) -> Result<pvisor_core::RunSpec> {
-    let image = &identity.image;
+    let image = identity.image.config();
     let mut argv = if image.native_guest {
         Vec::new()
     } else {
@@ -1323,7 +1327,7 @@ fn make_run_spec(identity: &Identity) -> Result<pvisor_core::RunSpec> {
     };
     argv.extend(
         if identity.spec.entrypoint.is_empty() {
-            &image.cmd
+            image.cmd
         } else {
             &identity.spec.entrypoint
         }
@@ -1538,7 +1542,7 @@ async fn initialize_envd(client: &reqwest::Client, envd: &str, identity: &Identi
         }
         sleep(Duration::from_millis(5)).await;
     }
-    let mut env = identity.image.env.clone();
+    let mut env = identity.image.config().env.clone();
     env.extend(identity.spec.env.clone());
     env.retain(|key, _| {
         !key.starts_with("PVISOR_") && !key.starts_with("KRUN_") && !key.starts_with("LIBKRUN_")
@@ -2083,31 +2087,34 @@ fn validate_owner(owner: &str) -> Result<()> {
     );
     Ok(())
 }
-fn validate_image_shape(image: &PreparedImage, state: &Path) -> Result<()> {
+fn validate_image_shape(source: &PreparedImageSource, state: &Path) -> Result<()> {
+    let image = source.config();
     ensure!(
         !image.native_guest || (!image.native_opensandbox && !image.native_e2b),
-        "native guest requires an exclusive pooled engine profile"
+        "native guest requires an exclusive engine profile"
     );
     ensure!(
         !image.native_e2b || (image.e2b.is_some() && !image.native_opensandbox),
-        "managed E2B requires a pooled E2B-only image"
+        "managed E2B requires an E2B-only image"
     );
     ensure!(
         !image.native_opensandbox || image.e2b.is_none(),
-        "managed OpenSandbox requires a pooled non-E2B image"
+        "managed OpenSandbox requires a non-E2B image"
     );
-    let pooled = &image.pooled_image;
-    let cache = &pooled.cache;
-    ensure!(
-        cache.location.is_absolute()
-            && cache.location.starts_with(&image.rootfs)
-            && !cache.location.components().any(|p| matches!(
-                p,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            ))
-            && pooled.platform == "linux/amd64",
-        "invalid native pooled image binding"
-    );
+    if let PreparedImageSource::Pooled(pooled) = source {
+        let pooled = &pooled.pooled_image;
+        let cache = &pooled.cache;
+        ensure!(
+            cache.location.is_absolute()
+                && cache.location.starts_with(image.rootfs)
+                && !cache.location.components().any(|p| matches!(
+                    p,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                ))
+                && pooled.platform == "linux/amd64",
+            "invalid native pooled image binding"
+        );
+    }
     ensure!(
         image.rootfs.is_absolute()
             && image.rootfs != Path::new("/")
@@ -2115,7 +2122,7 @@ fn validate_image_shape(image: &PreparedImage, state: &Path) -> Result<()> {
                 part,
                 std::path::Component::ParentDir | std::path::Component::CurDir
             ))
-            && !state.starts_with(&image.rootfs)
+            && !state.starts_with(image.rootfs)
             && !image.rootfs.starts_with(state),
         "prepared rootfs must be absolute and independent of host root and daemon state"
     );
@@ -2124,8 +2131,8 @@ fn validate_image_shape(image: &PreparedImage, state: &Path) -> Result<()> {
             || (!image.entrypoint.is_empty() && image.entrypoint[0].starts_with('/')),
         "prepared guest bootstrap must be absolute"
     );
-    validate_argv_env(&image.entrypoint, &image.env)?;
-    validate_argv_env(&image.cmd, &BTreeMap::new())?;
+    validate_argv_env(image.entrypoint, image.env)?;
+    validate_argv_env(image.cmd, &BTreeMap::new())?;
     if let Some(cwd) = &image.cwd {
         ensure!(
             cwd.is_absolute()
@@ -2145,7 +2152,7 @@ fn validate_image_shape(image: &PreparedImage, state: &Path) -> Result<()> {
                 ))
                 && !template.catalog.starts_with(state)
                 && !state.starts_with(&template.catalog)
-                && !template.catalog.starts_with(&image.rootfs)
+                && !template.catalog.starts_with(image.rootfs)
                 && !image.rootfs.starts_with(&template.catalog),
             "template catalog must be independent of image and state"
         );
@@ -2172,13 +2179,14 @@ fn validate_image_shape(image: &PreparedImage, state: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn validate_image(image: &PreparedImage, state: &Path) -> Result<()> {
+fn validate_image(image: &PreparedImageSource, state: &Path) -> Result<()> {
     validate_image_shape(image, state)?;
+    let image = image.config();
     ensure!(
         image.rootfs.is_absolute(),
         "prepared rootfs must be absolute"
     );
-    trusted_directory(&image.rootfs)?;
+    trusted_directory(image.rootfs)?;
     let root = image.rootfs.canonicalize()?;
     let state = state.canonicalize()?;
     ensure!(
@@ -2201,8 +2209,8 @@ fn validate_image(image: &PreparedImage, state: &Path) -> Result<()> {
             || (!image.entrypoint.is_empty() && image.entrypoint[0].starts_with('/')),
         "prepared guest bootstrap must be absolute"
     );
-    validate_argv_env(&image.entrypoint, &image.env)?;
-    validate_argv_env(&image.cmd, &BTreeMap::new())?;
+    validate_argv_env(image.entrypoint, image.env)?;
+    validate_argv_env(image.cmd, &BTreeMap::new())?;
     if let Some(path) = &image.library_dir {
         ensure!(path.is_absolute(), "firmware directory must be absolute");
         trusted_directory(path)?;
@@ -2276,7 +2284,7 @@ fn validate_tombstone(tombstone: &Tombstone, directory: &Path) -> Result<()> {
 }
 fn validate_launch_resources(identity: &Identity, directory: &Path) -> Result<()> {
     ensure!(
-        identity.image.template.is_some() == identity.template_version.is_some(),
+        identity.image.config().template.is_some() == identity.template_version.is_some(),
         "template version binding is missing or unexpected"
     );
     validate_spec(&identity.spec)?;
@@ -2613,6 +2621,20 @@ fn validate_resources(cpu_millis: u64, memory_bytes: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::PreparedImage;
+    fn pooled(image: &PreparedImageSource) -> &PreparedImage {
+        let PreparedImageSource::Pooled(image) = image else {
+            panic!("expected pooled fixture")
+        };
+        image
+    }
+    fn pooled_mut(image: &mut PreparedImageSource) -> &mut PreparedImage {
+        let PreparedImageSource::Pooled(image) = image else {
+            panic!("expected pooled fixture")
+        };
+        image
+    }
+
     use super::*;
     use pvisor::host_transport::{encode_host_frame, read_host_frame_sync, write_host_frame_sync};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2781,7 +2803,7 @@ mod tests {
             token: "a".repeat(64),
             generation: generation.clone(),
             spec: spec(),
-            image: PreparedImage {
+            image: PreparedImageSource::Pooled(Box::new(PreparedImage {
                 rootfs: rootfs.clone(),
                 entrypoint: vec!["/guest/bootstrap".into(), "--".into()],
                 cmd: vec!["/guest/default".into()],
@@ -2817,7 +2839,7 @@ mod tests {
                 native_opensandbox: false,
                 native_e2b: false,
                 native_guest: false,
-            },
+            })),
             cgroup: temp
                 .join("groups")
                 .join(format!("pvisor-{ID}-{generation}")),
@@ -2829,6 +2851,110 @@ mod tests {
         };
         (identity, directory)
     }
+
+    fn directory_identity(temp: &Path) -> (Identity, PathBuf) {
+        let (mut identity, directory) = identity_fixture(temp);
+        let catalog = temp.join("templates");
+        private_directory(&catalog).unwrap();
+        let mut wire = serde_json::to_value(&identity.image).unwrap();
+        wire.as_object_mut().unwrap().remove("pooled_image");
+        wire["source"] = "directory_template".into();
+        wire["template"] = serde_json::json!({
+            "catalog": catalog, "name": "agent", "image_sha256": "a".repeat(64)
+        });
+        wire["cwd"] = "/work/project".into();
+        identity.image = serde_json::from_value(wire).unwrap();
+        (identity, directory)
+    }
+
+    #[test]
+    fn directory_source_requires_restore_and_keeps_fresh_task_and_cleanup_contracts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut identity, directory) = directory_identity(temp.path());
+        validate_image(&identity.image, directory.parent().unwrap()).unwrap();
+        assert!(identity.image.cold_image(false).is_err());
+        assert!(identity.image.cold_image(true).unwrap().is_none());
+        assert!(validate_launch_resources(&identity, &directory).is_err());
+        identity.template_version = Some("b".repeat(64));
+        validate_launch_resources(&identity, &directory).unwrap();
+        identity.spec.env.insert("FRESH".into(), "new-task".into());
+        let run = make_run_spec(&identity).unwrap();
+        let pvisor_core::RunInvocation::Process(process) = run.invocation;
+        assert_eq!(process.cwd.as_deref(), Some("/work/project"));
+        assert_eq!(process.env["FRESH"], "new-task");
+        assert_eq!(process.args.last().map(String::as_str), Some("a b;$HOME"));
+        assert!(
+            acquire_image_template(
+                &identity.image,
+                &identity.spec,
+                Some(Path::new("/pool")),
+                None
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("COW RAM")
+        );
+        assert!(
+            acquire_image_template(
+                &identity.image,
+                &identity.spec,
+                None,
+                identity.template_version.as_deref()
+            )
+            .is_err()
+        );
+        assert!(!directory.join("run").exists());
+        fs::remove_dir_all(identity.image.config().rootfs).unwrap();
+        fs::remove_dir_all(&identity.image.config().template.unwrap().catalog).unwrap();
+        validate_identity(&identity, &directory).unwrap();
+        assert!(validate_launch_resources(&identity, &directory).is_err());
+    }
+
+    #[test]
+    fn source_specific_validation_preserves_pool_fences_and_directory_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let (identity, directory) = identity_fixture(temp.path());
+        assert!(identity.image.cold_image(false).unwrap().is_some());
+        assert!(identity.image.cold_image(true).unwrap().is_none());
+        for case in [
+            "relative_root",
+            "state_overlap",
+            "catalog_overlap",
+            "alias",
+            "digest",
+            "cwd",
+            "mixed_engines",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (identity, directory) = directory_identity(temp.path());
+            let mut wire = serde_json::to_value(&identity.image).unwrap();
+            match case {
+                "relative_root" => wire["rootfs"] = "relative".into(),
+                "state_overlap" => {
+                    wire["rootfs"] = directory.parent().unwrap().to_str().unwrap().into()
+                }
+                "catalog_overlap" => wire["template"]["catalog"] = wire["rootfs"].clone(),
+                "alias" => wire["template"]["name"] = "../escape".into(),
+                "digest" => wire["template"]["image_sha256"] = "A".repeat(64).into(),
+                "cwd" => wire["cwd"] = "/work/../escape".into(),
+                "mixed_engines" => {
+                    wire["native_guest"] = true.into();
+                    wire["native_e2b"] = true.into();
+                }
+                _ => unreachable!(),
+            }
+            let source: PreparedImageSource = serde_json::from_value(wire).unwrap();
+            assert!(
+                validate_image(&source, directory.parent().unwrap()).is_err(),
+                "{case}"
+            );
+        }
+        let mut invalid = identity.image.clone();
+        pooled_mut(&mut invalid).pooled_image.cache.location = PathBuf::from("/outside/pool");
+        assert!(validate_image(&invalid, directory.parent().unwrap()).is_err());
+    }
+
     fn runtime_fixture(identity: &Identity, directory: &Path) -> NativeRuntime {
         NativeRuntime {
             memory_pool: None,
@@ -3073,9 +3199,9 @@ mod tests {
             .unwrap()
             .remove("pooled_image");
         assert!(serde_json::from_value::<PreparedImage>(directory_record).is_err());
-        identity.image.native_opensandbox = true;
+        pooled_mut(&mut identity.image).native_opensandbox = true;
         assert!(validate_image_shape(&identity.image, &temp.path().join("state")).is_ok());
-        identity.image.native_e2b = true;
+        pooled_mut(&mut identity.image).native_e2b = true;
         assert!(validate_image_shape(&identity.image, &temp.path().join("state")).is_err());
     }
 
@@ -3086,8 +3212,8 @@ mod tests {
         let state = directory.parent().unwrap();
         let catalog = temp.path().join("templates");
         private_directory(&catalog).unwrap();
-        identity.image.cwd = Some("/work".into());
-        identity.image.template = Some(crate::api::NativeTemplate {
+        pooled_mut(&mut identity.image).cwd = Some("/work".into());
+        pooled_mut(&mut identity.image).template = Some(crate::api::NativeTemplate {
             catalog: catalog.clone(),
             name: "agent".into(),
             image_sha256: "a".repeat(64),
@@ -3102,7 +3228,7 @@ mod tests {
             "alias_traversal",
             "uppercase_digest",
         ] {
-            let mut image = identity.image.clone();
+            let mut image = pooled(&identity.image).clone();
             match case {
                 "relative_cwd" => image.cwd = Some("relative".into()),
                 "parent_cwd" => image.cwd = Some("/work/../secret".into()),
@@ -3119,7 +3245,10 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(validate_image_shape(&image, state).is_err(), "case {case}");
+            assert!(
+                validate_image_shape(&PreparedImageSource::Pooled(Box::new(image)), state).is_err(),
+                "case {case}"
+            );
         }
         assert!(
             validate_launch_resources(&identity, &directory)
@@ -3139,7 +3268,7 @@ mod tests {
             .to_string()
             .contains("COW RAM")
         );
-        identity.image.template = None;
+        pooled_mut(&mut identity.image).template = None;
         identity.template_version = Some("a".repeat(64));
         assert!(
             validate_launch_resources(&identity, &directory)
@@ -3153,15 +3282,15 @@ mod tests {
     fn native_engine_launches_workload_directly_with_a_pinned_pool() {
         let temp = tempfile::tempdir().unwrap();
         let (mut identity, _) = identity_fixture(temp.path());
-        assert!(!identity.image.native_guest);
+        assert!(!pooled_mut(&mut identity.image).native_guest);
         assert!(
             serde_json::to_value(&identity.image)
                 .unwrap()
                 .get("native_guest")
                 .is_none()
         );
-        identity.image.native_guest = true;
-        identity.image.entrypoint.clear();
+        pooled_mut(&mut identity.image).native_guest = true;
+        pooled_mut(&mut identity.image).entrypoint.clear();
         identity.spec.entrypoint = vec!["/bin/sleep".into(), "60".into()];
         identity
             .spec
@@ -3175,7 +3304,7 @@ mod tests {
         assert!(!process.env.contains_key("PVISOR_EXECD_ACCESS_TOKEN"));
         assert_eq!(process.env["PVISOR_NATIVE_SANDBOX_ID"], identity.spec.id);
         assert_eq!(process.env["PVISOR_NATIVE_GENERATION"], identity.generation);
-        identity.image.native_opensandbox = true;
+        pooled_mut(&mut identity.image).native_opensandbox = true;
         assert!(validate_image_shape(&identity.image, &temp.path().join("state")).is_err());
     }
 
@@ -3183,13 +3312,12 @@ mod tests {
     fn managed_binding_fences_identity_and_keeps_raw_credentials_out_of_guest_inputs() {
         let temp = tempfile::tempdir().unwrap();
         let (mut identity, _) = identity_fixture(temp.path());
-        identity.image.native_opensandbox = true;
+        pooled_mut(&mut identity.image).native_opensandbox = true;
         identity
             .spec
             .env
             .insert("PVISOR_EXECD_ACCESS_TOKEN".into(), "a".repeat(64));
-        identity
-            .image
+        pooled_mut(&mut identity.image)
             .env
             .insert("EXECD_ACCESS_TOKEN".into(), "template-secret".into());
         let run = make_run_spec(&identity).unwrap();
@@ -3347,10 +3475,10 @@ mod tests {
         let (mut identity, directory) = identity_fixture(temp.path());
         let firmware = temp.path().canonicalize().unwrap().join("firmware");
         private_directory(&firmware).unwrap();
-        identity.image.library_dir = Some(firmware.clone());
+        pooled_mut(&mut identity.image).library_dir = Some(firmware.clone());
         publish_new(&directory.join("identity.json"), &identity).unwrap();
         assert!(validate_launch_resources(&identity, &directory).is_ok());
-        fs::remove_dir_all(&identity.image.rootfs).unwrap();
+        fs::remove_dir_all(&pooled(&identity.image).rootfs).unwrap();
         fs::remove_dir_all(&firmware).unwrap();
         assert!(validate_launch_resources(&identity, &directory).is_err());
         assert!(validate_identity(&identity, &directory).is_ok());
@@ -3548,7 +3676,7 @@ mod tests {
             &Tombstone::from_identity(&identity),
         )
         .unwrap();
-        fs::remove_dir_all(&identity.image.rootfs).unwrap();
+        fs::remove_dir_all(&pooled(&identity.image).rootfs).unwrap();
         let external = temp.path().join("must-survive");
         private_directory(&external).unwrap();
         fs::write(external.join("keep"), b"outside sandbox").unwrap();
@@ -3562,7 +3690,10 @@ mod tests {
         assert!(!directory.join("ports").exists());
         assert!(external.join("keep").is_file());
         let proof = fs::read_to_string(directory.join("tombstone.json")).unwrap();
-        let rootfs_path = identity.image.rootfs.to_string_lossy().into_owned();
+        let rootfs_path = pooled(&identity.image)
+            .rootfs
+            .to_string_lossy()
+            .into_owned();
         for secret in [&identity.token, &identity.spec.entrypoint[1], &rootfs_path] {
             assert!(!proof.contains(secret));
         }
@@ -3596,9 +3727,9 @@ mod tests {
         identity.cgroup_inode = metadata.ino();
         let firmware = temp.path().canonicalize().unwrap().join("firmware");
         private_directory(&firmware).unwrap();
-        identity.image.library_dir = Some(firmware.clone());
+        pooled_mut(&mut identity.image).library_dir = Some(firmware.clone());
         publish_new(&directory.join("identity.json"), &identity).unwrap();
-        fs::remove_dir_all(&identity.image.rootfs).unwrap();
+        fs::remove_dir_all(&pooled(&identity.image).rootfs).unwrap();
         fs::remove_dir_all(&firmware).unwrap();
         let runtime = runtime_fixture(&identity, &directory);
         runtime.cleanup(&identity).await.unwrap();
@@ -3736,7 +3867,7 @@ mod tests {
         identity.cgroup_inode = 0;
         assert!(validate_identity(&identity, &directory).is_err());
         identity.cgroup_inode = 1;
-        identity.image.rootfs = PathBuf::from("/");
+        pooled_mut(&mut identity.image).rootfs = PathBuf::from("/");
         assert!(validate_launch_resources(&identity, &directory).is_err());
         assert!(validate_identity(&identity, &directory).is_ok());
     }
@@ -3780,11 +3911,11 @@ mod tests {
         let (mut identity, directory) = identity_fixture(temp.path());
         let firmware = temp.path().join("firmware");
         private_directory(&firmware).unwrap();
-        identity.image.library_dir = Some(firmware.clone());
+        pooled_mut(&mut identity.image).library_dir = Some(firmware.clone());
         assert_ne!(identity.boot_id, current_boot_id().unwrap());
         publish_new(&directory.join("identity.json"), &identity).unwrap();
         mark(&directory, "started").unwrap();
-        fs::remove_dir_all(&identity.image.rootfs).unwrap();
+        fs::remove_dir_all(&pooled(&identity.image).rootfs).unwrap();
         fs::remove_dir_all(&firmware).unwrap();
         let config = NativeRuntimeConfig {
             state_dir: directory.parent().unwrap().to_owned(),

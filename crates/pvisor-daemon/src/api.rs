@@ -301,7 +301,7 @@ pub trait MemoryPoolService: Sized {
 
 /// Trusted manifest binding to a native template catalog and immutable image.
 /// This record is validated at native admission; constructing it does not open
-/// the catalog or establish that the capture matches the selected pooled image.
+/// the catalog or verify the declared captured image inventory.
 ///
 /// ```
 /// use pvisor_daemon::api::NativeTemplate;
@@ -328,4 +328,88 @@ pub struct NativeTemplate {
     /// Image inventory digest printed by template preparation. Updating image
     /// content requires a new capture and manifest digest; no per-create scan.
     pub image_sha256: String,
+}
+
+/// One trusted local launch source. Existing pooled manifests retain their wire
+/// shape and required image binding. Directory templates require the explicit
+/// `source: "directory_template"` tag and cannot fall back to a cold launch.
+/// Admission validates paths and pins a template generation before mutation;
+/// deserialization alone neither authenticates backing nor acquires a lease.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreparedImageSource {
+    /// Pinned image-store launch, optionally restored from a selected template.
+    Pooled(Box<PreparedImage>),
+    /// Local inert template with no image-store binding or projection owner.
+    DirectoryTemplate(Box<DirectoryTemplateImage>),
+}
+
+/// Directory-backed template launch, encoded with `source: "directory_template"`.
+/// The operator captures the bootstrap and image contents into the selected
+/// catalog. Launch leases that generation and uses its sealed filesystem and
+/// COW RAM; it never opens an image pool or runs a host executable. Catalog,
+/// source root and daemon state must be independent trusted directories.
+///
+/// ```
+/// use pvisor_daemon::api::PreparedImageSource;
+/// let manifest = serde_json::json!({
+///     "source": "directory_template", "rootfs": "/private/rootfs",
+///     "entrypoint": ["/opt/pvisor/sandbox-init"], "cmd": ["/bin/sleep", "infinity"],
+///     "template": {
+///         "catalog": "/private/templates", "name": "agent",
+///         "image_sha256": "a".repeat(64)
+///     }
+/// });
+/// let source: PreparedImageSource = serde_json::from_value(manifest.clone())?;
+/// assert!(matches!(source, PreparedImageSource::DirectoryTemplate(_)));
+/// assert_eq!(serde_json::to_value(source)?, manifest);
+/// let mut missing_tag = manifest;
+/// missing_tag.as_object_mut().unwrap().remove("source");
+/// assert!(serde_json::from_value::<PreparedImageSource>(missing_tag).is_err());
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryTemplateImage {
+    /// Required explicit directory-template discriminator.
+    pub source: DirectoryTemplateKind,
+    /// Absolute prepared source root, independent of catalog and daemon state.
+    /// Restore uses the catalog's owned filesystem, not mutable source contents.
+    pub rootfs: PathBuf,
+    /// Guest bootstrap argv, absolute and nonempty unless `native_guest` is set.
+    pub entrypoint: Vec<String>,
+    /// Default workload argv appended when the request supplies none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd: Vec<String>,
+    /// Guest environment defaults; launch overrides never inherit host env.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Trusted absolute firmware directory retained through VM teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_dir: Option<PathBuf>,
+    /// Real envd resource/version profile; omission selects OpenSandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2b: Option<E2bTemplate>,
+    /// Managed execd bootstrap; mutually exclusive with native E2B/guest engines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_opensandbox: bool,
+    /// Managed envd bootstrap; requires `e2b` and excludes other native engines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_e2b: bool,
+    /// Shared guest process/file engine, without an execd/envd process.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_guest: bool,
+    /// Absolute guest cwd without parent traversal; omission uses `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Required catalog selection; the admitted exact version is persisted.
+    pub template: NativeTemplate,
+}
+
+/// Wire discriminator for a directory-backed inert template manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectoryTemplateKind {
+    /// The manifest leases a local catalog generation instead of an image pool.
+    #[serde(rename = "directory_template")]
+    DirectoryTemplate,
 }
