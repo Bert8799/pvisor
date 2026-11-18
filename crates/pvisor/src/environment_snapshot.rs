@@ -45,6 +45,7 @@ mod owned;
 #[cfg(target_os = "linux")]
 mod restore_cache;
 mod store;
+pub mod templates;
 pub use blocks::RamBlocks;
 pub(crate) use blocks::{PinnedRamBlocks, RamDelta};
 pub use lazy::{RawRamIndex, SnapshotRamMount, SnapshotRamReader};

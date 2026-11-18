@@ -128,6 +128,7 @@ pub struct VmExecutor {
     guest_idle: bool,
     disable_proactive_compaction: bool,
     idle_offload_minimum: std::time::Duration,
+    template: Option<std::sync::Arc<super::templates::Prepared>>,
     vsock_ports: BTreeMap<u32, PathBuf>,
     #[cfg(target_os = "linux")]
     cpu_group: Option<std::sync::Arc<super::cpu_qos::CpuQosGroup>>,
@@ -199,7 +200,7 @@ pub(super) struct RunnerSpec {
     #[serde(default)]
     pub(super) features: crate::features::FeatureSettings,
     #[serde(default)]
-    vsock_ports: BTreeMap<u32, PathBuf>,
+    pub(super) vsock_ports: BTreeMap<u32, PathBuf>,
     #[serde(default)]
     pub(super) cpu_qos: Option<pvisor_core::CpuQosClass>,
     #[cfg(target_os = "linux")]
@@ -226,6 +227,8 @@ pub(super) struct RunnerSpec {
     pub(super) checkpoint: Option<super::checkpoint::LaunchBinding>,
     #[serde(default)]
     pub(super) restore: Option<super::checkpoint::RestoreLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) template: Option<super::templates::Launch>,
 }
 
 impl RunnerSpec {
@@ -245,7 +248,10 @@ impl RunnerSpec {
         );
         anyhow::ensure!(
             !self.ram_pager.requested()
-                || (!self.ram_dedup && self.restore.is_none() && self.checkpoint.is_none()),
+                || (!self.ram_dedup
+                    && self.restore.is_none()
+                    && self.template.is_none()
+                    && self.checkpoint.is_none()),
             "cold pager is incompatible with dedup, snapshot restore and snapshot capture"
         );
         Ok(())
@@ -256,7 +262,7 @@ pub(super) use crate::GuestOverlay as OverlayDeviceSpec;
 
 /// A host-root VM must not reach the same workspace through its original lower
 /// path, or reach writable backing state through the root device.
-fn protect_overlay_backing(
+pub(super) fn protect_overlay_backing(
     root: &mut OverlayDeviceSpec,
     workspace: Option<&OverlayDeviceSpec>,
 ) -> anyhow::Result<()> {
@@ -581,6 +587,10 @@ impl VmExecutor {
         // win; the child receives only the normalized descriptor.
         resolve_ram_settings(&mut settings, env::os(POOL_ENV))?;
         anyhow::ensure!(
+            settings.template.is_none(),
+            "unresolved vm.template selector; authenticate a lease and use from_template"
+        );
+        anyhow::ensure!(
             settings.prepared_rootfs.is_none() || settings.snapshot_filesystem_pool.is_none(),
             "CAPABILITY_UNSUPPORTED: prepared rootfs cannot use an execution checkpoint filesystem pool"
         );
@@ -669,6 +679,7 @@ impl VmExecutor {
             guest_idle: false,
             disable_proactive_compaction: false,
             idle_offload_minimum: default_idle_offload_minimum(),
+            template: None,
             vsock_ports: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             cpu_group: None,
@@ -707,6 +718,10 @@ impl VmExecutor {
         anyhow::ensure!(
             self.restore.is_none(),
             "owned rootfs cannot override a restored VM"
+        );
+        anyhow::ensure!(
+            self.template.is_none(),
+            "owned rootfs cannot override a template"
         );
         let root = self.settings.rootfs.as_ref().context("missing VM rootfs")?;
         anyhow::ensure!(
@@ -815,6 +830,108 @@ impl VmExecutor {
         }
     }
 
+    /// Prepare one new native execution from an inert template. The supplied lease
+    /// is retained until VM teardown. The executor is single-use, including after
+    /// a failed launch; create another lease/executor for another instance.
+    /// Linux x86_64 only; exact build, firmware, sizing and network topology must
+    /// match. Shares sealed read-only filesystem lowers and baseline RAM, with
+    /// private upper/work and COW RAM writes. Caller owns private storage and reclaims partial preparation
+    /// after failure. Workspace-capable recipes accept a fresh managed stage;
+    /// existing execution checkpoint restore and cold-RAM modes remain unsupported.
+    pub fn from_template(
+        settings: VmSettings,
+        lease: crate::environment_snapshot::templates::TemplateLease,
+        storage: &Path,
+    ) -> anyhow::Result<Self> {
+        let prepared = super::templates::prepare(&settings, lease, storage)?;
+        let mut settings = settings;
+        settings.rootfs = Some(prepared.rootfs());
+        let mut executor = Self::new(settings)?;
+        executor.template = Some(std::sync::Arc::new(prepared));
+        Ok(executor)
+    }
+
+    /// Capture a credential-free inert template in this isolated synchronous
+    /// runner process. Guest shutdown/capture terminates the process; never call
+    /// from a service or a Tokio host. The parent owns stage cleanup and must reap
+    /// the preparer. No user command/env is admitted before capture. Native Linux
+    /// x86_64 only. Publication uses the catalog's expected-selection fence.
+    pub fn capture_template(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+    ) -> anyhow::Result<()> {
+        self.capture_template_profile(catalog, name, expected, guest, stage, generation, false)
+    }
+
+    /// Capture an inert template with an unused workspace device for CLI Sessions.
+    /// Uses the same isolated-process, immutable-source and parent-owned cleanup
+    /// contract as `capture_template`. The device is never mounted before task
+    /// handoff; restore requires a fresh workspace and does not inherit old files.
+    /// Linux x86_64 only; ordinary root-only Daemon templates are unchanged.
+    pub fn capture_workspace_template(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+    ) -> anyhow::Result<()> {
+        self.capture_template_profile(catalog, name, expected, guest, stage, generation, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_template_profile(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+        workspace_device: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.template.is_none()
+                && self.vsock_ports.is_empty()
+                && self.rootfs_base.is_none()
+                && !self.private_ram
+                && self.settings.memory_pool.is_none()
+                && self.settings.snapshot_filesystem_pool.is_none()
+                && !self.settings.cold_pager_requested()
+                && !self.settings.ram_dedup
+                && !self.settings.ram_compression,
+            "template preparation requires a fresh plain VM executor"
+        );
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        ))]
+        anyhow::ensure!(
+            self.restore.is_none(),
+            "a restored execution cannot become a template preparer"
+        );
+        super::templates::capture(
+            self,
+            catalog,
+            name,
+            expected,
+            guest,
+            stage,
+            generation,
+            workspace_device,
+        )
+    }
+
+    pub(super) fn firmware_path(&self) -> Option<&Path> {
+        self.firmware_path.as_deref()
+    }
+
     /// Opt in to M1 guest idle handoff: fresh Linux/KVM, one or two vCPUs, no paging,
     /// restore or auxiliary vsock ports. Matching patched firmware is required;
     /// missing guest support never permits automatic pause. Optional automatic
@@ -846,7 +963,8 @@ impl VmExecutor {
                 && (1..=2).contains(&self.settings.cpus)
                 && !self.settings.cold_pager_requested()
                 && !self.settings.ram_dedup
-                && self.vsock_ports.is_empty(),
+                && self.vsock_ports.is_empty()
+                && self.template.is_none(),
             "guest idle requires one/two-vCPU Linux/KVM without paging/dedup/vsock ports"
         );
         #[cfg(any(
@@ -889,6 +1007,10 @@ impl VmExecutor {
             self.restore.is_none(),
             "private RAM mode requires a fresh VM"
         );
+        anyhow::ensure!(
+            self.template.is_none(),
+            "private anonymous RAM cannot replace a template baseline"
+        );
         self.private_ram = true;
         Ok(self)
     }
@@ -900,6 +1022,12 @@ impl VmExecutor {
     }
 
     fn ram_backing(&self) -> anyhow::Result<super::control::RamBacking> {
+        if let Some(template) = &self.template {
+            return Ok(super::control::RamBacking::template(
+                template.ram.clone(),
+                template.ram_path.clone(),
+            ));
+        }
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
@@ -945,7 +1073,7 @@ fn firmware_read_only_paths(firmware: Option<&Path>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn configure_runner_firmware(
+pub(super) fn configure_runner_firmware(
     vm: &mut impl VmConfiguration,
     firmware: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -1049,7 +1177,7 @@ impl RunExecutor for VmExecutor {
                     CapabilityDimension::FilesystemWrite,
                     "libkrun-guest-kernel-virtiofs-overlay",
                 ),
-            supports_checkpoint: self.settings.prepared_rootfs.is_none(),
+            supports_checkpoint: self.settings.prepared_rootfs.is_none() && self.template.is_none(),
             supports_migration: false,
         }
     }
@@ -1077,6 +1205,11 @@ impl RunExecutor for VmExecutor {
         if self.guest_idle && (!self.vsock_ports.is_empty() || self.settings.cold_pager_requested())
         {
             return failed_to_start("guest idle M1 has incompatible devices/pager".into());
+        }
+        if self.template.is_some()
+            && !matches!(spec.invocation, RunInvocation::Process(ref process) if matches!(process.stdin, pvisor_core::StdioMode::Null))
+        {
+            return failed_to_start("template handoff requires closed workload stdin".into());
         }
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
@@ -1128,6 +1261,11 @@ impl RunExecutor for VmExecutor {
         let guest_cwd = vm_inputs
             .guest_cwd
             .clone()
+            .or_else(|| {
+                self.template
+                    .as_ref()
+                    .and(invocation.cwd.as_deref().map(PathBuf::from))
+            })
             .unwrap_or_else(|| PathBuf::from("/"));
         let configured_overlay = context.workspace_overlay().cloned();
         let access_policy = configured_overlay
@@ -1215,27 +1353,36 @@ impl RunExecutor for VmExecutor {
             }
         };
         let runner_root = root.clone();
-        let root_upper = temporary.path().join("root-upper");
-        let root_work = temporary.path().join("root-work");
-        if let Err(error) =
-            std::fs::create_dir_all(&root_upper).and_then(|()| std::fs::create_dir_all(&root_work))
-        {
-            return failed_to_start(format!("prepare libkrun root overlay: {error}"));
-        }
-        let mut root_overlay = if root_overlay.upper.as_os_str().is_empty() {
-            OverlayDeviceSpec {
-                lowers: root_overlay.lowers,
-                lower_mutability: root_overlay.lower_mutability,
-                apply_target: root_overlay.apply_target,
-                baseline_lower: root_overlay.baseline_lower,
-                upper: root_upper.clone(),
-                work: Some(root_work.clone()),
-                preimages: root_overlay.preimages,
-                excluded: root_overlay.excluded,
-                access_policy: root_overlay.access_policy,
-            }
+        let root_upper = self.template.as_ref().map_or_else(
+            || temporary.path().join("root-upper"),
+            |template| template.root_overlay().upper,
+        );
+        let mut root_overlay = if let Some(template) = &self.template {
+            let mut root = template.root_overlay();
+            root.access_policy = root_overlay.access_policy;
+            root
         } else {
-            root_overlay
+            let root_work = temporary.path().join("root-work");
+            if let Err(error) = std::fs::create_dir_all(&root_upper)
+                .and_then(|()| std::fs::create_dir_all(&root_work))
+            {
+                return failed_to_start(format!("prepare libkrun root overlay: {error}"));
+            }
+            if root_overlay.upper.as_os_str().is_empty() {
+                OverlayDeviceSpec {
+                    lowers: root_overlay.lowers,
+                    lower_mutability: root_overlay.lower_mutability,
+                    apply_target: root_overlay.apply_target,
+                    baseline_lower: root_overlay.baseline_lower,
+                    upper: root_upper.clone(),
+                    work: Some(root_work),
+                    preimages: root_overlay.preimages,
+                    excluded: root_overlay.excluded,
+                    access_policy: root_overlay.access_policy,
+                }
+            } else {
+                root_overlay
+            }
         };
         if let Some(selected) = &self.settings.prepared_rootfs {
             let checked =
@@ -1274,18 +1421,30 @@ impl RunExecutor for VmExecutor {
                 return failed_to_start(format!("read VM network configuration: {error:#}"));
             }
         };
+        if self.template.is_some()
+            && network_config.as_ref().is_some_and(|network| {
+                network.address != pvisor_overlaynet::api::GUEST_IPV4.octets()
+                    || network.gateway != pvisor_overlaynet::api::ROUTER_IPV4.octets()
+            })
+        {
+            return failed_to_start(
+                "template topology does not support peer-network addressing".into(),
+            );
+        }
         let vm_network_enabled = network_config.is_some();
         let router = network_config
             .as_ref()
             .map_or(pvisor_overlaynet::api::ROUTER_IPV4, |network| {
                 std::net::Ipv4Addr::from(network.gateway)
             });
-        if let Err(error) = prepare_network_resolver(
-            &mut root_overlay,
-            temporary.path(),
-            vm_network_enabled,
-            router,
-        ) {
+        if self.template.is_none()
+            && let Err(error) = prepare_network_resolver(
+                &mut root_overlay,
+                temporary.path(),
+                vm_network_enabled,
+                router,
+            )
+        {
             return failed_to_start(format!("prepare VM synthetic resolver: {error}"));
         }
         if let Some(workspace) = &workspace {
@@ -1318,7 +1477,12 @@ impl RunExecutor for VmExecutor {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let upper_mountpoint =
                         guest_path_in_root(&root_upper, target).expect("validated guest target");
-                    if let Err(error) = std::fs::create_dir_all(&upper_mountpoint) {
+                    // Keep captured backing byte-for-byte unchanged through
+                    // snapshot rebinding. The resumed guest creates its own
+                    // mount point after receiving the fresh task instead.
+                    if self.template.is_none()
+                        && let Err(error) = std::fs::create_dir_all(&upper_mountpoint)
+                    {
                         return failed_to_start(format!("create guest overlay target: {error}"));
                     }
                 }
@@ -1456,6 +1620,7 @@ impl RunExecutor for VmExecutor {
             && self.vsock_ports.is_empty()
             && !self.settings.cold_pager_requested()
             && self.settings.prepared_rootfs.is_none()
+            && self.template.is_none()
         {
             let prepared = if let Some(drivers) = &context.drivers {
                 let store = match drivers.execution_snapshot_store() {
@@ -1578,6 +1743,7 @@ impl RunExecutor for VmExecutor {
             firmware_path: self.firmware_path.clone(),
             checkpoint,
             restore: None,
+            template: None,
         };
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
@@ -1595,6 +1761,12 @@ impl RunExecutor for VmExecutor {
             if let Err(error) = apply_restore(&mut runner, restore, context) {
                 return failed_to_start(format!("restore launch contract: {error:#}"));
             }
+        }
+        if let Some(template) = &self.template
+            && let Err(error) =
+                super::templates::apply(template, &mut runner, context.execution_id().as_str())
+        {
+            return failed_to_start(format!("template launch contract: {error:#}"));
         }
         if let Err(error) = hide_host_authority(
             &mut runner.root,
@@ -1648,12 +1820,14 @@ impl RunExecutor for VmExecutor {
         crate::util::startup_mark_run("vm.spec_write_ready", spec.run_id.as_str());
         let mut ipc_span = crate::startup_profile::Span::start("vm.runner_ipc");
         let mut ipc_phase = crate::startup_profile::Span::start("vm.ipc.network_take");
+        crate::util::startup_mark_run("vm.network_take_begin", spec.run_id.as_str());
         let mut vm_network = match context.take_vm_network() {
             Ok(network) => network,
             Err(error) => {
                 return failed_to_start(error.to_string());
             }
         };
+        crate::util::startup_mark_run("vm.network_take_ready", spec.run_id.as_str());
         if vm_network_enabled && vm_network.is_none() {
             return failed_to_start("pVisor VM network attachment is missing".into());
         }
@@ -1735,6 +1909,7 @@ impl RunExecutor for VmExecutor {
         ipc_span.success(None);
         drop(ipc_span);
         let mut command_span = crate::startup_profile::Span::start("vm.runner_command");
+        crate::util::startup_mark_run("vm.runner_channels_ready", spec.run_id.as_str());
         let mut command = Command::new(executable);
         command
             .env(RUNNER_SPEC_ENV, runner_path)
@@ -1745,6 +1920,7 @@ impl RunExecutor for VmExecutor {
             .stderr(stdio(invocation.stderr))
             .kill_on_drop(true)
             .process_group(0);
+        crate::util::startup_mark_run("vm.runner_command_ready", spec.run_id.as_str());
         configure_prepared_rootfs_flush_environment(
             &mut command,
             self,
@@ -2490,6 +2666,9 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
     spec.features.validate(crate::RunExecutorKind::Vm)?;
     spec.validate_ram()?;
     let mut lower_span = crate::startup_profile::Span::start("runner.attach_lazy_lowers");
+    // Pin the shared tree in the actual VMM process before entering Landlock.
+    // A detached supervisor crash must not let GC reclaim a live runner's lowers.
+    let template_lease = super::templates::runner_lease(&spec)?;
     let _direct_lowers = crate::image::cache::attach_runner_lowers(
         spec.root.lowers.iter().chain(
             spec.workspace
@@ -2502,7 +2681,7 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
     let mut baseline_span = crate::startup_profile::Span::start("runner.lease_baselines");
     // Acquire before Landlock and hold until the VM has stopped. Copy restores
     // use ordinary fingerprints; the original generation is no longer leased.
-    let baseline_owners = if spec.restore.is_none() {
+    let baseline_owners = if spec.restore.is_none() && spec.template.is_none() {
         std::iter::once(&spec.root)
             .chain(spec.workspace.iter())
             .map(lease_overlay_baseline)
@@ -2540,15 +2719,24 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64")
     ))]
-    let restore = if spec.restore.is_some() {
+    let restore = if spec.restore.is_some() || spec.template.is_some() {
         let ram = env::required_unicode(RAM_FD_ENV)?.parse::<RawFd>()?;
         anyhow::ensure!(ram == RAM_CHILD_FD, "invalid restore RAM descriptor");
         if unsafe { libc::fcntl(ram, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        Some(super::checkpoint::native::machine_restore(&spec, unsafe {
-            std::fs::File::from_raw_fd(ram)
-        })?)
+        let ram = unsafe { std::fs::File::from_raw_fd(ram) };
+        Some(if spec.template.is_some() {
+            super::templates::machine_restore(
+                &spec,
+                ram,
+                template_lease
+                    .as_ref()
+                    .context("missing runner template lease")?,
+            )?
+        } else {
+            super::checkpoint::native::machine_restore(&spec, ram)?
+        })
     } else {
         None
     };
@@ -2730,22 +2918,34 @@ fn run_linked_krun(
     }
     let cold_pager = spec.ram_pager.requested();
     spec.validate_ram()?;
-    if spec.restore.is_none() && !cold_pager && !spec.private_ram {
+    if spec.restore.is_none() && spec.template.is_none() && !cold_pager && !spec.private_ram {
         vm.ram_backing(unsafe { std::fs::File::from_raw_fd(ram) })?;
-    } else if spec.restore.is_none() {
+    } else if spec.restore.is_none() && spec.template.is_none() {
         // Bookkeeping FD is not guest RAM. Close it; dedup/paging uses private
         // anonymous memory and must never masquerade as shared file backing.
         // Restored RAM has already transferred this descriptor to MachineRestore;
         // constructing another File here would close its still-owned mapping FD.
         drop(unsafe { std::fs::File::from_raw_fd(ram) });
     }
-    if spec.checkpoint.is_some() {
+    if spec.checkpoint.is_some() || spec.template.is_some() {
         vm.snapshot_profile()?;
     }
     // Both cold launch and restore configure the same built-in supervisor.
     // Restore verifies its virtual inode and restores the saved consumed state;
     // disabling it would change the captured device configuration.
 
+    let (template_input, mut handoff) = match super::templates::handoff(&spec, &guest)? {
+        Some(super::templates::Handoff {
+            writer,
+            reader,
+            task,
+        }) => (Some(reader), Some((writer, task))),
+        None => (None, None),
+    };
+    if let Some(reader) = &template_input {
+        vm.disable_implicit_init()?;
+        vm.task_stdio(reader.as_raw_fd(), libc::STDOUT_FILENO, libc::STDERR_FILENO)?;
+    }
     // OverlayFs cannot service FUSE_SETUPMAPPING; keep DAX disabled.
     add_vm_overlay(
         &mut vm,
@@ -2753,13 +2953,15 @@ fn run_linked_krun(
         &spec.root,
         baseline_indexes.first().cloned().flatten(),
     )?;
-    vm.virtual_file(
-        "/dev/root",
-        "/.pvisor-guest.json",
-        guest_config,
-        0o400,
-        true,
-    )?;
+    if spec.template.is_none() {
+        vm.virtual_file(
+            "/dev/root",
+            "/.pvisor-guest.json",
+            guest_config,
+            0o400,
+            true,
+        )?;
+    }
     if let Some(workspace) = &spec.workspace {
         add_vm_overlay(
             &mut vm,
@@ -2843,7 +3045,19 @@ fn run_linked_krun(
                 ),
             }
         }
-        if spec.restore.is_some() {
+        if let Some((mut writer, task)) = handoff.take() {
+            // Keep the input descriptor alive through VM execution. The console
+            // retains its own fd owner; the writer has a bounded host timeout.
+            std::thread::Builder::new().name("pvisor-template-task".into()).spawn(move || {
+                crate::util::startup_mark("template.task_send_begin");
+                if let Err(error) = pvisor_guest::api::GuestFrameWrite::write_frame(&mut writer, &task) {
+                    eprintln!("template task delivery failed: {error}");
+                    std::process::exit(1);
+                }
+                crate::util::startup_mark("template.task_send_ready");
+            })?;
+        }
+        if spec.restore.is_some() || spec.template.is_some() {
             handle.resume().map_err(std::io::Error::other)?;
             #[cfg(target_os = "linux")]
             if env::required_unicode(RAW_READY_FD_ENV).ok().as_deref() == Some("203") {
@@ -2941,7 +3155,7 @@ fn run_linked_krun(
                             handle.resume().map(|()| (VmState::Running, None))
                         }
                         Ok(OperationKind::RunOffload { .. }) => {
-                            if cold_pager || spec.private_ram {
+                            if cold_pager || spec.private_ram || spec.template.is_some() {
                                 rejection_state = handle.is_paused().ok().map(|paused|
                                     if paused { VmState::Paused } else { VmState::Running });
                                 Err("whole-VM offload requires writable shared RAM backing".into())
@@ -3000,6 +3214,7 @@ fn run_linked_krun(
             })?;
         Ok(())
     });
+    drop(template_input);
     if let Err(error) = started {
         // A failed build cannot leave an accepted execution receipt.
         attestation.set_len(0)?;
@@ -3202,7 +3417,7 @@ mod feature_tests {
     }
 }
 
-fn prepare_network_resolver(
+pub(super) fn prepare_network_resolver(
     overlay: &mut OverlayDeviceSpec,
     temporary: &Path,
     enabled: bool,
@@ -3230,7 +3445,7 @@ fn prepare_network_resolver(
     Ok(())
 }
 
-fn add_vm_overlay(
+pub(super) fn add_vm_overlay(
     vm: &mut pvisor_vm::api::VmBuilder,
     tag: &str,
     overlay: &OverlayDeviceSpec,

@@ -290,10 +290,27 @@ pub struct PreparedBase {
 /// unsupported; this alias does not change `vm.prepared_rootfs` JSON/TOML keys.
 pub type PreparedRootfs = PreparedBase;
 
+/// Explicit CLI selection of an immutable inert VM template. The frontend
+/// authenticates and leases this version before constructing `from_template`;
+/// passing an unresolved selector to `VmExecutor::new` is an error. Linux
+/// x86_64 only, with a workspace-capable template and closed stdin. No cold
+/// fallback occurs. Retained Session configuration records the exact version.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VmTemplate {
+    /// Private existing template catalog, independent of guest workspace/stage.
+    pub catalog: PathBuf,
+    /// Exact 64-digit lowercase generation ID; never a mutable alias.
+    pub version: String,
+}
+
 /// libkrun process isolation over a pVisor-provided Linux rootfs OverlayFS.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VmSettings {
+    /// Optional CLI template selection; omitted keeps ordinary cold startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<VmTemplate>,
     /// Host-only live control endpoint; omitted uses an automatic private socket.
     /// The existing parent must be private (0700); existing paths are never overwritten.
     pub control_socket: Option<PathBuf>,
@@ -385,6 +402,7 @@ impl VmSettings {
 impl Default for VmSettings {
     fn default() -> Self {
         Self {
+            template: None,
             control_socket: None,
             ram_backing: None,
             ram_compression: false,
@@ -1294,6 +1312,7 @@ cpus = 4
 #[cfg(test)]
 mod session_policy_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn policy_defaults_keep_explicit_scopes_and_reject_invalid_rules() {
         let root = tempfile::tempdir().unwrap();
@@ -1301,6 +1320,9 @@ mod session_policy_tests {
         let user = root.path().join("user");
         std::fs::create_dir_all(workspace.join(".pvisor")).unwrap();
         std::fs::create_dir_all(user.join("pvisor")).unwrap();
+        for directory in [workspace.join(".pvisor"), user.join("pvisor")] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::write(
             user.join("pvisor/policy.toml"),
             "[filesystem]\ndeny = ['secrets/**']\n",
@@ -1311,6 +1333,12 @@ mod session_policy_tests {
             "[filesystem]\nallow = ['secrets/workspace']\n",
         )
         .unwrap();
+        for path in [
+            workspace.join(".pvisor/policy.toml"),
+            user.join("pvisor/policy.toml"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let mut config = RunConfig::default();
         config.policies.session.filesystem = Some(
             pvisor_core::FileAccessPolicy::new_with_allow(
@@ -1350,11 +1378,12 @@ mod session_policy_tests {
     }
     #[test]
     fn policy_defaults_reject_symlinks_special_files_and_unbounded_input() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let directory = workspace.join(".pvisor");
         std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.join("policy.toml");
         let source = root.path().join("external.toml");
         std::fs::write(&source, "[network]\nallow = [{ host = 'api.example' }]\n").unwrap();
@@ -1370,6 +1399,7 @@ mod session_policy_tests {
             .unwrap()
             .set_len(1024 * 1024 + 1)
             .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load().is_err());
         std::fs::copy(&source, &path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();

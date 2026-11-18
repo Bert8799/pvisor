@@ -1125,6 +1125,40 @@ excluding every fixed child destination, including idle and ready channels.
 Only the child installs the fixed mappings; source descriptors retain CLOEXEC.
 This avoids growing a multithreaded parent's descriptor table on ordinary launches.
 
+## Inert VM templates
+
+`environment_snapshot::templates` owns a private, versioned catalog. A recipe
+binds the immutable image, guest supervisor, CPU/RAM sizing, console/network
+topology and exact build/firmware compatibility. Capture precedes all workload
+commands, credentials and instance-specific data.
+
+`VmExecutor::capture_template` captures an inert guest in an isolated synchronous
+preparer. Its parent owns timeout, reaping and staging cleanup; it must not run
+inside a service or Tokio host. `capture_workspace_template` also captures a
+provably unused workspace device for later binding to a fresh workspace.
+
+`from_template` pins the selected generation and starts one independent execution
+through the normal runner and controls. Instances share sealed read-only lowers
+and baseline RAM, with private filesystem writes and COW RAM. The runner acquires
+its own lease, atomically rebinds devices and receives one fresh identity, entropy
+seed and task. Indexed RAM validation checks every block, including sparse holes,
+without retaining another RAM cache.
+
+Alias updates require the expected generation. Existing leases retain their
+selected version; explicit collection removes only unselected, unleased payloads.
+Publication or synchronization errors can leave selection uncertain, so inspect
+the catalog before retrying. The caller must keep captured backing immutable and
+all catalog state inaccessible to guests.
+
+Template execution requires closed stdin, matching topology and fresh network
+backends. PTYs, peer-network addressing, explicit RAM backing/paging/pools,
+CPU QoS overrides and execution checkpoint mixing are unsupported. Root-only
+recipes reject managed workspaces. Ordinary cold launch and execution restore
+retain their existing contracts. Templates do not clone active connections or
+application credentials, and do not imply a measured latency or density gain.
+See the public contracts in [the catalog](src/environment_snapshot/templates.rs)
+and [the executor](src/executor/vm/supported.rs) for lifecycle and failure details.
+
 ## Resource ownership and local cold compression
 
 Native VM checkpoint admission fixes compatibility and the private snapshot-store

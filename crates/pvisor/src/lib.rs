@@ -47,7 +47,7 @@ pub use config::{
     FilesystemMode, GatewayMode, GatewaySettings, NetworkDriverConfig, OverlayFsCommit,
     OverlayFsSettings, OverlayNetMode, OverlayNetPolicy, OverlayNetSettings, PVisorConfig,
     PeerNetworkSettings, PreparedBase, PreparedRootfs, RecordSettings, RunConfig, RunExecutorKind,
-    RunPolicy, RunSettings, RunStdio, VmSettings,
+    RunPolicy, RunSettings, RunStdio, VmSettings, VmTemplate,
 };
 #[cfg(feature = "gateway")]
 pub use config::{CooperativeModelWait, GatewayDriverConfig, ModelWaitRounds};
