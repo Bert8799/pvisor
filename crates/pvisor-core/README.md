@@ -40,6 +40,10 @@ replace endpoint authentication or target binding.
 
 ## Local resource contracts
 
+Symlink preimages optionally carry non-native logical permissions. Missing mode
+retains legacy/native comparisons and logical 0777; metadata-aware copies retain
+that field so apply detects image symlink permission changes.
+
 `execution::RunProfile` is a typed execution request shared by frontends and
 embedded callers. `RuntimeConfig.profile` defaults to `Default`; `Safe` requires
 runtime sandbox admission before execution. Network non-bypassability is checked

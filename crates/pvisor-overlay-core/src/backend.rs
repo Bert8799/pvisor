@@ -4,6 +4,7 @@
 //! descriptors remain owned by the adapters; remote bytes are read through the
 //! backend and materialized only for copy-up or an owned snapshot export.
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -25,7 +26,7 @@ pub enum FileType {
 }
 
 /// Unix object metadata, independent of fuser replies and virtqueue buffers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileAttr {
     pub ino: u64,
     pub size: u64,
@@ -76,11 +77,118 @@ impl UnixIdentity {
     }
 }
 
+mod projection;
+pub use projection::{
+    ImageNode, ImageSource, SymlinkMetadataPolicy, attach_image, attach_image_bounded,
+};
+
+/// Scoped admission for inode-bound logical metadata in a native tree. Retain
+/// through inventory/copy/restore; dropping unregisters, without removing state.
+/// A writable owner requires exclusive tree ownership and stable root identity.
+/// Readonly owners never create or repair state. Admission rejects corrupt or
+/// untranslated native copies. No per-entry cache or process is allocated.
+#[derive(Debug)]
+pub struct MetadataOwner(Option<crate::symlink_state::Owner>);
+
+/// Admit an existing native directory. Writable admission creates metadata only
+/// when required. Ordinary native trees retain their original representation.
+pub fn metadata_owner(root: &Path, writable: bool) -> io::Result<MetadataOwner> {
+    crate::symlink_state::attach(root, writable).map(MetadataOwner)
+}
+
+/// Whether this root requires the complete virtual Unix metadata contract.
+/// Qualified immutable sources and validated persisted logical state do; ordinary
+/// native/legacy roots do not. Adapters must reject a simplified profile before
+/// mutation rather than dropping fields. Corrupt persisted state is an error.
+pub fn requires_unix_metadata(root: &Path) -> io::Result<bool> {
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if symlink_metadata_policy(&root)? == Some(SymlinkMetadataPolicy::Preserve) {
+        return Ok(true);
+    }
+    for ancestor in root.ancestors() {
+        if crate::symlink_state::contains(ancestor)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+impl MetadataOwner {
+    /// Install exact symlink metadata on a caller-owned, unpublished inode.
+    /// The inode may be in private work on the same filesystem before publication
+    /// into this owner's tree. The caller owns namespace serialization and must
+    /// never publish this inode into another tree. UID/GID/mode and binary xattrs
+    /// are preserved without changing the target. Readonly owners return EROFS;
+    /// invalid fields fail before publication. Persistence errors may follow an
+    /// atomic replacement; inspect/reopen after failure. Linux only.
+    pub fn restore_symlink(
+        &self,
+        destination: &Path,
+        identity: UnixIdentity,
+        xattrs: &[(Vec<u8>, Vec<u8>)],
+    ) -> io::Result<()> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EROFS))?
+            .restore(destination, identity, xattrs)
+    }
+}
+
+/// Identify and validate the private namespace for a metadata-aware tree walker.
+/// Only translating copiers may skip a true result; raw copies must continue
+/// using `validate_native_copy_entry`. Forged or rebound namespaces fail.
+pub fn is_metadata_entry(path: &Path) -> io::Result<bool> {
+    if path.file_name() != Some(std::ffi::OsStr::new(crate::symlink_state::DIRECTORY)) {
+        return Ok(false);
+    }
+    crate::symlink_state::validate_namespace(
+        path.parent()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?,
+    )?;
+    Ok(true)
+}
+
+/// Exact Linux symlink fields needing logical-aware copy/restore. Legacy/native
+/// entries return None to retain their original contracts. Retain source owners;
+/// cold persisted trees must first be admitted with `metadata_owner`.
+pub fn logical_symlink_attributes(path: &Path) -> io::Result<Option<FileAttr>> {
+    if !cfg!(target_os = "linux")
+        || symlink_metadata_policy(path)? == Some(SymlinkMetadataPolicy::LegacyNative)
+    {
+        return Ok(None);
+    }
+    Ok(attributes(path)?.filter(|a| a.kind == FileType::Symlink))
+}
+
+/// Restore into an already admitted writable metadata tree. Same ownership,
+/// unpublished-inode and failure contract as `MetadataOwner::restore_symlink`.
+/// An unadmitted tree returns EOPNOTSUPP; readonly admission returns EROFS.
+pub fn restore_symlink_metadata(
+    path: &Path,
+    identity: UnixIdentity,
+    xattrs: &[(Vec<u8>, Vec<u8>)],
+) -> io::Result<()> {
+    crate::symlink_state::restore_at(path, identity, xattrs)
+}
+
 pub trait ReadOnlyBackend: Send + Sync {
     /// Populate only native metadata for a checked relative path.
     fn prepare_metadata(&self, relative: &Path) -> io::Result<()>;
     fn prepare_directory(&self, relative: &Path) -> io::Result<()>;
     fn attributes(&self, relative: &Path) -> io::Result<FileAttr>;
+    /// Exact logical xattrs when native storage cannot represent them. None
+    /// retains native no-follow lookup; Some(empty) means no attributes. Do not
+    /// call sys xattr helpers here: they dispatch through this query.
+    fn logical_xattrs(&self, _relative: &Path) -> io::Result<Option<BTreeMap<Vec<u8>, Vec<u8>>>> {
+        Ok(None)
+    }
+    /// Stable copy policy; existing backends retain best-effort native metadata.
+    fn symlink_metadata_policy(&self) -> SymlinkMetadataPolicy {
+        SymlinkMetadataPolicy::LegacyNative
+    }
     fn read_at(&self, relative: &Path, offset: u64, size: u32) -> io::Result<Vec<u8>>;
     /// Deliver at most `size` verified bytes to this call's borrowed sink.
     /// EOF is a successful short result. On error a verified prefix may already
@@ -342,9 +450,21 @@ pub fn read_link(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 }
 
 pub fn attributes(path: &Path) -> io::Result<Option<FileAttr>> {
-    find(path)?
-        .map(|(entry, relative)| entry.backend.attributes(&relative))
-        .transpose()
+    match find(path)? {
+        Some((entry, relative)) => entry.backend.attributes(&relative).map(Some),
+        None => crate::symlink_state::attributes(path),
+    }
+}
+
+pub(crate) fn logical_xattrs(path: &Path) -> io::Result<Option<BTreeMap<Vec<u8>, Vec<u8>>>> {
+    match find(path)? {
+        Some((entry, relative)) => entry.backend.logical_xattrs(&relative),
+        None => crate::symlink_state::xattrs(path),
+    }
+}
+
+pub(crate) fn symlink_metadata_policy(path: &Path) -> io::Result<Option<SymlinkMetadataPolicy>> {
+    Ok(find(path)?.map(|(entry, _)| entry.backend.symlink_metadata_policy()))
 }
 
 pub fn read_at(path: &Path, offset: u64, size: u32) -> io::Result<Option<Vec<u8>>> {
@@ -421,6 +541,21 @@ pub fn materialize_file(path: &Path) -> io::Result<()> {
 pub fn materialize_tree(path: &Path) -> io::Result<()> {
     if let Some((entry, relative)) = find(path)? {
         entry.backend.materialize_tree(&relative)?;
+    }
+    Ok(())
+}
+
+/// Admit an entry for an ordinary native inventory/copy, without reading payloads.
+/// Call for every traversed entry, including sealed trees. Inode-bound symlink
+/// state requires a metadata-aware copier: a valid namespace returns EOPNOTSUPP,
+/// and corrupt bindings propagate errors. Ordinary names succeed without I/O.
+pub fn validate_native_copy_entry(path: &Path) -> io::Result<()> {
+    if path.file_name() == Some(std::ffi::OsStr::new(crate::symlink_state::DIRECTORY)) {
+        crate::symlink_state::validate_namespace(
+            path.parent()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?,
+        )?;
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
     }
     Ok(())
 }

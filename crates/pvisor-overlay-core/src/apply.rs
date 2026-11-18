@@ -868,7 +868,10 @@ fn upper_hard_link_groups(inventory: &[UpperEntry]) -> Vec<Vec<PathBuf>> {
     let mut groups = HashMap::<(u64, u64), Vec<PathBuf>>::new();
     for entry in inventory {
         let metadata = &entry.metadata;
-        if !entry.whiteout && metadata.is_file() && metadata.nlink() > 1 {
+        if !entry.whiteout
+            && (metadata.is_file() || metadata.file_type().is_symlink())
+            && metadata.nlink() > 1
+        {
             groups
                 .entry((metadata.dev(), metadata.ino()))
                 .or_default()
@@ -2095,7 +2098,9 @@ fn install_replacement_directories(
             walk_upper(&source, &source, &mut |relative, whiteout| {
                 if !whiteout {
                     let metadata = fs::symlink_metadata(source.join(&relative))?;
-                    if metadata.is_file() && metadata.nlink() > 1 {
+                    if (metadata.is_file() || metadata.file_type().is_symlink())
+                        && metadata.nlink() > 1
+                    {
                         hard_links
                             .insert((metadata.dev(), metadata.ino()), destination.join(relative));
                     }
@@ -2812,6 +2817,8 @@ fn apply_selected_directory_checked(
 ) -> Result<(), OverlayError> {
     verify_target(relative, false)?;
     ensure_directory(destination)?;
+    let _source_metadata = crate::symlink_state::attach(source, false)?;
+    let _destination_metadata = crate::symlink_state::write_owner(destination)?;
     let durable_directory = File::open(destination)?;
     let directory_identity = durable_directory.metadata()?;
     let directory_fingerprint = if selected.contains(relative) {
@@ -2823,7 +2830,11 @@ fn apply_selected_directory_checked(
     if opaque && selected.contains(relative) {
         verify_target(relative, true)?;
         for entry in fs::read_dir(destination)? {
-            remove_path(&entry?.path())?;
+            let entry = entry?;
+            if crate::symlink_state::internal_directory(&entry)? {
+                continue;
+            }
+            remove_path(&entry.path())?;
         }
     }
 
@@ -2832,6 +2843,7 @@ fn apply_selected_directory_checked(
         let name = entry.file_name();
         if name == OPAQUE_WHITEOUT
             || name == crate::ROOT_METADATA_NAME
+            || crate::symlink_state::internal_directory(entry)?
             || is_copy_up_directory(entry)?
         {
             continue;
@@ -3154,10 +3166,16 @@ fn apply_directory(
     preserve_metadata: bool,
 ) -> Result<(), OverlayError> {
     ensure_directory(destination)?;
+    let _source_metadata = crate::symlink_state::attach(source, false)?;
+    let _destination_metadata = crate::symlink_state::write_owner(destination)?;
     let opaque = crate::is_opaque_directory(source);
     if opaque {
         for entry in fs::read_dir(destination)? {
-            remove_path(&entry?.path())?;
+            let entry = entry?;
+            if crate::symlink_state::internal_directory(&entry)? {
+                continue;
+            }
+            remove_path(&entry.path())?;
         }
     }
 
@@ -3222,18 +3240,15 @@ fn copy_upper_entry_checked(
     let temporary = temporary_dir.join("entry");
     let identity = (metadata.dev(), metadata.ino());
     let result = (|| {
-        if kind.is_symlink() {
+        if (kind.is_file() || kind.is_symlink())
+            && metadata.nlink() > 1
+            && let Some(existing) = hard_links.get(&identity)
+        {
+            fs::hard_link(existing, &temporary)?;
+        } else if kind.is_symlink() {
             std::os::unix::fs::symlink(fs::read_link(source)?, &temporary)?;
         } else if kind.is_file() {
-            if metadata.nlink() > 1 {
-                if let Some(existing) = hard_links.get(&identity) {
-                    fs::hard_link(existing, &temporary)?;
-                } else {
-                    fs::copy(source, &temporary)?;
-                }
-            } else {
-                fs::copy(source, &temporary)?;
-            }
+            fs::copy(source, &temporary)?;
         } else {
             let path = c_path(&temporary)?;
             // SAFETY: path is NUL terminated and points to valid storage for this call.
@@ -3258,7 +3273,7 @@ fn copy_upper_entry_checked(
         }
         fs::rename(&temporary, destination)?;
         File::open(parent)?.sync_all()?;
-        if kind.is_file() && metadata.nlink() > 1 {
+        if (kind.is_file() || kind.is_symlink()) && metadata.nlink() > 1 {
             hard_links.insert(identity, destination.to_path_buf());
         }
         Ok::<_, OverlayError>(())
@@ -3273,8 +3288,13 @@ fn snapshot_directory_raw(
     hard_links: &mut HashMap<(u64, u64), PathBuf>,
 ) -> Result<(), OverlayError> {
     ensure_directory(destination)?;
+    let _source_metadata = crate::symlink_state::attach(source, false)?;
+    let _destination_metadata = crate::symlink_state::write_owner(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        if crate::symlink_state::internal_directory(&entry)? {
+            continue;
+        }
         snapshot_entry_raw(
             &entry.path(),
             &destination.join(entry.file_name()),
@@ -3300,6 +3320,14 @@ fn snapshot_entry_raw(
         fs::create_dir_all(parent)?;
     }
     remove_path(destination)?;
+    let identity = (metadata.dev(), metadata.ino());
+    if (kind.is_file() || kind.is_symlink())
+        && metadata.nlink() > 1
+        && let Some(existing) = hard_links.get(&identity)
+    {
+        fs::hard_link(existing, destination)?;
+        return Ok(());
+    }
     if kind.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(source)?, destination)?;
     } else if kind.is_file() {
@@ -3329,6 +3357,9 @@ fn snapshot_entry_raw(
         }
     }
     copy_snapshot_metadata(source, destination)?;
+    if (kind.is_file() || kind.is_symlink()) && metadata.nlink() > 1 {
+        hard_links.insert(identity, destination.to_owned());
+    }
     if kind.is_file() {
         File::open(destination)?.sync_all()?;
     }
@@ -3361,9 +3392,10 @@ fn c_path(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
-/// Publish logical ownership/mode and ordinary xattrs, never private controls.
-/// Logical identity errors are returned before any destination metadata mutation.
-/// Native symlink/special-file and unprivileged ownership limitations still apply.
+/// Publish logical ownership/mode and ordinary xattrs without private backing
+/// controls. Qualified symlinks retain inode-bound metadata in the destination.
+/// Logical identity errors precede destination mutation; ordinary native ownership
+/// and special-file limitations still apply.
 pub fn copy_host_metadata(source: &Path, destination: &Path) -> io::Result<()> {
     copy_metadata(source, destination, MetadataCopy::LogicalTarget)
 }
@@ -3384,6 +3416,10 @@ fn copy_metadata_with_mode(
     copy: MetadataCopy,
     mode: Option<u32>,
 ) -> io::Result<()> {
+    let _owner = crate::symlink_state::attach_containing(source)?;
+    if crate::symlink_state::copy_metadata(source, destination)? {
+        return Ok(());
+    }
     let metadata = fs::symlink_metadata(source)?;
     let identity = match copy {
         MetadataCopy::LogicalTarget => crate::logical_identity(source, &metadata)?,
@@ -3649,7 +3685,7 @@ fn walk_upper_metadata(
     for entry in entries {
         let entry = entry?;
         // Interrupted copy-up artifacts are neither changes nor deletion markers.
-        if is_copy_up_directory(&entry)? {
+        if crate::symlink_state::internal_directory(&entry)? || is_copy_up_directory(&entry)? {
             continue;
         }
         let path = entry.path();

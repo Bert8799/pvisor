@@ -12,6 +12,117 @@ backing validates work but does not enumerate or recover its temporary entries.
 Read-only adapters open existing upper backing with no work or preimage journal;
 they must reject view mutations themselves and do not promise fresh observations.
 
+## Shared immutable image projections
+
+`backend::{ImageSource, ImageNode, attach_image}` supplies one shared native
+projection implementation for immutable readers. The current pVisor cache's
+direct lower uses this implementation; format adapters implement only metadata,
+directory names and authenticated range reads. Sources may be shared through
+`Arc` across views. Each view retains private projection state and a Core upper.
+
+`attach_image_bounded` uses the same contract with an explicit 1..16384-entry
+limit on each per-view projected-kind/completion hint set. Capacity eviction frees
+allocations; paths over 4096 bytes bypass these hints. It leaves native files,
+source identities and active reads intact, and completion misses reuse the durable
+receipt. The original `attach_image` retains its existing policy. Neither adds a
+file-content cache. Native projection names and kernel dentries remain separate
+from the bounded hints.
+
+`attach_image` requires real sibling root/objects directories under one owned
+0700 parent and returns the existing `BackendAttachment` owner. Retain it through
+Core I/O and teardown. Dropping unregisters the backend without deleting caller
+backing. The source owner must keep its immutable metadata, data and identities
+valid throughout. Reattachment/receipts apply only to the same immutable source.
+
+Metadata queries create only checked native placeholders; ordinary reads use the
+source directly. Copy-up materializes one complete file with a durable receipt,
+preserving source object IDs for aliases. Failed reads publish no completion
+receipt. Explicit owned export materializes unvisited files and directories too,
+then removes private indexing links so the native tree has no outside aliases.
+Regular-file/directory attributes use the existing ownership override contract.
+Legacy override bytes and version-1 direct-image descriptors remain compatible.
+Additional native xattrs are copied exactly; representation errors propagate.
+On Linux, symlink attributes and xattrs are read from the immutable source through
+`backend::attributes` and the `sys` no-follow xattr helpers. The internal legacy
+ownership override remains separate from visible symlink xattrs. Logical queries
+do not follow targets or require fetching file data; source errors never fall
+back to native empty attributes. Already projected file/directory xattr reads
+retain native lookup without querying source metadata again.
+
+Qualified image sources select `SymlinkMetadataPolicy::Preserve` (the ImageSource
+default). On Linux, Core copy-up can persist otherwise unrepresentable symlink
+UID/GID, mode and xattrs in the exclusively owned upper. Ordinary native lowers
+and the old cache adapter retain their original best-effort native copy contract;
+the cache explicitly selects `LegacyNative`, which is not new-format metadata
+qualification. Qualified symlink copy-up uses logical records consistently,
+including host-representable links, so later metadata updates retain this contract.
+The private
+0700 `.wh..pvisor-symlink-metadata-v1` namespace stores
+atomic records keyed by device/inode and one hardlink anchor per recorded object.
+Anchors prevent inode reuse while records exist; guest nlink excludes that anchor.
+Renaming an entry does not rename its metadata. The format binds the native upper
+root identity, so moving that whole root after teardown works; copying native
+inodes without translating the bindings fails admission. Keep this namespace with
+the upper and do not modify it outside its owner. Corruption and rebinding fail
+instead of reverting to host attributes. Metadata-space presence and backing
+bindings must stay stable for an admitted reader; reopen to admit a new format.
+
+Core retains scoped owners and reacquires them on reopen, without retaining
+per-entry metadata in memory. Readonly roots without this state retain no owner;
+the writable upper creates its namespace only on the first required copy. No
+additional process is used. Directory lookup uses root prefixes rather than
+scanning all live owners. Deleted objects' private records/anchors currently stay
+until upper removal; per-object retirement is still pending.
+
+The no-follow `sys::chown`, `sys::set_symlink_attributes`, `sys::set_xattr`
+and `sys::remove_xattr` helpers
+update recorded Linux symlinks durably, without changing their native ownership
+or targets. Read/modify/publication shares one root lock, so updates through
+aliases cannot overwrite each other's fields. Logical ctime survives reopen;
+later native rename/time changes remain visible. Existing records without that
+optional timestamp remain readable. CREATE/REPLACE and missing-attribute errors
+follow Linux rules; invalid requests leave the record unchanged. Internal
+ownership overrides are reserved. The caller still authorizes changes and
+serializes namespace mutations. Readonly owners return EROFS. A persistence
+failure may occur after atomic replacement; reopen/inspect before retrying.
+Native and legacy entries without a logical record retain native setters.
+
+Metadata-aware apply, raw-upper snapshots and runtime owned/sealed copies
+reconstruct destination bindings rather than copying this namespace verbatim.
+Walkers skip only validated internal directories; they retain original content,
+metadata, source-change, hardlink and target-conflict checks. Logical symlink
+permissions participate in fingerprints; native/legacy fingerprints retain their
+old encoding. Qualified projection aliases use source object identity, and Core
+copy-up/snapshot/apply retain their native hardlink groups. Full materialization
+persists logical symlink fields and retires external projection indexing links.
+
+`backend::MetadataOwner` admits an owned root for inventory/copy/restore. Keep
+readonly admission alive while reading state; writable admission requires the
+caller's exclusive namespace ownership. `restore_symlink_metadata` requires a
+live writable admission. Invalid/unadmitted/corrupt state fails. Internal
+metadata must remain with the tree; metadata-aware copies can relocate it.
+`validate_native_copy_entry` still rejects untranslated raw copies. No general
+native tar/cp portability is implied by an inode-bound directory format.
+
+The Linux virtio-fs adapter routes logical symlink attributes/xattrs through Core,
+including selected-field changes, size-query/buffer errors, creator ownership,
+setgid inheritance and filesystem snapshot alias validation. Qualified sources
+and recorded trees require LinuxComplete; simplified profiles and ordinary
+native/DAX shares reject them instead of dropping fields. Use a LinuxComplete
+overlay for a self-contained export. Ordinary native and LegacyNative inputs
+keep their previous behavior. Cross-process RAFS source handoff, product image
+selection and version/GC leases remain separate integration work.
+
+`tests/image_projection.rs` exercises lazy metadata, hardlinks, independent
+views sharing one source, unvisited materialization, receipt reuse, read-failure
+retry, exact logical symlink metadata, copy-up/rename/reopen, deleted-name reuse,
+independent work backing, corrupt records/rebound namespaces, untranslated native
+copy refusal, logical setters/reopen, concurrent alias updates, Linux xattr flags,
+readonly/corrupt-state write rejection, metadata-aware upper snapshots, and invalid
+metadata without registration. Runtime native conformance covers exact symlink
+export/apply/conflicts and base import/export; existing direct-image tests retain
+the runner receipt and owned-export paths.
+
 ## Validation
 
 ```sh

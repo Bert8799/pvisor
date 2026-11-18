@@ -302,6 +302,7 @@ impl OverlayLayout {
 
 #[derive(Debug)]
 pub struct OverlayCore {
+    _symlink_owners: Vec<crate::symlink_state::Owner>,
     copy_up_owner: Arc<()>,
     prepared_copy_ups: Mutex<Option<HashMap<PathBuf, PreparedCopyUp>>>,
     durability: crate::stage::StageDurability,
@@ -830,6 +831,16 @@ pub(crate) fn hex_digest(digest: &[u8]) -> String {
 
 /// Fingerprint one path without following its final symlink.
 pub fn fingerprint_at(root: &Path, rel: &Path) -> io::Result<PathFingerprint> {
+    OverlayCore::validate_rel(rel)?;
+    // Raw-entry fingerprints also accept a file/symlink as root. Preserve that
+    // contract rather than probing a metadata directory beneath a non-directory.
+    let _owner = match fs::symlink_metadata(root) {
+        Ok(m) if m.is_dir() => crate::symlink_state::attach(root, false)?,
+        Ok(m) if m.file_type().is_symlink() => crate::symlink_state::attach_containing(root)?,
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
     fingerprint_with_index(root, rel, &crate::profile::Profile::default(), None)
 }
 
@@ -919,6 +930,9 @@ fn fingerprint_with_index(
     }
     if kind.is_symlink() {
         return Ok(PathFingerprint::Symlink {
+            mode: (mode & 0o7777 != 0o777
+                && crate::backend::logical_symlink_attributes(&path)?.is_some())
+            .then_some(mode & 0o7777),
             target: crate::backend::read_link(&path)?
                 .into_os_string()
                 .into_vec(),
@@ -1333,13 +1347,24 @@ impl OverlayCore {
             .map(crate::stage::policy)
             .transpose()?
             .unwrap_or(crate::stage::StageDurability::Strict);
+        let stage_writable = preimage_dir
+            .as_deref()
+            .map(crate::stage::admits_writes)
+            .transpose()?
+            .unwrap_or(true);
+        let mut symlink_owners = Vec::new();
+        if let Some(owner) = crate::symlink_state::attach(&actual_upper, stage_writable)? {
+            symlink_owners.push(owner);
+        }
+        for root in layout.lowers.iter().chain(std::iter::once(&layout.target)) {
+            if let Some(owner) = crate::symlink_state::attach(root, false)? {
+                symlink_owners.push(owner);
+            }
+        }
         let core = Self {
+            _symlink_owners: symlink_owners,
             durability,
-            stage_writable: preimage_dir
-                .as_deref()
-                .map(crate::stage::admits_writes)
-                .transpose()?
-                .unwrap_or(true),
+            stage_writable,
             profile: crate::profile::Profile::from_env("overlay-core"),
             layout,
             content_index: None,
@@ -1506,7 +1531,7 @@ impl OverlayCore {
             });
             let meta = crate::backend::symlink_metadata(path)?;
             if !owned
-                || !meta.is_file()
+                || !(meta.is_file() || meta.file_type().is_symlink())
                 || meta.nlink() < 2
                 || (meta.dev(), meta.ino()) != (*dev, *ino)
                 || restored.insert((*dev, *ino), path.clone()).is_some()
@@ -1538,7 +1563,9 @@ impl OverlayCore {
                 let path = layer_path(&self.upper, relative)?.ok_or_else(|| error(libc::ENOENT))?;
                 let metadata = crate::backend::symlink_metadata(&path)?;
                 let current = (metadata.dev(), metadata.ino());
-                if !metadata.is_file() || identity.is_some_and(|expected| expected != current) {
+                if !(metadata.is_file() || metadata.file_type().is_symlink())
+                    || identity.is_some_and(|expected| expected != current)
+                {
                     return Err(error(libc::EINVAL));
                 }
                 identity = Some(current);
@@ -1978,7 +2005,9 @@ impl OverlayCore {
     fn require_unaliased(&self, path: &Path) -> io::Result<()> {
         if self.access.has_denials() {
             let metadata = crate::backend::symlink_metadata(path)?;
-            if crate::backend::link_count(path, metadata.nlink())? > 1 && metadata.is_file() {
+            if crate::backend::link_count(path, metadata.nlink())? > 1
+                && (metadata.is_file() || metadata.file_type().is_symlink())
+            {
                 return Err(error(libc::EACCES));
             }
         }
@@ -1987,7 +2016,7 @@ impl OverlayCore {
 
     fn require_unaliased_metadata(&self, path: &Path, metadata: &Metadata) -> io::Result<()> {
         if self.access.has_denials()
-            && metadata.is_file()
+            && (metadata.is_file() || metadata.file_type().is_symlink())
             && crate::backend::link_count(path, metadata.nlink())? > 1
         {
             return Err(error(libc::EACCES));
@@ -2634,7 +2663,9 @@ impl OverlayCore {
         &self,
         entry: &ResolvedMetadata,
     ) -> io::Result<Option<Metadata>> {
-        if entry.resolved.is_upper || !entry.metadata.is_file() {
+        if entry.resolved.is_upper
+            || !(entry.metadata.is_file() || entry.metadata.file_type().is_symlink())
+        {
             return Ok(None);
         }
         let identity = (entry.metadata.dev(), entry.metadata.ino());
@@ -2649,7 +2680,7 @@ impl OverlayCore {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
                 };
-                if !metadata.is_file() {
+                if metadata.file_type() != entry.metadata.file_type() {
                     return Err(error(libc::EIO));
                 }
                 self.require_unaliased_metadata(path, &metadata)?;
@@ -2722,7 +2753,10 @@ impl OverlayCore {
                 0,
             )?;
         } else {
-            if let Err(err) = sys::chown(destination, uid, gid, nofollow)
+            let logical_symlink =
+                nofollow && crate::symlink_state::preserve(source, destination, &self.upper)?;
+            if !logical_symlink
+                && let Err(err) = sys::chown(destination, uid, gid, nofollow)
                 && !ignorable_ownership_error(&err)
             {
                 return Err(err);
@@ -2730,7 +2764,8 @@ impl OverlayCore {
             if !nofollow {
                 fs::set_permissions(destination, fs::Permissions::from_mode(mode & 0o7777))?;
             }
-            if let Err(err) = self.copy_user_xattrs(source, destination)
+            if !logical_symlink
+                && let Err(err) = self.copy_user_xattrs(source, destination)
                 && !ignorable_metadata_error(&err)
             {
                 return Err(err);
@@ -3082,10 +3117,7 @@ impl OverlayCore {
             if kind.is_dir() {
                 fs::create_dir(&temporary)?;
                 temporary_owned = true;
-            } else if kind.is_symlink() {
-                std::os::unix::fs::symlink(crate::backend::read_link(&resolved.path)?, &temporary)?;
-                temporary_owned = true;
-            } else if kind.is_file() {
+            } else if kind.is_file() || kind.is_symlink() {
                 let identity = (metadata.dev(), metadata.ino());
                 let existing = if crate::backend::link_count(&resolved.path, metadata.nlink())? > 1
                 {
@@ -3103,6 +3135,12 @@ impl OverlayCore {
                     fs::hard_link(existing, &temporary)?;
                     temporary_owned = true;
                     reused_upper_inode = true;
+                } else if kind.is_symlink() {
+                    std::os::unix::fs::symlink(
+                        crate::backend::read_link(&resolved.path)?,
+                        &temporary,
+                    )?;
+                    temporary_owned = true;
                 } else if let Some(prepared) = &prepared {
                     fs::rename(&prepared.temporary, &temporary)?;
                     temporary_owned = true;
@@ -3148,7 +3186,7 @@ impl OverlayCore {
                 self.copy_metadata(&resolved.path, &temporary, &metadata)?;
             }
             fs::rename(&temporary, &upper)?;
-            if metadata.is_file()
+            if (metadata.is_file() || metadata.file_type().is_symlink())
                 && crate::backend::link_count(&resolved.path, metadata.nlink())? > 1
                 && let Ok(mut links) = self.copied_hard_links.lock()
             {

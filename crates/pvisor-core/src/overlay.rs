@@ -314,6 +314,10 @@ pub enum PathFingerprint {
         target: Vec<u8>,
         uid: u32,
         gid: u32,
+        /// Non-native Linux logical permissions. Absence retains legacy/native
+        /// comparisons and logical 0777; copy-up/export/apply retain this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         xattrs: Option<XattrFingerprint>,
     },

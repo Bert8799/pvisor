@@ -222,7 +222,14 @@ pub fn set_times(
     cvt(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), flags) })
 }
 
+/// Change native ownership, or atomically persist ownership of an admitted logical
+/// symlink when `nofollow` is true. `u32::MAX` leaves that field unchanged.
+/// Callers authorize the change and serialize namespace mutations. Readonly
+/// logical roots return EROFS; logical updates never change the symlink target.
 pub fn chown(path: &Path, uid: u32, gid: u32, nofollow: bool) -> io::Result<()> {
+    if nofollow && crate::symlink_state::chown(path, uid, gid)? {
+        return Ok(());
+    }
     let path = c_path(path)?;
     let flags = if nofollow {
         libc::AT_SYMLINK_NOFOLLOW
@@ -239,6 +246,20 @@ pub fn chown(path: &Path, uid: u32, gid: u32, nofollow: bool) -> io::Result<()> 
             flags,
         )
     })
+}
+
+/// Atomically change selected fields of an admitted logical Linux symlink.
+/// Returns false without mutation for ordinary native/legacy entries. The caller
+/// authorizes virtual Unix metadata and serializes namespace changes. Unspecified
+/// fields and xattrs are retained; readonly/corrupt state fails. Mode is limited
+/// to 07777. No target is followed and no host chmod/chown is performed.
+pub fn set_symlink_attributes(
+    path: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u16>,
+) -> io::Result<bool> {
+    crate::symlink_state::set_attributes(path, uid, gid, mode)
 }
 
 pub fn access(path: &Path, mask: i32) -> io::Result<()> {
@@ -317,7 +338,11 @@ where
     Ok(buffer)
 }
 
+/// List exact no-follow attributes, including an attached source's logical values.
 pub fn list_xattrs(path: &Path) -> io::Result<Vec<Vec<u8>>> {
+    if let Some(attrs) = crate::backend::logical_xattrs(path)? {
+        return Ok(attrs.into_keys().collect());
+    }
     let path = c_path(path)?;
     #[cfg(target_os = "macos")]
     let data = xattr_buffer(|buf, size| {
@@ -336,7 +361,24 @@ pub fn list_xattrs(path: &Path) -> io::Result<Vec<Vec<u8>>> {
         .collect())
 }
 
+/// Read an exact no-follow attribute; logical source errors never fall back.
 pub fn get_xattr(path: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
+    if name.as_bytes().contains(&0) {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    if let Some(mut attrs) = crate::backend::logical_xattrs(path)? {
+        return attrs.remove(name.as_bytes()).ok_or_else(|| {
+            #[cfg(target_os = "linux")]
+            let errno = libc::ENODATA;
+            #[cfg(target_os = "macos")]
+            let errno = libc::ENOATTR;
+            io::Error::from_raw_os_error(errno)
+        });
+    }
+    native_get_xattr(path, name)
+}
+
+pub(crate) fn native_get_xattr(path: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
     let path = c_path(path)?;
     let name = c_name(name)?;
     #[cfg(target_os = "macos")]
@@ -364,7 +406,14 @@ pub fn get_xattr(path: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Set an exact no-follow attribute. Recorded Linux symlinks use durable logical
+/// metadata, with Linux CREATE/REPLACE flags; their internal ownership override
+/// is reserved. Other entries retain native behavior. Callers authorize the
+/// operation and serialize namespace changes; logical updates are atomic.
 pub fn set_xattr(path: &Path, name: &OsStr, value: &[u8], flags: i32) -> io::Result<()> {
+    if crate::symlink_state::set_xattr(path, name.as_bytes(), Some(value), flags)? {
+        return Ok(());
+    }
     let path = c_path(path)?;
     let name = c_name(name)?;
     #[cfg(target_os = "macos")]
@@ -397,7 +446,13 @@ pub fn set_xattr(path: &Path, name: &OsStr, value: &[u8], flags: i32) -> io::Res
     }
 }
 
+/// Remove an exact no-follow attribute, atomically persisting recorded Linux
+/// symlink changes. Missing logical attributes return ENODATA. Authorization and
+/// namespace serialization remain the caller's responsibility.
 pub fn remove_xattr(path: &Path, name: &OsStr) -> io::Result<()> {
+    if crate::symlink_state::set_xattr(path, name.as_bytes(), None, 0)? {
+        return Ok(());
+    }
     let path = c_path(path)?;
     let name = c_name(name)?;
     #[cfg(target_os = "macos")]

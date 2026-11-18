@@ -9,6 +9,7 @@ pub mod preimage_log;
 pub mod profile;
 pub mod service;
 pub mod stage;
+mod symlink_state;
 pub mod sys;
 
 pub use core::{
