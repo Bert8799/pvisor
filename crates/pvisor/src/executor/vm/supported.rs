@@ -36,6 +36,17 @@ const RAM_CHILD_FD: RawFd = 200;
 const IDLE_CHILD_FD: RawFd = 202;
 const RAW_READY_CHILD_FD: RawFd = 203;
 
+pub(super) fn reserve_runner_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
+    let minimum = RAW_READY_CHILD_FD.max(crate::diagnostics::INHERITED_LOG_FD) + 1;
+    // SAFETY: fcntl duplicates the borrowed descriptor into a new owned slot.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new valid descriptor owned by this call.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
 pub(super) fn runner_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
     let reserved = [
         NETWORK_CHILD_FD,

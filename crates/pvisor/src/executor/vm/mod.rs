@@ -64,7 +64,7 @@ impl VmExecutor {
             use std::os::fd::AsRawFd;
             let mut span = crate::startup_profile::Span::start("vm.reserve_runner_fds");
             let source = std::fs::File::open("/dev/null")?;
-            let reserved = supported::runner_fd(source.as_raw_fd())?;
+            let reserved = supported::reserve_runner_fd(source.as_raw_fd())?;
             drop(reserved);
             span.success(None);
         }
