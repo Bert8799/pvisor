@@ -35,6 +35,9 @@ const DESCRIPTOR: &str = "backend.json";
 const PREFIX: &str = ".pvisor-direct-image-";
 
 pub(crate) fn private_owner(root: &Path) -> Option<&Path> {
+    if let Some(parent) = crate::image::rafs::private_owner(root) {
+        return Some(parent);
+    }
     root.parent().filter(|parent| {
         root.file_name() == Some(OsStr::new("lower"))
             && parent
@@ -485,6 +488,13 @@ pub(crate) fn attach_runner_lowers<'a>(
     for root in roots {
         let root = root.canonicalize()?;
         if !seen.insert(root.clone()) {
+            continue;
+        }
+        if crate::image::rafs::is_view(&root) {
+            let (attachment, store) = crate::image::rafs::reattach(&root)?;
+            owners.read_only.push(store);
+            owners.read_write.push(root.parent().unwrap().to_owned());
+            owners._attachments.push(attachment);
             continue;
         }
         let Some(parent) = private_owner(&root) else {

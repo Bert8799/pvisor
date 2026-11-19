@@ -40,6 +40,8 @@ pub mod ram_backing;
 pub use executor::sandbox;
 #[cfg(unix)]
 pub use image::cache;
+#[cfg(unix)]
+pub use image::rafs;
 mod util;
 
 pub use config::{

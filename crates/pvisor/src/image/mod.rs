@@ -4,3 +4,6 @@
 pub mod cache;
 pub(crate) mod oci;
 pub(crate) mod store;
+
+#[cfg(unix)]
+pub mod rafs;

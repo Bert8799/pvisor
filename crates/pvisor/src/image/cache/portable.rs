@@ -248,6 +248,7 @@ impl Handle {
     }
 }
 pub(super) struct PortableCache {
+    rafs: Option<Arc<crate::image::rafs::RafsEndpoint>>,
     storage: Storage,
     local_store: Option<PathBuf>,
     read_only: bool,
@@ -301,6 +302,7 @@ impl PortableCache {
     }
     pub(super) fn new(storage: Storage, local_store: Option<PathBuf>, read_only: bool) -> Self {
         Self {
+            rafs: None,
             storage,
             local_store,
             read_only,
@@ -314,8 +316,21 @@ impl PortableCache {
         self.local_objects = root;
         self
     }
+    pub(super) fn with_rafs(mut self, rafs: Option<Arc<crate::image::rafs::RafsEndpoint>>) -> Self {
+        self.rafs = rafs;
+        self
+    }
     pub(super) fn request(&self, request: Request) -> anyhow::Result<(Response, Vec<u8>)> {
         match request {
+            Request::Rafs {
+                handle,
+                request,
+                generation,
+            } => self
+                .rafs
+                .as_ref()
+                .context("RAFS node service is not configured")?
+                .request(&handle, request, generation.as_deref()),
             Request::Open {
                 handle,
                 architecture,

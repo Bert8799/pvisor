@@ -97,8 +97,9 @@ pub struct TemplateSpec {
     /// New host-assigned build generation, e.g. a UUID. Never reuse it to replace
     /// an existing capture, even when the other inputs are identical.
     pub generation: String,
-    /// SHA-256 of the immutable source image's complete inventory, obtained with
-    /// [`Self::image_id`] before platform initialization modifies its private copy.
+    /// SHA-256 of the ordinary image inventory, obtained with [`Self::image_id`],
+    /// or the merged revision of the exact optional RAFS environment. Computed
+    /// before platform initialization modifies any independently owned boot copy.
     pub image_sha256: String,
     /// SHA-256 of the exact guest supervisor installed in the private image.
     pub guest_sha256: String,
@@ -124,6 +125,12 @@ pub struct TemplateSpec {
     /// False preserves the original root-only recipe and its device topology.
     #[serde(default, skip_serializing_if = "is_false")]
     pub workspace_device: bool,
+    /// Optional exact RAFS environment, attached as a never-used extra device.
+    /// Captured root contains only the static supervisor and platform setup.
+    /// Publication holds a durable commit hardlink in this generation; catalog
+    /// and metadata store must share a filesystem (EXDEV fails explicitly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::rafs::RafsArtifact>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -151,6 +158,13 @@ impl TemplateSpec {
         valid_name(&self.generation)?;
         valid_digest(&self.image_sha256)?;
         valid_digest(&self.guest_sha256)?;
+        if let Some(image) = &self.environment {
+            ensure!(
+                self.native_overlay
+                    && crate::image::rafs::revision(&image.handle)? == self.image_sha256,
+                "environment template requires an exact native image identity"
+            );
+        }
         ensure!(
             self.cpus > 0 && self.memory_mib > 0,
             "empty template resource budget"
@@ -174,7 +188,7 @@ impl TemplateSpec {
         }
         let id = digest(&serde_json::to_vec(self)?);
         Template {
-            environment_root: false,
+            environment_root: self.environment.is_some(),
             version: pvisor_guest::api::TEMPLATE_VERSION,
             template_id: id.clone(),
             stdio_ports: self.stdio_ports,
@@ -186,7 +200,7 @@ impl TemplateSpec {
     /// Construct the credential-free boot descriptor for this generation.
     pub fn boot(&self) -> anyhow::Result<Template> {
         Ok(Template {
-            environment_root: false,
+            environment_root: self.environment.is_some(),
             version: pvisor_guest::api::TEMPLATE_VERSION,
             template_id: self.id()?,
             stdio_ports: self.stdio_ports,
@@ -199,7 +213,9 @@ impl TemplateSpec {
     /// config paths are rejected, never overwritten. Failure may leave a partial
     /// private destination; do not boot or reuse it. With native_overlay, the
     /// destination is a capsule containing rootfs/, upper/ and work/; boot files
-    /// are placed under rootfs/. Capture must retain the entire capsule, including
+    /// are placed under rootfs/. An environment recipe instead requires an empty
+    /// source and installs standard early-boot mountpoints without reading image
+    /// payloads. Capture must retain the entire capsule, including
     /// any native resolver lower added before boot. No VM is started here.
     pub fn prepare_rootfs(
         &self,
@@ -208,10 +224,17 @@ impl TemplateSpec {
         destination: &Path,
     ) -> anyhow::Result<()> {
         let boot = self.boot()?;
-        ensure!(
-            Self::image_id(source)? == self.image_sha256,
-            "template image changed"
-        );
+        if self.environment.is_some() {
+            ensure!(
+                fs::read_dir(source)?.next().is_none(),
+                "environment template boot root must be empty"
+            );
+        } else {
+            ensure!(
+                Self::image_id(source)? == self.image_sha256,
+                "template image changed"
+            );
+        }
         ensure!(
             file_hash(guest)? == self.guest_sha256,
             "template supervisor changed"
@@ -230,6 +253,15 @@ impl TemplateSpec {
             destination.to_owned()
         };
         copy_owned_tree(source, &root)?;
+        if self.environment.is_some() {
+            // Supply Linux's early mountpoints before PID 1 starts. In
+            // particular, /dev permits early devtmpfs/console setup rather
+            // than depending on userspace initialization of an empty image.
+            for name in ["dev", "proc", "sys", "run", "tmp"] {
+                fs::DirBuilder::new().mode(0o755).create(root.join(name))?;
+            }
+            fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
+        }
         let mut input = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -295,6 +327,7 @@ pub struct TemplateCatalog {
 /// changing/removing its alias does not revoke it. GC skips this generation while
 /// allowing unrelated retired generations to be reclaimed.
 pub struct TemplateLease {
+    _artifact: Option<File>,
     version: TemplateVersion,
     environment: PublishedEnvironment,
     _generation: File,
@@ -324,7 +357,9 @@ impl TemplateLease {
     /// Authenticated state, raw read-only RAM file and independent filesystem
     /// materialization. The caller must rebind saved filesystem paths and install
     /// the exact CPU/device topology through the VM API before resuming. This
-    /// accessor grants no mutation or deletion authority over catalog payloads.
+    /// With `spec.environment`, this is only the static boot capsule; the caller
+    /// must also attach the exact leased environment before handing off a task.
+    /// This accessor grants no mutation or deletion authority over catalog payloads.
     pub fn environment(&self) -> &PublishedEnvironment {
         &self.environment
     }
@@ -416,7 +451,8 @@ impl TemplateCatalog {
         ensure!(
             matches!(boot, BootConfig::Template { template }
             if template.template_id == id && template.version == ready.version
-            && template.stdio_ports == spec.stdio_ports),
+            && template.stdio_ports == spec.stdio_ports
+            && template.environment_root == spec.environment.is_some()),
             "template boot recipe mismatch"
         );
         ensure!(
@@ -437,6 +473,13 @@ impl TemplateCatalog {
             (staging, writer)
         };
         let store = SnapshotStore::new(&staging.path().join("store"))?;
+        // Pin before any dependent payload can become visible. Pending builder
+        // cleanup and generation GC own the hardlink; no TTL or service needed.
+        let _artifact = spec
+            .environment
+            .as_ref()
+            .map(|image| image.pin(&staging.path().join("image.commit")))
+            .transpose()?;
         let pending = store.begin()?;
         pending.copy_ram_from(ram)?;
         let snapshot_id = pending.publish(&source, machine, spec.compatibility.clone())?;
@@ -551,7 +594,22 @@ impl TemplateCatalog {
         )?
         .open_for_restore(&version.snapshot_id, expected)?;
         crate::util::startup_mark("template.environment_open_ready");
+        let artifact = version
+            .spec
+            .environment
+            .as_ref()
+            .map(|image| {
+                image.verify_pin(
+                    &self
+                        .root
+                        .join("generations")
+                        .join(&version.id)
+                        .join("image.commit"),
+                )
+            })
+            .transpose()?;
         Ok(TemplateLease {
+            _artifact: artifact,
             version,
             environment,
             _generation: generation,

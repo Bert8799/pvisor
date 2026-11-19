@@ -113,7 +113,7 @@ enum CacheTransport {
 /// Private host-side runner handoff. Never include this in a guest view.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ClientBinding {
+pub(crate) struct ClientBinding {
     address: String,
     token: Option<String>,
     local_store: Option<std::path::PathBuf>,
@@ -209,13 +209,13 @@ impl CacheClient {
     pub(super) fn local_directory(&self) -> Option<&std::path::Path> {
         self.local_directory.as_deref()
     }
-    pub(super) fn address(&self) -> &str {
+    pub(crate) fn address(&self) -> &str {
         &self.binding.address
     }
-    pub(super) fn binding(&self) -> ClientBinding {
+    pub(crate) fn binding(&self) -> ClientBinding {
         self.binding.clone()
     }
-    pub(super) fn from_binding(binding: ClientBinding) -> anyhow::Result<Self> {
+    pub(crate) fn from_binding(binding: ClientBinding) -> anyhow::Result<Self> {
         if let Some(handle) = &binding.pinned_read_retry {
             super::portable::metadata_prefix(handle)?;
         }
@@ -429,6 +429,13 @@ impl CacheClient {
         };
         let expected = match &request {
             Request::Read { length, .. } | Request::Metadata { length, .. } => Some(*length),
+            Request::Rafs { request, .. } => {
+                request.validate()?;
+                Some(match request {
+                    super::RafsRequest::Read { length, .. } => *length,
+                    _ => 0,
+                })
+            }
             _ => None,
         };
         let retry = self
@@ -753,7 +760,7 @@ fn receive_response(
         // Return them as verified exchanges; the caller converts them to the
         // existing io::Error only after marking the connection reusable.
         Response::Error { .. } => {}
-        Response::Data { length, sha256 } => {
+        Response::Data { length, sha256 } | Response::Rafs { length, sha256, .. } => {
             ensure!(
                 expected.is_some_and(|limit| *length <= limit) && *length <= MAX_READ,
                 "invalid cache data length"
@@ -837,6 +844,45 @@ pub(super) mod retry_tests {
         )
         .unwrap();
         socket.write_all(b"verified").unwrap();
+    }
+
+    #[test]
+    fn rafs_binary_bodies_are_bounded_and_authenticated_before_use() {
+        for (length, digest, data, accepted) in [
+            (3, hash(b"abc"), b"abc".as_slice(), true),
+            (3, hash(b"abc"), b"bad".as_slice(), false),
+            (4, hash(b"abcd"), b"abcd".as_slice(), false),
+            (3, hash(b"abc"), b"a".as_slice(), false),
+        ] {
+            let mut bytes = Vec::new();
+            write_frame(
+                &mut bytes,
+                &Response::Rafs {
+                    frame: serde_json::json!({"status":"ok","length":length,"sha256":digest}),
+                    length,
+                    sha256: digest,
+                },
+            )
+            .unwrap();
+            bytes.extend_from_slice(data);
+            let result = receive_response(&mut bytes.as_slice(), Some(3));
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(result.unwrap().1, b"abc");
+            }
+        }
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &Response::Rafs {
+                frame: serde_json::json!({"status":"ok"}),
+                length: 1,
+                sha256: hash(b"x"),
+            },
+        )
+        .unwrap();
+        bytes.push(b'x');
+        assert!(receive_response(&mut bytes.as_slice(), Some(0)).is_err());
     }
 
     #[test]

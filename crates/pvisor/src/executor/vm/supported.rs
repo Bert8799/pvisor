@@ -221,6 +221,8 @@ pub(super) struct RunnerSpec {
     pub(super) run_id: String,
     pub(super) setup_attestation: PathBuf,
     pub(super) root: OverlayDeviceSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) environment: Option<OverlayDeviceSpec>,
     pub(super) workspace: Option<OverlayDeviceSpec>,
     pub(super) workspace_target: Option<PathBuf>,
     pub(super) guest: pvisor_guest::api::GuestConfig,
@@ -582,7 +584,9 @@ impl VmExecutor {
         settings: &VmSettings,
     ) -> anyhow::Result<crate::environment_snapshot::Compatibility> {
         anyhow::ensure!(
-            settings.prepared_rootfs.is_none(),
+            settings.prepared_rootfs.is_none()
+                && settings.rafs.is_none()
+                && settings.rafs_node.is_none(),
             "CAPABILITY_UNSUPPORTED: prepared rootfs execution capture/restore is not supported"
         );
         #[cfg(all(target_os = "linux", target_env = "musl", target_arch = "x86_64"))]
@@ -597,6 +601,27 @@ impl VmExecutor {
         // The host environment alias is consumed once, at admission. Explicit settings
         // win; the child receives only the normalized descriptor.
         resolve_ram_settings(&mut settings, env::os(POOL_ENV))?;
+        if settings.rafs.is_some() || settings.rafs_node.is_some() {
+            anyhow::ensure!(
+                cfg!(target_os = "linux")
+                    && !(settings.rafs.is_some() && settings.rafs_node.is_some())
+                    && settings.image.is_none()
+                    && settings.prepared_rootfs.is_none()
+                    && settings.template.is_none()
+                    && settings.snapshot_filesystem_pool.is_none(),
+                "RAFS requires fresh Linux VM execution without other image/snapshot selectors"
+            );
+            let root = settings
+                .rootfs
+                .as_deref()
+                .context("unresolved RAFS source")?;
+            if let Some(source) = &settings.rafs {
+                source.validate_view(root)?;
+            }
+            if let Some(source) = &settings.rafs_node {
+                source.validate_view(root)?;
+            }
+        }
         anyhow::ensure!(
             settings.template.is_none(),
             "unresolved vm.template selector; authenticate a lease and use from_template"
@@ -802,8 +827,10 @@ impl VmExecutor {
         storage: &Path,
     ) -> anyhow::Result<(Self, crate::OverlayHint)> {
         anyhow::ensure!(
-            settings.prepared_rootfs.is_none(),
-            "prepared rootfs cannot override a restored VM"
+            settings.prepared_rootfs.is_none()
+                && settings.rafs.is_none()
+                && settings.rafs_node.is_none(),
+            "prepared/RAFS rootfs cannot override a restored VM"
         );
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
@@ -849,6 +876,9 @@ impl VmExecutor {
     /// private upper/work and COW RAM writes. Caller owns private storage and reclaims partial preparation
     /// after failure. Workspace-capable recipes accept a fresh managed stage;
     /// existing execution checkpoint restore and cold-RAM modes remain unsupported.
+    /// Environment recipes additionally require `settings.rafs_node` and a
+    /// matching prepared `settings.rootfs` view. Retain that view through VM
+    /// teardown; the executor owns its private write layer and template lease.
     pub fn from_template(
         settings: VmSettings,
         lease: crate::environment_snapshot::templates::TemplateLease,
@@ -857,6 +887,9 @@ impl VmExecutor {
         let prepared = super::templates::prepare(&settings, lease, storage)?;
         let mut settings = settings;
         settings.rootfs = Some(prepared.rootfs());
+        // The template's boot device is sealed ordinary storage. Its pristine
+        // environment device independently authenticates the RAFS runner view.
+        settings.rafs_node = None;
         let mut executor = Self::new(settings)?;
         executor.template = Some(std::sync::Arc::new(prepared));
         Ok(executor)
@@ -876,7 +909,9 @@ impl VmExecutor {
         stage: &Path,
         generation: &str,
     ) -> anyhow::Result<()> {
-        self.capture_template_profile(catalog, name, expected, guest, stage, generation, false)
+        self.capture_template_profile(
+            catalog, name, expected, guest, stage, generation, false, None,
+        )
     }
 
     /// Capture an inert template with an unused workspace device for CLI Sessions.
@@ -893,7 +928,39 @@ impl VmExecutor {
         stage: &Path,
         generation: &str,
     ) -> anyhow::Result<()> {
-        self.capture_template_profile(catalog, name, expected, guest, stage, generation, true)
+        self.capture_template_profile(
+            catalog, name, expected, guest, stage, generation, true, None,
+        )
+    }
+
+    /// Capture static guest/platform setup for a fixed RAFS environment.
+    /// `settings.rootfs` must be an empty private boot tree. The environment is
+    /// not opened by the guest or downloaded: a pristine extra device is rebound
+    /// on restore, then mounted as the task root after one authenticated handoff.
+    /// Retains the exact local commit through capture and pins it durably before
+    /// publication. Catalog and metadata store must share a filesystem. Uses the
+    /// same isolated-process/reaping contract as [`Self::capture_template`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_environment_template(
+        &self,
+        catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        name: &str,
+        expected: Option<&str>,
+        guest: &Path,
+        stage: &Path,
+        generation: &str,
+        environment: crate::rafs::RafsArtifact,
+    ) -> anyhow::Result<()> {
+        self.capture_template_profile(
+            catalog,
+            name,
+            expected,
+            guest,
+            stage,
+            generation,
+            false,
+            Some(environment),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -906,6 +973,7 @@ impl VmExecutor {
         stage: &Path,
         generation: &str,
         workspace_device: bool,
+        environment: Option<crate::rafs::RafsArtifact>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.template.is_none()
@@ -936,6 +1004,7 @@ impl VmExecutor {
             stage,
             generation,
             workspace_device,
+            environment,
         )
     }
 
@@ -1188,7 +1257,10 @@ impl RunExecutor for VmExecutor {
                     CapabilityDimension::FilesystemWrite,
                     "libkrun-guest-kernel-virtiofs-overlay",
                 ),
-            supports_checkpoint: self.settings.prepared_rootfs.is_none() && self.template.is_none(),
+            supports_checkpoint: self.settings.prepared_rootfs.is_none()
+                && self.settings.rafs.is_none()
+                && self.settings.rafs_node.is_none()
+                && self.template.is_none(),
             supports_migration: false,
         }
     }
@@ -1631,6 +1703,8 @@ impl RunExecutor for VmExecutor {
             && self.vsock_ports.is_empty()
             && !self.settings.cold_pager_requested()
             && self.settings.prepared_rootfs.is_none()
+            && self.settings.rafs.is_none()
+            && self.settings.rafs_node.is_none()
             && self.template.is_none()
         {
             let prepared = if let Some(drivers) = &context.drivers {
@@ -1740,6 +1814,7 @@ impl RunExecutor for VmExecutor {
             run_id: spec.run_id.to_string(),
             setup_attestation: attestation.path().to_path_buf(),
             root: root_overlay,
+            environment: None,
             workspace,
             workspace_target: workspace_target.clone(),
             guest,
@@ -1786,6 +1861,16 @@ impl RunExecutor for VmExecutor {
             &authority_paths,
         ) {
             return failed_to_start(format!("hide host authority: {error:#}"));
+        }
+        if let Some(environment) = &mut runner.environment
+            && let Err(error) = hide_host_authority(
+                environment,
+                runner.workspace.as_mut(),
+                runner.workspace_target.as_deref(),
+                &authority_paths,
+            )
+        {
+            return failed_to_start(format!("hide environment authority: {error:#}"));
         }
         #[cfg(any(
             all(target_os = "linux", target_arch = "x86_64"),
@@ -2681,11 +2766,15 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
     // A detached supervisor crash must not let GC reclaim a live runner's lowers.
     let template_lease = super::templates::runner_lease(&spec)?;
     let _direct_lowers = crate::image::cache::attach_runner_lowers(
-        spec.root.lowers.iter().chain(
-            spec.workspace
-                .iter()
-                .flat_map(|workspace| workspace.lowers.iter()),
-        ),
+        spec.root
+            .lowers
+            .iter()
+            .chain(
+                spec.workspace
+                    .iter()
+                    .flat_map(|workspace| workspace.lowers.iter()),
+            )
+            .chain(spec.environment.iter().flat_map(|view| view.lowers.iter())),
     )?;
     lower_span.success(None);
     drop(lower_span);
@@ -2775,7 +2864,7 @@ fn run_runner(spec: RunnerSpec) -> anyhow::Result<()> {
         if let Some(binding) = &spec.checkpoint {
             read_write.push(binding.store.clone());
         }
-        if let Some(workspace) = &spec.workspace {
+        for workspace in spec.workspace.iter().chain(spec.environment.iter()) {
             read_only.extend(workspace.lowers.iter().cloned());
             read_write.push(workspace.upper.clone());
             read_write.extend(workspace.work.iter().cloned());
@@ -2980,6 +3069,13 @@ fn run_linked_krun(
             workspace,
             baseline_indexes.get(1).cloned().flatten(),
         )?;
+    }
+    if let Some(environment) = &spec.environment {
+        anyhow::ensure!(
+            spec.template.is_some(),
+            "environment device requires a template"
+        );
+        add_vm_overlay(&mut vm, "pvisor-environment", environment, None)?;
     }
     if let Some(fd) = env::os(NETWORK_FD_ENV) {
         let fd = fd

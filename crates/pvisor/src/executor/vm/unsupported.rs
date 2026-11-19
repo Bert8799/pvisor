@@ -123,6 +123,22 @@ impl VmExecutor {
         anyhow::bail!(UNSUPPORTED_MESSAGE)
     }
 
+    /// Environment-template capture requires Linux x86_64 and is unavailable
+    /// here. No VM, filesystem copy or artifact pin is created on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_environment_template(
+        &self,
+        _catalog: crate::environment_snapshot::templates::TemplateCatalog,
+        _name: &str,
+        _expected: Option<&str>,
+        _guest: &std::path::Path,
+        _stage: &std::path::Path,
+        _generation: &str,
+        _environment: crate::rafs::RafsArtifact,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(UNSUPPORTED_MESSAGE)
+    }
+
     pub fn settings(&self) -> &VmSettings {
         &self.settings
     }

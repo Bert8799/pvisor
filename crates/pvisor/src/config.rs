@@ -308,6 +308,16 @@ pub struct VmTemplate {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VmSettings {
+    /// Explicit fixed local RAFS source for a fresh Linux VM. Conflicts with
+    /// rootfs/image, prepared sources and templates; omitted preserves old paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rafs: Option<crate::rafs::RafsRootfs>,
+    /// Fixed RAFS image served by a same-user, same-host cache node. The metadata
+    /// store is shared locally; the node owns remote access and the disk cache.
+    /// Fresh Linux VMs, or a matching environment template resolved through
+    /// `VmExecutor::from_template`; mutually exclusive with other image sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rafs_node: Option<crate::rafs::RafsNodeRootfs>,
     /// Optional CLI template selection; omitted keeps ordinary cold startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<VmTemplate>,
@@ -402,6 +412,8 @@ impl VmSettings {
 impl Default for VmSettings {
     fn default() -> Self {
         Self {
+            rafs: None,
+            rafs_node: None,
             template: None,
             control_socket: None,
             ram_backing: None,

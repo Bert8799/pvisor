@@ -12,32 +12,10 @@ use std::{
 };
 
 pub(super) fn xattrs(path: &Path) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let path = native_path(path)?;
-    let size = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
-    ensure!(size >= 0, "listxattr: {}", io::Error::last_os_error());
-    let mut names = vec![0u8; size as usize];
-    let count = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
-    ensure!(count == size, "extended attributes changed while listing");
     let mut result = Vec::new();
-    for name in names
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-    {
-        let native = CString::new(name)?;
-        let size =
-            unsafe { libc::lgetxattr(path.as_ptr(), native.as_ptr(), std::ptr::null_mut(), 0) };
-        ensure!(size >= 0, "getxattr: {}", io::Error::last_os_error());
-        let mut value = vec![0; size as usize];
-        let count = unsafe {
-            libc::lgetxattr(
-                path.as_ptr(),
-                native.as_ptr(),
-                value.as_mut_ptr().cast(),
-                value.len(),
-            )
-        };
-        ensure!(count == size, "extended attribute changed while reading");
-        result.push((name.to_vec(), value));
+    for name in pvisor_overlay_core::sys::list_xattrs(path)? {
+        let value = pvisor_overlay_core::sys::get_xattr(path, OsStr::from_bytes(&name))?;
+        result.push((name, value));
     }
     result.sort();
     Ok(result)
@@ -81,6 +59,24 @@ pub(super) fn copy_entry(
         }
     } else if metadata.file_type().is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(source)?, destination)?;
+        if let Some(attr) = pvisor_overlay_core::backend::logical_symlink_attributes(source)? {
+            pvisor_overlay_core::backend::restore_symlink_metadata(
+                destination,
+                pvisor_overlay_core::backend::UnixIdentity {
+                    uid: attr.uid,
+                    gid: attr.gid,
+                    mode: u32::from(attr.perm),
+                },
+                &xattrs(source)?,
+            )?;
+            pvisor_overlay_core::sys::set_times(
+                destination,
+                Some(attr.atime),
+                Some(attr.mtime),
+                true,
+            )?;
+            return Ok(false);
+        }
     }
     let dst = native_path(destination)?;
     let current = fs::symlink_metadata(destination)?;
@@ -258,6 +254,36 @@ fn validate_link(
 pub(super) fn restore_metadata(path: &Path, entry: &TreeEntry) -> anyhow::Result<()> {
     let native = native_path(path)?;
     let current = fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink()
+        && (current.uid() != entry.uid
+            || current.gid() != entry.gid
+            || entry.mode & 0o7777 != 0o777
+            || !entry.xattrs.is_empty()
+            || pvisor_overlay_core::backend::logical_symlink_attributes(path)?.is_some())
+    {
+        pvisor_overlay_core::backend::restore_symlink_metadata(
+            path,
+            pvisor_overlay_core::backend::UnixIdentity {
+                uid: entry.uid,
+                gid: entry.gid,
+                mode: entry.mode,
+            },
+            &entry.xattrs,
+        )?;
+        pvisor_overlay_core::sys::set_times(
+            path,
+            Some(pvisor_overlay_core::sys::unix_time(
+                entry.mtime,
+                entry.mtime_nsec,
+            )),
+            Some(pvisor_overlay_core::sys::unix_time(
+                entry.mtime,
+                entry.mtime_nsec,
+            )),
+            true,
+        )?;
+        return Ok(());
+    }
     if current.uid() != entry.uid || current.gid() != entry.gid {
         ensure!(
             unsafe { libc::lchown(native.as_ptr(), entry.uid, entry.gid) } == 0,

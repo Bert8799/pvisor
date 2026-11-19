@@ -20,10 +20,11 @@ pub(crate) use config::scrub_guest_environment;
 mod transport;
 
 pub use client::CacheClient;
+pub(crate) use client::ClientBinding;
 pub use config::{BACKEND_ENV, CacheBackend, CacheConfig, LOCATION_ENV, READ_ONLY_ENV};
 pub use progress::ImageTotals;
 use protocol::hash;
-pub use protocol::{MAX_READ, Request, Response};
+pub use protocol::{MAX_READ, RafsRequest, Request, Response};
 pub use transport::default_endpoint;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -69,6 +70,32 @@ pub fn serve(
         location,
         crate::image::store::LocalStore::discover(image_store)?,
         token,
+        ready,
+    )
+}
+
+/// Serve the existing cache protocol with optional node-owned RAFS supply and
+/// cooperative shutdown. `rafs_config` names an explicit protected local JSON
+/// configuration; it cannot be supplied by requests. RAFS requires Linux and an
+/// explicitly trusted native reader. A negative/closed shutdown descriptor is
+/// invalid; the caller retains a live descriptor through this blocking call.
+/// Readability or hangup ends admission, stops/reaps the native reader and keeps
+/// shared cached data. In-flight requests are not drained. `ready` runs only
+/// after the socket, bounded workers and optional native reader are ready.
+pub fn serve_managed(
+    location: String,
+    image_store: Option<std::path::PathBuf>,
+    token: Option<String>,
+    rafs_config: Option<std::path::PathBuf>,
+    shutdown_fd: Option<std::os::fd::RawFd>,
+    ready: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    server::serve_managed(
+        location,
+        crate::image::store::LocalStore::discover(image_store)?,
+        token,
+        rafs_config,
+        shutdown_fd,
         ready,
     )
 }

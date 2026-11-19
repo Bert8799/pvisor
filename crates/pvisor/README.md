@@ -2669,3 +2669,19 @@ Execution preparation binds VM Gateway proxies to Core's VM resolved-address
 constraints, even when LLM Gateway dispatch is disabled. Injected HTTP/HTTPS/ALL
 proxy routes therefore cannot widen direct VM egress to link-local metadata or
 IPv6 destinations. Host execution keeps the host proxy's address policy.
+
+### Experimental RAFS environments
+
+On Unix, `pvisor::rafs` exposes local reader and authenticated node sources for
+fixed merged image revisions. Linux VM execution admits only a prepared view
+matching its explicit `VmSettings::rafs` or `rafs_node` selector. Sources cannot
+be combined with other image selectors or execution-checkpoint restores.
+Views own their reader/attachment lifetimes; retain them until VM teardown.
+The node shares bounded metadata hints and file backing across clients.
+
+Environment templates capture static guest setup with an unused filesystem
+device. Restore binds that device to the exact node image, then mounts it as
+the task root after authenticated handoff. The catalog pins the image commit
+with a hardlink; publication fails across filesystems. Each restored execution
+owns private writable layers. Ordinary directory templates keep their existing
+root and workspace device contracts.

@@ -27,6 +27,7 @@ pub(super) struct Prepared {
     pub ram: Arc<File>,
     pub ram_path: PathBuf,
     root: OverlayDeviceSpec,
+    environment: Option<OverlayDeviceSpec>,
     workspace_device: bool,
     launch: Launch,
     _lease: TemplateLease,
@@ -102,7 +103,30 @@ pub(super) fn prepare(
         "native templates require a raw shared RAM baseline, without eager decode"
     );
     crate::util::startup_mark("template.compatibility_begin");
-    let mut expected = super::supported::VmExecutor::checkpoint_compatibility(settings)?;
+    let environment_source = match (&spec.environment, &settings.rafs_node) {
+        (Some(image), Some(source)) => {
+            let root = settings
+                .rootfs
+                .as_deref()
+                .context("missing RAFS template view")?;
+            source.validate_view(root)?;
+            ensure!(
+                crate::image::rafs::node_artifact(root)? == *image,
+                "template environment artifact mismatch"
+            );
+            Some(root.to_owned())
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("template environment profile mismatch"),
+    };
+    ensure!(
+        settings.rafs.is_none(),
+        "local RAFS templates are unsupported"
+    );
+    let mut compatibility_settings = settings.clone();
+    compatibility_settings.rafs_node = None;
+    let mut expected =
+        super::supported::VmExecutor::checkpoint_compatibility(&compatibility_settings)?;
     expected.profile = crate::environment_snapshot::templates::PROFILE.into();
     ensure!(
         spec.compatibility == expected
@@ -166,7 +190,26 @@ pub(super) fn prepare(
     restored_root
         .lower_mutability
         .fill(pvisor_overlay_core::LayerMutability::Mutable);
+    let environment = environment_source
+        .map(|source| -> anyhow::Result<_> {
+            let directory = preparation.join("environment");
+            fs::create_dir(&directory)?;
+            for name in ["upper", "work"] {
+                fs::create_dir(directory.join(name))?;
+            }
+            let mut overlay = root(&directory, false);
+            overlay.lowers = vec![source];
+            super::supported::prepare_network_resolver(
+                &mut overlay,
+                &directory,
+                true,
+                pvisor_overlaynet::api::ROUTER_IPV4,
+            )?;
+            Ok(overlay)
+        })
+        .transpose()?;
     Ok(Prepared {
+        environment,
         ram,
         ram_path,
         root: restored_root,
@@ -212,6 +255,12 @@ pub(super) fn apply(
     let mut launch = prepared.launch.clone();
     launch.instance_id = instance_id.into();
     runner.template = Some(launch);
+    runner.environment = prepared.environment.clone();
+    if let Some(environment) = &mut runner.environment {
+        environment.access_policy = runner.root.access_policy.clone();
+        super::supported::protect_overlay_backing(environment, runner.workspace.as_ref())?;
+    }
+    runner.guest.environment_root = runner.environment.is_some();
     Ok(())
 }
 
@@ -264,6 +313,11 @@ pub(super) fn machine_restore(
             tag: "pvisor-workspace",
         });
     }
+    if spec.environment.is_some() {
+        changes.push(pvisor_vm::api::SnapshotRebind::UnmountedFilesystem {
+            tag: "pvisor-environment",
+        });
+    }
     changes.push(pvisor_vm::api::SnapshotRebind::VsockPorts { ports: &ports });
     crate::util::startup_mark("template.machine_rebind_begin");
     state.rebind_all(&changes)?;
@@ -301,6 +355,19 @@ pub(super) fn runner_lease(spec: &RunnerSpec) -> anyhow::Result<Option<TemplateL
         recipe.workspace_device == spec.workspace.is_some(),
         "template workspace topology changed"
     );
+    ensure!(
+        recipe.environment.is_some() == spec.environment.is_some()
+            && spec.guest.environment_root == recipe.environment.is_some(),
+        "template environment topology changed"
+    );
+    if let Some(environment) = &spec.environment {
+        let image = recipe.environment.as_ref().unwrap();
+        ensure!(
+            environment.lowers.len() == 2
+                && crate::image::rafs::node_artifact(&environment.lowers[1])? == *image,
+            "template runner environment identity changed"
+        );
+    }
     let lowers = ["network-lower", "rootfs"]
         .iter()
         .map(|name| lease.environment().owned_layer_path(Path::new(name)))
@@ -400,9 +467,15 @@ pub(super) fn capture(
     stage: &Path,
     generation: &str,
     workspace_device: bool,
+    environment: Option<crate::rafs::RafsArtifact>,
 ) -> anyhow::Result<()> {
-    use pvisor_vm::api::{SnapshotCapture, SnapshotControl, VmConfiguration, VmRuntime};
+    use pvisor_vm::api::{
+        RuntimeSupport, SnapshotCapture, SnapshotControl, VmConfiguration, VmRuntime,
+    };
     use std::{io::Write, os::fd::AsRawFd, os::unix::fs::OpenOptionsExt};
+    if std::env::var_os("PVISOR_KRUN_LOG").is_some() {
+        pvisor_vm::api::VmPlatform::init_logging("trace");
+    }
     ensure!(
         cfg!(all(target_os = "linux", target_arch = "x86_64")),
         "native templates require Linux x86_64"
@@ -410,6 +483,8 @@ pub(super) fn capture(
     let settings = executor.settings();
     ensure!(
         settings.prepared_rootfs.is_none()
+            && settings.rafs.is_none()
+            && settings.rafs_node.is_none()
             && settings.memory_pool.is_none()
             && settings.ram_backing.is_none(),
         "template preparation requires a plain immutable image"
@@ -421,15 +496,29 @@ pub(super) fn capture(
     let image = catalog.validate_source(image)?;
     let stage = catalog.validate_source(stage)?;
     ensure!(
-        !image.starts_with(&stage) && !stage.starts_with(&image),
+        environment.is_some() || (!image.starts_with(&stage) && !stage.starts_with(&image)),
         "template image and staging must be independent"
     );
+    let _artifact = environment
+        .as_ref()
+        .map(|source| source.open())
+        .transpose()?;
+    if let Some(source) = &environment {
+        ensure!(
+            !source.store.starts_with(&stage) && !stage.starts_with(&source.store),
+            "template build and artifact store overlap"
+        );
+    }
     let mut compatibility = super::supported::VmExecutor::checkpoint_compatibility(settings)?;
     compatibility.profile = crate::environment_snapshot::templates::PROFILE.into();
     let spec = TemplateSpec {
         version: 1,
         generation: generation.into(),
-        image_sha256: TemplateSpec::image_id(&image)?,
+        image_sha256: match &environment {
+            Some(source) => crate::image::rafs::revision(&source.handle)?.to_owned(),
+            None => TemplateSpec::image_id(&image)?,
+        },
+        environment,
         guest_sha256: crate::environment_snapshot::file_hash(guest)?,
         cpus: u8::try_from(settings.cpus)?,
         memory_mib: settings.memory_mib,
@@ -462,6 +551,11 @@ pub(super) fn capture(
         // PID 1 has no workspace configuration before handoff, so this device
         // is discovered but never mounted or issued a filesystem request.
         vm.filesystem("pvisor-workspace", &unused, 0)?;
+    }
+    if spec.environment.is_some() {
+        let unused = capsule.join("unused-environment");
+        fs::create_dir(&unused)?;
+        vm.filesystem("pvisor-environment", &unused, 0)?;
     }
     let (input, input_vm) = std::os::unix::net::UnixStream::pair()?;
     let (mut output, output_vm) = std::os::unix::net::UnixStream::pair()?;

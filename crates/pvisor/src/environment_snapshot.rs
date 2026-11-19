@@ -295,7 +295,15 @@ fn inventory_projected_with_hash<const DEDUPLICATE: bool>(
         hash: &mut impl FnMut(&Path) -> anyhow::Result<String>,
         excluded: &[std::path::PathBuf],
     ) -> anyhow::Result<()> {
+        if pvisor_overlay_core::backend::is_metadata_entry(path)? {
+            return Ok(());
+        }
         let metadata = fs::symlink_metadata(path)?;
+        let _owner = metadata
+            .is_dir()
+            .then(|| pvisor_overlay_core::backend::metadata_owner(path, false))
+            .transpose()?;
+        let logical = pvisor_overlay_core::backend::logical_symlink_attributes(path)?;
         #[cfg(target_os = "macos")]
         ensure!(
             metadata.st_flags() == 0,
@@ -311,7 +319,9 @@ fn inventory_projected_with_hash<const DEDUPLICATE: bool>(
                 .or_insert_with(|| InventoryLink {
                     first_path: relative.clone(),
                     seen: 0,
-                    expected_links: metadata.nlink(),
+                    expected_links: logical
+                        .as_ref()
+                        .map_or(metadata.nlink(), |a| u64::from(a.nlink)),
                     content: None,
                 });
             link.seen += 1;
@@ -350,9 +360,11 @@ fn inventory_projected_with_hash<const DEDUPLICATE: bool>(
         };
         entries.push(TreeEntry {
             path: relative,
-            mode: metadata.mode(),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
+            mode: logical
+                .as_ref()
+                .map_or(metadata.mode(), |a| 0o120000 | u32::from(a.perm)),
+            uid: logical.as_ref().map_or(metadata.uid(), |a| a.uid),
+            gid: logical.as_ref().map_or(metadata.gid(), |a| a.gid),
             mtime: metadata.mtime(),
             mtime_nsec: metadata.mtime_nsec(),
             object,
@@ -380,6 +392,17 @@ fn inventory_projected_with_hash<const DEDUPLICATE: bool>(
             }
         }
         let after = fs::symlink_metadata(path)?;
+        let mut logical_after = pvisor_overlay_core::backend::logical_symlink_attributes(path)?;
+        if let (Some(before), Some(after)) = (&logical, &mut logical_after) {
+            // readlink may update native atime. Inventories never capture atime;
+            // retain all identity, permission, ctime and namespace checks.
+            after.atime = before.atime;
+        }
+        ensure!(
+            logical == logical_after,
+            "logical metadata changed during inventory at {}",
+            path.display()
+        );
         ensure!(
             metadata.dev() == after.dev()
                 && metadata.ino() == after.ino()
@@ -472,6 +495,7 @@ fn copy_tree<const SEALED: bool>(
         "source root must not be a symlink"
     );
     let source = source.canonicalize()?;
+    let _source_metadata = pvisor_overlay_core::backend::metadata_owner(&source, false)?;
     let parent = destination
         .parent()
         .context("missing destination parent")?
@@ -494,6 +518,8 @@ fn copy_tree<const SEALED: bool>(
     drop(before_span);
     fs::create_dir(destination)?;
     let result = (|| {
+        let _destination_metadata =
+            pvisor_overlay_core::backend::metadata_owner(destination, true)?;
         #[allow(clippy::too_many_arguments)]
         fn copy(
             source: &Path,
@@ -505,6 +531,9 @@ fn copy_tree<const SEALED: bool>(
             root: &Path,
             excluded: &[std::path::PathBuf],
         ) -> anyhow::Result<()> {
+            if pvisor_overlay_core::backend::is_metadata_entry(source)? {
+                return Ok(());
+            }
             let hidden_directory = excluded.iter().any(|excluded| {
                 source
                     .strip_prefix(root)
@@ -514,6 +543,9 @@ fn copy_tree<const SEALED: bool>(
                 for child in fs::read_dir(source)? {
                     let child = child?;
                     let source = child.path();
+                    if pvisor_overlay_core::backend::is_metadata_entry(&source)? {
+                        continue;
+                    }
                     if excluded.iter().any(|path| {
                         source
                             .strip_prefix(root)

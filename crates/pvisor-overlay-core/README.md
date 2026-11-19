@@ -15,9 +15,9 @@ they must reject view mutations themselves and do not promise fresh observations
 ## Shared immutable image projections
 
 `backend::{ImageSource, ImageNode, attach_image}` supplies one shared native
-projection implementation for immutable readers. The current pVisor cache's
-direct lower uses this implementation; format adapters implement only metadata,
-directory names and authenticated range reads. Sources may be shared through
+projection implementation for immutable readers. RAFS format adapters implement
+metadata, directory names and authenticated range reads. The cache's direct
+image adapter retains its separate projection and streaming/direct-copy paths. Sources may be shared through
 `Arc` across views. Each view retains private projection state and a Core upper.
 
 `attach_image_bounded` uses the same contract with an explicit 1..16384-entry
@@ -53,7 +53,7 @@ Qualified image sources select `SymlinkMetadataPolicy::Preserve` (the ImageSourc
 default). On Linux, Core copy-up can persist otherwise unrepresentable symlink
 UID/GID, mode and xattrs in the exclusively owned upper. Ordinary native lowers
 and the old cache adapter retain their original best-effort native copy contract;
-the cache explicitly selects `LegacyNative`, which is not new-format metadata
+the cache retains the default `LegacyNative` policy, which is not new-format metadata
 qualification. Qualified symlink copy-up uses logical records consistently,
 including host-representable links, so later metadata updates retain this contract.
 The private

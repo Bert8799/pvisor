@@ -287,11 +287,26 @@ pub(super) fn serve(
     token: Option<String>,
     ready: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let store = Arc::new(reader(&store.root)?);
+    serve_managed(address, store, token, None, None, ready)
+}
+
+pub(super) fn serve_managed(
+    address: String,
+    store: LocalStore,
+    token: Option<String>,
+    rafs_config: Option<std::path::PathBuf>,
+    shutdown_fd: Option<std::os::fd::RawFd>,
+    ready: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    ensure!(
+        shutdown_fd.is_none_or(|fd| fd >= 0),
+        "invalid cache shutdown descriptor"
+    );
+    let portable = reader(&store.root)?;
     let token = Arc::new(token);
     // Bind before starting workers so address conflicts fail without orphan workers.
     enum Listener {
-        Unix(UnixListener, File),
+        Unix { socket: UnixListener, _lock: File },
         Tcp(TcpListener),
     }
     let listener = match endpoint(&address)? {
@@ -327,7 +342,10 @@ pub(super) fn serve(
             }
             let listener = UnixListener::bind(&path)?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-            Listener::Unix(listener, lock)
+            Listener::Unix {
+                socket: listener,
+                _lock: lock,
+            }
         }
         Endpoint::Tcp(address) => {
             ensure!(
@@ -337,6 +355,10 @@ pub(super) fn serve(
             Listener::Tcp(TcpListener::bind(address)?)
         }
     };
+    let rafs = rafs_config
+        .map(|path| crate::image::rafs::RafsCache::start(&path))
+        .transpose()?;
+    let store = Arc::new(portable.with_rafs(rafs.as_ref().map(|r| r.endpoint())));
     // File workers only execute admitted requests. Idle peers and V2 preparation
     // waits consume a connection permit, never a file-service worker.
     let file_store = store.clone();
@@ -355,16 +377,55 @@ pub(super) fn serve(
     };
     ready()?;
     eprintln!("pVisor cache component listening on {address}");
-    match listener {
-        Listener::Unix(listener, _lock) => {
-            for stream in listener.incoming() {
-                let _ = handlers.dispatch(Stream::Unix(stream?));
+    loop {
+        let fd = match &listener {
+            Listener::Unix { socket, .. } => socket.as_raw_fd(),
+            Listener::Tcp(socket) => socket.as_raw_fd(),
+        };
+        let mut polls = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: shutdown_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: rafs.as_ref().map_or(-1, |r| r.pidfd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let count = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, -1) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(error.into());
         }
-        Listener::Tcp(listener) => {
-            for stream in listener.incoming() {
-                let _ = handlers.dispatch(Stream::Tcp(stream?));
-            }
+        ensure!(
+            polls[1].revents & libc::POLLNVAL == 0,
+            "cache shutdown descriptor closed"
+        );
+        if polls[1].revents != 0 {
+            break;
+        }
+        ensure!(
+            polls[2].revents == 0,
+            "native RAFS node reader exited unexpectedly"
+        );
+        if polls[0].revents & libc::POLLIN != 0 {
+            let stream = match &listener {
+                Listener::Unix { socket, .. } => Stream::Unix(socket.accept()?.0),
+                Listener::Tcp(socket) => Stream::Tcp(socket.accept()?.0),
+            };
+            let _ = handlers.dispatch(stream);
+        } else {
+            ensure!(polls[0].revents == 0, "cache listener failed");
         }
     }
     Ok(())

@@ -24,6 +24,7 @@ fn fixture() -> (
     let guest = root.join("guest");
     fs::write(&guest, b"fixture supervisor").unwrap();
     let spec = TemplateSpec {
+        environment: None,
         version: 1,
         generation: "generation-a".into(),
         image_sha256: TemplateSpec::image_id(&image).unwrap(),
@@ -77,6 +78,104 @@ fn publish(
             rootfs: source,
         },
     )
+}
+
+#[test]
+fn environment_template_pins_exact_commit_until_last_generation_and_reader_are_gone() {
+    use std::os::unix::fs::MetadataExt;
+    let (temp, catalog, mut spec, _, ram) = fixture();
+    let root = temp.path().canonicalize().unwrap();
+    let store = root.join("node-store");
+    for directory in [&store, &store.join("merged")] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let raw = root.join("commit");
+    fs::write(&raw, b"immutable merged environment and ordered artifacts").unwrap();
+    let revision = file_hash(&raw).unwrap();
+    let bundle = store.join("merged").join(&revision);
+    fs::create_dir(&bundle).unwrap();
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+    let commit = bundle.join("MERGED.json");
+    fs::rename(raw, &commit).unwrap();
+    fs::set_permissions(&commit, fs::Permissions::from_mode(0o600)).unwrap();
+    let metadata = commit.metadata().unwrap();
+    spec.environment = Some(pvisor::rafs::RafsArtifact {
+        store,
+        handle: format!("pvisor-rafs-merged-v1:{revision}"),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    });
+    spec.image_sha256 = revision;
+    spec.native_overlay = true;
+    let empty = root.join("empty-boot");
+    fs::create_dir(&empty).unwrap();
+    let source = root.join("environment-capsule");
+    spec.prepare_rootfs(&empty, &root.join("guest"), &source)
+        .unwrap();
+    let version = publish(&catalog, "environment", None, &spec, &source, &ram).unwrap();
+    assert_eq!(commit.metadata().unwrap().nlink(), 2);
+    let reader = catalog.acquire("environment", &spec.compatibility).unwrap();
+    assert_eq!(reader.version().spec.environment, spec.environment);
+    catalog.remove("environment", &version.id).unwrap();
+    assert_eq!(catalog.collect().unwrap(), 0);
+    assert_eq!(commit.metadata().unwrap().nlink(), 2);
+    let exclusive = File::open(&commit).unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&exclusive).is_err());
+    // Byte-identical replacement does not inherit a template's physical lease.
+    fs::rename(&commit, bundle.join("old")).unwrap();
+    fs::write(&commit, fs::read(bundle.join("old")).unwrap()).unwrap();
+    fs::set_permissions(&commit, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        catalog
+            .acquire_version(&version.id, &spec.compatibility)
+            .is_err()
+    );
+    fs::remove_file(&commit).unwrap();
+    fs::rename(bundle.join("old"), &commit).unwrap();
+    drop(reader);
+    catalog.collect().unwrap();
+    assert_eq!(commit.metadata().unwrap().nlink(), 1);
+    fs2::FileExt::try_lock_exclusive(&exclusive).unwrap();
+    assert!(
+        catalog
+            .acquire_version(&version.id, &spec.compatibility)
+            .is_err()
+    );
+}
+
+#[test]
+fn failed_environment_template_publication_does_not_leak_a_pin_or_accept_a_data_boot_root() {
+    let (temp, catalog, mut spec, source, ram) = fixture();
+    spec.native_overlay = true;
+    spec.image_sha256 = "a".repeat(64);
+    spec.environment = Some(pvisor::rafs::RafsArtifact {
+        store: temp.path().join("missing-store"),
+        handle: format!("pvisor-rafs-merged-v1:{}", spec.image_sha256),
+        device: 1,
+        inode: 1,
+    });
+    assert!(
+        spec.prepare_rootfs(
+            &source,
+            &temp.path().join("guest"),
+            &temp.path().join("unexpected")
+        )
+        .is_err()
+    );
+    let empty = temp.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let capsule = temp.path().join("capsule");
+    spec.prepare_rootfs(&empty, &temp.path().join("guest"), &capsule)
+        .unwrap();
+    assert!(publish(&catalog, "bad", None, &spec, &capsule, &ram).is_err());
+    assert!(catalog.selected("bad").unwrap().is_none());
+    assert!(
+        fs::read_dir(temp.path().join("catalog/pending"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

@@ -493,6 +493,7 @@ impl FilesystemBlocks {
         );
         fs::create_dir(destination)?;
         let result = (|| -> anyhow::Result<()> {
+            let _metadata = pvisor_overlay_core::backend::metadata_owner(destination, true)?;
             let mut origins = BTreeMap::new();
             for (entry, relative) in &selected {
                 let path = destination.join(OsStr::from_bytes(relative));
