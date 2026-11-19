@@ -1,0 +1,264 @@
+--- a/api/src/config.rs
++++ b/api/src/config.rs
+@@ -592,6 +592,9 @@
+     /// Enable HTTP proxy for the read request.
+     #[serde(default)]
+     pub proxy: ProxyConfig,
++    /// Maximum concurrent HEAD/Range operations across this backend; zero keeps legacy behavior.
++    #[serde(default)]
++    pub max_concurrent_requests: usize,
+ }
+ 
+ /// Container registry configuration information to access blobs.
+@@ -762,6 +765,12 @@
+     /// Key for data encryption, a heximal representation of [u8; 32].
+     #[serde(default)]
+     pub encryption_key: String,
++    /// Load and authenticate metadata before publishing a cache entry. Legacy default is asynchronous.
++    #[serde(default)]
++    pub sync_metadata: bool,
++    /// Persist decoded cache data in the caller instead of spawning deferred writes.
++    #[serde(default)]
++    pub sync_data: bool,
+ }
+ 
+ impl FileCacheConfig {
+--- a/storage/src/backend/http_proxy.rs
++++ b/storage/src/backend/http_proxy.rs
+@@ -49,6 +49,8 @@
+     CopyBuffer(Error),
+     /// Invalid path.
+     InvalidPath,
++    RequestLimit(Error),
++    MissingContentLength,
+     /// Failed to build request header.
+     ConstructHeader(String),
+ }
+@@ -77,6 +79,8 @@
+                 write!(f, "failed to read response body, {}", e)
+             }
+             HttpProxyError::CopyBuffer(e) => write!(f, "failed to copy buffer, {}", e),
++            HttpProxyError::RequestLimit(e) => write!(f, "HTTP request admission: {}", e),
++            HttpProxyError::MissingContentLength => write!(f, "HEAD response lacks Content-Length"),
+             HttpProxyError::InvalidPath => write!(f, "invalid path"),
+             HttpProxyError::ConstructHeader(e) => {
+                 write!(f, "failed to construct request header, {}", e)
+@@ -99,7 +103,45 @@
+ /// - `GET /path/to/blob` to read the blob
+ ///
+ /// The http proxy server should respect [the `Range` header](https://www.rfc-editor.org/rfc/rfc9110.html#name-range) to support range reading.
++// One backend owns one gate. A permit covers the complete response body, not
++// just connection/header establishment. Zero preserves existing callers.
++struct RequestGate {
++    active: std::sync::Mutex<usize>,
++    available: std::sync::Condvar,
++    limit: usize,
++    timeout: std::time::Duration,
++}
++struct RequestPermit(Arc<RequestGate>);
++impl Drop for RequestPermit {
++    fn drop(&mut self) {
++        *self.0.active.lock().unwrap() -= 1;
++        self.0.available.notify_one();
++    }
++}
++impl RequestGate {
++    fn acquire(self: &Arc<Self>) -> Result<Option<RequestPermit>> {
++        if self.limit == 0 {
++            return Ok(None);
++        }
++        let deadline = std::time::Instant::now() + self.timeout;
++        let mut active = self.active.lock().unwrap();
++        while *active == self.limit {
++            let left = deadline.saturating_duration_since(std::time::Instant::now());
++            if left.is_zero() {
++                return Err(Error::new(
++                    std::io::ErrorKind::TimedOut,
++                    "HTTP concurrency limit",
++                ));
++            }
++            active = self.available.wait_timeout(active, left).unwrap().0;
++        }
++        *active += 1;
++        Ok(Some(RequestPermit(self.clone())))
++    }
++}
++
+ pub struct HttpProxy {
++    gate: Arc<RequestGate>,
+     addr: String,
+     path: String,
+     client: Client,
+@@ -108,6 +150,7 @@
+ 
+ /// HttpProxyReader is a BlobReader to implement the HttpProxy backend driver.
+ pub struct HttpProxyReader {
++    gate: Arc<RequestGate>,
+     client: Client,
+     uri: Uri,
+     metrics: Arc<BackendMetrics>,
+@@ -196,6 +239,7 @@
+ 
+ impl BlobReader for HttpProxyReader {
+     fn blob_size(&self) -> super::BackendResult<u64> {
++        let _permit = self.gate.acquire().map_err(HttpProxyError::RequestLimit)?;
+         let headers = match &self.client {
+             Client::Local(client) => {
+                 let uri = match self.uri {
+@@ -225,7 +269,10 @@
+                     .map_err(BackendError::Request)
+             }
+         };
+-        let content_length = headers?[http::header::CONTENT_LENGTH]
++        let headers = headers?;
++        let content_length = headers
++            .get(http::header::CONTENT_LENGTH)
++            .ok_or(HttpProxyError::MissingContentLength)?
+             .to_str()
+             .map_err(HttpProxyError::ParseContentLengthFromHeader)?
+             .parse::<u64>()
+@@ -243,6 +290,7 @@
+         offset: u64,
+         ctx: Option<&mut BackendContext>,
+     ) -> BackendResult<usize> {
++        let _permit = self.gate.acquire().map_err(HttpProxyError::RequestLimit)?;
+         match &self.client {
+             Client::Local(client) => {
+                 let uri = match self.uri {
+@@ -312,7 +360,19 @@
+             };
+             Client::Local(local_client)
+         };
++        if config.max_concurrent_requests > 256 {
++            return Err(Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "HTTP concurrency limit exceeds 256",
++            ));
++        }
+         Ok(HttpProxy {
++            gate: Arc::new(RequestGate {
++                active: Default::default(),
++                available: Default::default(),
++                limit: config.max_concurrent_requests,
++                timeout: std::time::Duration::from_secs(u64::from(config.timeout.max(1))),
++            }),
+             addr: config.addr.to_string(),
+             path: config.path.to_string(),
+             client,
+@@ -355,6 +415,7 @@
+             }
+         };
+         let reader = Arc::new(HttpProxyReader {
++            gate: self.gate.clone(),
+             client: self.client.clone(),
+             uri,
+             metrics: self.metrics.as_ref().unwrap().clone(),
+@@ -400,6 +461,27 @@
+ 
+     use super::build_tokio_runtime;
+     use super::Bytes;
++
++    #[test]
++    fn admission_timeout_releases_capacity_and_zero_preserves_legacy() {
++        let gate = std::sync::Arc::new(super::RequestGate {
++            active: Default::default(),
++            available: Default::default(),
++            limit: 1,
++            timeout: Duration::from_millis(10),
++        });
++        let permit = gate.acquire().unwrap().unwrap();
++        assert_eq!(gate.acquire().err().unwrap().kind(), std::io::ErrorKind::TimedOut);
++        drop(permit);
++        assert!(gate.acquire().unwrap().is_some());
++        let unlimited = std::sync::Arc::new(super::RequestGate {
++            active: Default::default(),
++            available: Default::default(),
++            limit: 0,
++            timeout: Duration::ZERO,
++        });
++        assert!(unlimited.acquire().unwrap().is_none());
++    }
+ 
+     const CONTENT: &str = "some content for test";
+     const SOCKET_PATH: &str = "/tmp/nydus-test-local-http-proxy.sock";
+--- a/storage/src/cache/filecache/mod.rs
++++ b/storage/src/cache/filecache/mod.rs
+@@ -49,6 +49,8 @@
+     cache_encryption_key: String,
+     closed: Arc<AtomicBool>,
+     user_io_batch_size: u32,
++    sync_metadata: bool,
++    sync_data: bool,
+ }
+ 
+ impl FileCacheMgr {
+@@ -82,6 +84,8 @@
+             cache_encryption_key: blob_cfg.encryption_key.clone(),
+             closed: Arc::new(AtomicBool::new(false)),
+             user_io_batch_size,
++            sync_metadata: blob_cfg.sync_metadata,
++            sync_data: blob_cfg.sync_data,
+         })
+     }
+ 
+@@ -289,7 +293,7 @@
+                     blob_info.clone(),
+                     Some(blob_meta_reader),
+                     Some(runtime.clone()),
+-                    false,
++                    mgr.sync_metadata,
+                     load_chunk_digest,
+                 )?;
+                 Some(meta)
+@@ -371,6 +375,7 @@
+             dio_enabled: false,
+             need_validation,
+             user_io_batch_size: mgr.user_io_batch_size,
++            sync_data: mgr.sync_data,
+             prefetch_config,
+         })
+     }
+--- a/storage/src/cache/cachedfile.rs
++++ b/storage/src/cache/cachedfile.rs
+@@ -221,6 +221,8 @@
+     pub(crate) need_validation: bool,
+     // Amplified user IO request batch size to read data from remote storage backend / local cache.
+     pub(crate) user_io_batch_size: u32,
++    // Keep node eviction and work admission inside the request lifetime.
++    pub(crate) sync_data: bool,
+     pub(crate) prefetch_config: Arc<AsyncPrefetchConfig>,
+ }
+ 
+@@ -249,7 +251,7 @@
+         let _cas_mgr = self.cas_mgr.clone();
+ 
+         metrics.buffered_backend_size.add(buffer.size() as u64);
+-        self.runtime.spawn_blocking(move || {
++        let persist = move || {
+             metrics.buffered_backend_size.sub(buffer.size() as u64);
+             let mut t_buf;
+             let buf = if !is_raw_data && is_cache_encrypted {
+@@ -313,7 +315,12 @@
+                     );
+                 }
+             }
+-        });
++        };
++        if self.sync_data {
++            persist();
++        } else {
++            self.runtime.spawn_blocking(persist);
++        }
+     }
+ 
+     fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) {
+--- a/storage/src/cache/fscache/mod.rs
++++ b/storage/src/cache/fscache/mod.rs
+@@ -321,6 +321,7 @@
+             dio_enabled: true,
+             need_validation,
+             user_io_batch_size: mgr.user_io_batch_size,
++            sync_data: false,
+             prefetch_config,
+         })
+     }

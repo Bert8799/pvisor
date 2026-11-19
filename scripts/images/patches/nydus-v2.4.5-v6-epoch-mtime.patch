@@ -1,0 +1,14 @@
+--- a/rafs/src/fs.rs
++++ b/rafs/src/fs.rs
+@@ -344,3 +344,3 @@
+-        // Older rafs image or the root inode doesn't include mtime, in such cases
+-        // we use runtime timestamp.
+-        if attr.mtime == 0 {
++        // Keep the legacy v5 fallback. In v6, zero seconds is a valid epoch
++        // timestamp (including fractional times within its first second).
++        if self.sb.meta.is_v5() && attr.mtime == 0 {
+@@ -373,2 +373,2 @@
+-        // Older rafs image doesn't include mtime, in such case we use runtime timestamp.
+-        if entry.attr.st_mtime == 0 {
++        // RAFS v6 always carries timestamps; zero seconds is not missing data.
++        if self.sb.meta.is_v5() && entry.attr.st_mtime == 0 {

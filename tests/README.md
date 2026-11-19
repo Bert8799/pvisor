@@ -226,3 +226,14 @@ Keep resource budgets, fault oracles and cleanup instructions beside each driver
 claims. Use its `--help` for bounded duration, workload, seed and output options.
 Long-running campaigns are explicit correctness experiments, separate from the
 default unit and regression suites.
+
+## Image format and supply qualification
+
+Image model and publication tests live in `tests/unit/test_image_*.py`; reader
+and management transport lifecycle tests live in `tests/regression/`. Shared
+fixtures under `tests/image_fixtures/` own OCI inputs, Range origins and processes
+without importing test cases. Explicit `tests/hardware/image_*.py` suites require
+pinned patched Nydus tools; selected Core/Daemon cases additionally need native
+probes, KVM or delegated cgroup v2. Select these modules explicitly with
+`mise run test-py -- tests.hardware.image_node`. Default Python tests do not
+claim native image, mount or VM acceptance.

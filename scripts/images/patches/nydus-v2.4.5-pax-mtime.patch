@@ -1,0 +1,69 @@
+--- a/builder/src/tarball.rs
++++ b/builder/src/tarball.rs
+@@ -54,0 +55,25 @@
++}
++
++// PAX times are decimal seconds, not floating point. RAFS stores nonnegative
++// seconds plus nanoseconds; reject values that cannot be represented exactly.
++fn parse_pax_mtime(bytes: &[u8]) -> Result<(u64, u32)> {
++    let value = std::str::from_utf8(bytes).context("tarball: invalid PAX mtime encoding")?;
++    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
++    if seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
++        bail!("tarball: PAX mtime must have nonnegative decimal seconds");
++    }
++    let seconds: u64 = seconds
++        .parse()
++        .context("tarball: PAX mtime seconds overflow")?;
++    if !fraction.bytes().all(|b| b.is_ascii_digit())
++        || (fraction.len() > 9 && !fraction.as_bytes()[9..].iter().all(|b| *b == b'0'))
++    {
++        bail!("tarball: PAX mtime is not representable as nanoseconds");
++    }
++    let fraction = &fraction[..fraction.len().min(9)];
++    let nanos = if fraction.is_empty() {
++        0
++    } else {
++        fraction.parse::<u32>()?
++    };
++    Ok((seconds, nanos * 10u32.pow(9 - fraction.len() as u32)))
+@@ -276 +301,2 @@
+-        let mtime = header.mtime().unwrap_or_default();
++        let mut mtime = header.mtime().unwrap_or_default();
++        let mut mtime_nsec = 0;
+@@ -378,0 +405,2 @@
++                        } else if key == b"mtime" {
++                            (mtime, mtime_nsec) = parse_pax_mtime(pax.value_bytes())?;
+@@ -410 +438 @@
+-                i_mtime_nsec: 0,
++                i_mtime_nsec: mtime_nsec,
+@@ -428 +456 @@
+-                i_mtime_nsec: 0,
++                i_mtime_nsec: mtime_nsec,
+@@ -667,0 +696,27 @@
++    #[test]
++    fn test_pax_mtime_exact_nanoseconds() {
++        assert_eq!(
++            super::parse_pax_mtime(b"1700000000.123456789").unwrap(),
++            (1700000000, 123456789)
++        );
++        assert_eq!(super::parse_pax_mtime(b"0.000000001").unwrap(), (0, 1));
++        assert_eq!(super::parse_pax_mtime(b"42.1").unwrap(), (42, 100000000));
++        assert_eq!(super::parse_pax_mtime(b"42").unwrap(), (42, 0));
++        assert_eq!(
++            super::parse_pax_mtime(b"42.123456789000").unwrap(),
++            (42, 123456789)
++        );
++        for invalid in [
++            "-1.5",
++            "1.0000000001",
++            "NaN",
++            "1e9",
++            "1.a",
++            "18446744073709551616",
++        ] {
++            assert!(
++                super::parse_pax_mtime(invalid.as_bytes()).is_err(),
++                "{invalid}"
++            );
++        }
++    }
