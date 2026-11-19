@@ -62,6 +62,8 @@ enum Command {
         listen: String,
         #[arg(long)]
         image_store: Option<PathBuf>,
+        #[arg(long)]
+        rafs_config: Option<PathBuf>,
     },
     /// Run the selected shared-service components under one daemon lifecycle.
     #[command(group(clap::ArgGroup::new("state_service").args(["sandbox", "memory_pool"]).multiple(true)))]
@@ -79,6 +81,9 @@ enum Command {
         /// Cache OCI staging directory; defaults to PVISOR_IMAGE_STORE.
         #[arg(long, requires = "cache")]
         cache_image_store: Option<PathBuf>,
+        /// Private operator configuration for a Linux RAFS reader and shared cache.
+        #[arg(long, requires = "cache")]
+        cache_rafs_config: Option<PathBuf>,
         /// Enable the sandbox lifecycle API.
         #[arg(long, requires = "cgroup_root")]
         sandbox: bool,
@@ -132,8 +137,15 @@ enum Command {
 
 #[derive(clap::Args)]
 struct TemplateArgs {
-    #[arg(long)]
-    rootfs: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "rafs_node",
+        conflicts_with = "rafs_node"
+    )]
+    rootfs: Option<PathBuf>,
+    /// JSON fixed node selector (store, handle, endpoint), without credentials.
+    #[arg(long, required_unless_present = "rootfs", conflicts_with = "rootfs")]
+    rafs_node: Option<PathBuf>,
     /// Exact static pvisor-guest supervisor executable to install.
     #[arg(long)]
     guest: PathBuf,
@@ -164,14 +176,46 @@ fn prepare_template(args: &TemplateArgs) -> anyhow::Result<()> {
         "native templates require Linux x86_64"
     );
     if let Some(stage) = &args.template_worker_stage {
+        let source: Option<pvisor::rafs::RafsNodeRootfs> = args
+            .rafs_node
+            .as_ref()
+            .map(|path| -> anyhow::Result<_> {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)?
+                    .take(65537)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() <= 65536, "node selector exceeds 64 KiB");
+                Ok(serde_json::from_slice(&bytes)?)
+            })
+            .transpose()?;
+        let environment = source.as_ref().map(|s| s.artifact()).transpose()?;
+        let rootfs = if environment.is_some() {
+            let boot = stage.join("boot-image");
+            std::fs::create_dir(&boot)?;
+            Some(boot)
+        } else {
+            args.rootfs.as_ref().map(|p| p.canonicalize()).transpose()?
+        };
         let executor = pvisor::VmExecutor::new(pvisor::VmSettings {
-            rootfs: Some(args.rootfs.canonicalize()?),
+            rootfs,
             rootfs_immutable: true,
             cpus: args.cpus,
             memory_mib: args.memory_mib,
             library_dir: args.library_dir.clone(),
             ..Default::default()
         })?;
+        if let Some(environment) = environment {
+            return executor.capture_environment_template(
+                pvisor::environment_snapshot::templates::TemplateCatalog::new(&args.catalog)?,
+                &args.name,
+                args.expected.as_deref(),
+                &args.guest.canonicalize()?,
+                stage,
+                &uuid::Uuid::new_v4().to_string(),
+                environment,
+            );
+        }
         return executor.capture_template(
             pvisor::environment_snapshot::templates::TemplateCatalog::new(&args.catalog)?,
             &args.name,
@@ -240,9 +284,10 @@ fn main() -> anyhow::Result<()> {
     if let Command::CacheWorker {
         listen,
         image_store,
+        rafs_config,
     } = args.command
     {
-        return cache_component::worker(listen, image_store);
+        return cache_component::worker(listen, image_store, rafs_config);
     }
     if let Command::MemoryPool { directory } = &args.command {
         return pvisor_daemon::api::PoolConfig::run(directory);
@@ -297,6 +342,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             cache,
             cache_listen,
             cache_image_store,
+            cache_rafs_config,
             sandbox,
             listen,
             allow_insecure_listen,
@@ -422,7 +468,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 None
             };
             let mut cache = if cache {
-                Some(cache_component::start(cache_listen, cache_image_store).await?)
+                Some(
+                    cache_component::start(cache_listen, cache_image_store, cache_rafs_config)
+                        .await?,
+                )
             } else {
                 None
             };
@@ -919,5 +968,35 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+#[test]
+fn template_source_requires_exactly_one_directory_or_node_selector() {
+    let base = [
+        "pvisor-daemon",
+        "template-prepare",
+        "--guest",
+        "/guest",
+        "--catalog",
+        "/catalog",
+        "--name",
+        "test",
+        "--work-dir",
+        "/work",
+    ];
+    assert!(Args::try_parse_from(base).is_err());
+    for selector in ["--rootfs", "--rafs-node"] {
+        let mut args = base.to_vec();
+        args.extend([selector, "/source"]);
+        assert!(Args::try_parse_from(&args).is_ok());
+        args.extend([
+            if selector == "--rootfs" {
+                "--rafs-node"
+            } else {
+                "--rootfs"
+            },
+            "/other",
+        ]);
+        assert!(Args::try_parse_from(args).is_err());
     }
 }

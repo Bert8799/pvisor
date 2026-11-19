@@ -127,6 +127,8 @@ struct Identity {
     generation: String,
     spec: RuntimeSpec,
     image: PreparedImageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_binding: Option<pvisor::rafs::RafsNodeBinding>,
     cgroup: PathBuf,
     cgroup_device: u64,
     cgroup_inode: u64,
@@ -565,9 +567,18 @@ impl Runtime for NativeRuntime {
             !directory.try_exists()?,
             "sandbox ID was already used; never relaunch/reuse it"
         );
-        let image: PreparedImageSource =
+        let mut image: PreparedImageSource =
             read_json(&self.config.images_dir.join(format!("{}.json", spec.image)))?;
         validate_image(&image, &self.config.state_dir)?;
+        let image_lease = match image.config().rafs_node.cloned() {
+            Some(source) => Some(tokio::task::spawn_blocking(move || source.bind()).await??),
+            None => None,
+        };
+        let image_binding = image_lease.as_ref().map(|source| source.binding());
+        if let (PreparedImageSource::RafsNode(image), Some(binding)) = (&mut image, &image_binding)
+        {
+            image.rafs_node = binding.source().clone();
+        }
         ensure!(
             *image.config().e2b == spec.e2b,
             "prepared image service profile changed"
@@ -577,6 +588,12 @@ impl Runtime for NativeRuntime {
         let template_version = template_lease
             .as_ref()
             .map(|lease| lease.version().id.clone());
+        if let Some(template) = &template_lease {
+            ensure!(
+                template.version().spec.environment == image_binding.as_ref().map(|b| b.artifact()),
+                "prepared template environment binding changed"
+            );
+        }
         let generation = uuid::Uuid::new_v4().to_string();
         let group_path = self
             .config
@@ -595,6 +612,7 @@ impl Runtime for NativeRuntime {
                 generation,
                 spec: spec.clone(),
                 image,
+                image_binding,
                 cgroup: group_path.clone(),
                 cgroup_device: 0,
                 cgroup_inode: 0,
@@ -939,6 +957,11 @@ impl NativeRuntimeService for NativeRuntime {
         // its backend registration alive while VmExecutor exports it to the runner.
         let run_dir = sandbox_dir.join("run");
         private_directory(&run_dir)?;
+        let image_view = identity
+            .image_binding
+            .as_ref()
+            .map(|binding| binding.acquire()?.prepare(&run_dir))
+            .transpose()?;
         // Scratch belongs to this VM; the binding reads the shared V2 pool.
         let template_lease = acquire_image_template(
             &identity.image,
@@ -953,9 +976,10 @@ impl NativeRuntimeService for NativeRuntime {
                 None
             };
         startup.insert("image_opened_us", startup_clock.elapsed().as_micros());
-        let rootfs = match &template_lease {
-            Some(lease) => lease.environment().owned_layer_path(Path::new("rootfs"))?,
-            None => pooled_root
+        let rootfs = match (&image_view, &template_lease) {
+            (Some(view), _) => view.root().to_owned(),
+            (None, Some(lease)) => lease.environment().owned_layer_path(Path::new("rootfs"))?,
+            (None, None) => pooled_root
                 .as_ref()
                 .context("pooled image owner missing")?
                 .rootfs()
@@ -966,7 +990,8 @@ impl NativeRuntimeService for NativeRuntime {
                 .then(|| run_dir.join("live-ram")),
             memory_pool: identity.memory_pool.clone(),
             rootfs: Some(rootfs),
-            rootfs_immutable: template_lease.is_some(),
+            rafs_node: identity.image.config().rafs_node.cloned(),
+            rootfs_immutable: template_lease.is_some() || image_view.is_some(),
             library_dir: identity.image.config().library_dir.clone(),
             memory_mib: u32::try_from(identity.spec.memory_bytes / MIB)?,
             cpus: u16::try_from(identity.spec.cpu_millis.div_ceil(1000).min(8))?,
@@ -1307,6 +1332,15 @@ fn acquire_image_template(
     };
     let recipe = &lease.version().spec;
     ensure!(
+        match (&recipe.environment, image.rafs_node) {
+            (Some(artifact), Some(source)) =>
+                artifact.store == source.store && artifact.handle == source.handle,
+            (None, None) => true,
+            _ => false,
+        },
+        "prepared template environment selection mismatch"
+    );
+    ensure!(
         recipe.native_overlay
             && recipe.cpus as u16 == settings.cpus
             && recipe.memory_mib == settings.memory_mib
@@ -1386,6 +1420,14 @@ fn make_run_spec(identity: &Identity) -> Result<pvisor_core::RunSpec> {
         "pvisor.vm.guest_cwd".into(),
         serde_json::to_value(&process.cwd)?,
     );
+    if let Some(source) = image.rafs_node {
+        run.metadata
+            .insert("pvisor.vm.image_backend".into(), "rafs-v6-node".into());
+        run.metadata.insert(
+            "pvisor.vm.image_digest".into(),
+            source.handle.clone().into(),
+        );
+    }
     // RAM is rounded DOWN; the enclosing cgroup also caps host overhead.
     run.runtime.resource_limits.memory_bytes = Some(identity.spec.memory_bytes / MIB * MIB);
     Ok(run)
@@ -2143,6 +2185,22 @@ fn validate_image_shape(source: &PreparedImageSource, state: &Path) -> Result<()
             "guest working directory must be absolute without parent traversal"
         );
     }
+    if let Some(source) = image.rafs_node {
+        ensure!(
+            source
+                .handle
+                .strip_prefix("pvisor-rafs-merged-v1:")
+                .is_some_and(|revision| revision.len() == 64
+                    && revision
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))),
+            "RAFS requires an exact merged environment handle"
+        );
+        ensure!(
+            source.endpoint.starts_with("unix:///"),
+            "RAFS requires an absolute Unix endpoint"
+        );
+    }
     if let Some(template) = &image.template {
         ensure!(
             template.catalog.is_absolute()
@@ -2186,7 +2244,11 @@ fn validate_image(image: &PreparedImageSource, state: &Path) -> Result<()> {
         image.rootfs.is_absolute(),
         "prepared rootfs must be absolute"
     );
-    trusted_directory(image.rootfs)?;
+    if image.rafs_node.is_some() {
+        trusted_private_directory(image.rootfs)?;
+    } else {
+        trusted_directory(image.rootfs)?;
+    }
     let root = image.rootfs.canonicalize()?;
     let state = state.canonicalize()?;
     ensure!(
@@ -2283,6 +2345,14 @@ fn validate_tombstone(tombstone: &Tombstone, directory: &Path) -> Result<()> {
     Ok(())
 }
 fn validate_launch_resources(identity: &Identity, directory: &Path) -> Result<()> {
+    ensure!(
+        match (identity.image.config().rafs_node, &identity.image_binding) {
+            (Some(source), Some(binding)) => source == binding.source(),
+            (None, None) => true,
+            _ => false,
+        },
+        "prepared image node binding mismatch"
+    );
     ensure!(
         identity.image.config().template.is_some() == identity.template_version.is_some(),
         "template version binding is missing or unexpected"
@@ -2622,6 +2692,35 @@ fn validate_resources(cpu_millis: u64, memory_bytes: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::api::PreparedImage;
+    #[test]
+    fn node_source_requires_binding_for_launch_but_not_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut identity, directory) = identity_fixture(temp.path());
+        let mut wire = serde_json::to_value(&identity.image).unwrap();
+        wire.as_object_mut().unwrap().remove("rootfs");
+        wire.as_object_mut().unwrap().remove("pooled_image");
+        wire["rafs_node"] = serde_json::json!({
+            "store": temp.path().join("node-store"),
+            "handle": format!("pvisor-rafs-merged-v1:{}", "a".repeat(64)),
+            "endpoint": "unix:///private/node.sock"
+        });
+        identity.image = serde_json::from_value(wire.clone()).unwrap();
+        validate_image_shape(&identity.image, directory.parent().unwrap()).unwrap();
+        assert!(identity.image.cold_image(false).unwrap().is_none());
+        assert!(validate_launch_resources(&identity, &directory).is_err());
+        validate_identity(&identity, &directory).unwrap();
+        let run = make_run_spec(&identity).unwrap();
+        assert_eq!(run.metadata["pvisor.vm.image_backend"], "rafs-v6-node");
+        assert_eq!(
+            run.metadata["pvisor.vm.image_digest"],
+            wire["rafs_node"]["handle"]
+        );
+        wire["rafs_node"]["handle"] = "latest".into();
+        identity.image = serde_json::from_value(wire).unwrap();
+        assert!(validate_image_shape(&identity.image, directory.parent().unwrap()).is_err());
+        validate_identity(&identity, &directory).unwrap();
+    }
+
     fn pooled(image: &PreparedImageSource) -> &PreparedImage {
         let PreparedImageSource::Pooled(image) = image else {
             panic!("expected pooled fixture")
@@ -2803,6 +2902,7 @@ mod tests {
             token: "a".repeat(64),
             generation: generation.clone(),
             spec: spec(),
+            image_binding: None,
             image: PreparedImageSource::Pooled(Box::new(PreparedImage {
                 rootfs: rootfs.clone(),
                 entrypoint: vec!["/guest/bootstrap".into(), "--".into()],

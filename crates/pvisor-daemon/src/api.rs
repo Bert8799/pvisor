@@ -325,7 +325,7 @@ pub struct NativeTemplate {
     pub catalog: PathBuf,
     /// Mutable alias selected once at admission; the exact version is persisted.
     pub name: String,
-    /// Image inventory digest printed by template preparation. Updating image
+    /// Image inventory digest or RAFS revision printed by preparation. Updating image
     /// content requires a new capture and manifest digest; no per-create scan.
     pub image_sha256: String,
 }
@@ -342,6 +342,8 @@ pub enum PreparedImageSource {
     Pooled(Box<PreparedImage>),
     /// Local inert template with no image-store binding or projection owner.
     DirectoryTemplate(Box<DirectoryTemplateImage>),
+    /// Exact node image, with an independent private writable layer per VM.
+    RafsNode(Box<RafsNodeImage>),
 }
 
 /// Directory-backed template launch, encoded with `source: "directory_template"`.
@@ -412,4 +414,62 @@ pub enum DirectoryTemplateKind {
     /// The manifest leases a local catalog generation instead of an image pool.
     #[serde(rename = "directory_template")]
     DirectoryTemplate,
+}
+
+/// Explicit RAFS node launch source; no directory or pooled-image fallback.
+/// Cold creation and template restore both retain the selected commit and service
+/// generation through VM teardown. Node loss fails dependent reads; restarting
+/// the node requires new admission. Every instance owns its writable layer.
+///
+/// ```
+/// use pvisor_daemon::api::PreparedImageSource;
+/// let wire = serde_json::json!({
+///     "rafs_node": {"store": "/private/images", "handle": format!("pvisor-rafs-merged-v1:{}", "a".repeat(64)), "endpoint": "unix:///private/control/cache.sock"},
+///     "entrypoint": ["/bootstrap"]
+/// });
+/// let image: PreparedImageSource = serde_json::from_value(wire.clone())?;
+/// assert!(matches!(image, PreparedImageSource::RafsNode(_)));
+/// assert_eq!(serde_json::to_value(image)?, wire);
+/// let mut mixed = wire;
+/// mixed["rootfs"] = serde_json::json!("/private/rootfs");
+/// assert!(serde_json::from_value::<PreparedImageSource>(mixed).is_err());
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RafsNodeImage {
+    /// Fixed merged revision on a protected same-user cache node. The store,
+    /// commit inode and service generation are bound before sandbox creation.
+    /// Credentials remain in the host client and never enter this manifest.
+    pub rafs_node: pvisor::rafs::RafsNodeRootfs,
+    /// Guest bootstrap argv, absolute and nonempty unless `native_guest` is set.
+    pub entrypoint: Vec<String>,
+    /// Default workload argv appended when the request supplies none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd: Vec<String>,
+    /// Guest environment defaults; launch overrides never inherit host env.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Trusted absolute firmware directory retained through VM teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_dir: Option<PathBuf>,
+    /// Real envd resource/version profile; omission selects OpenSandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2b: Option<E2bTemplate>,
+    /// Managed execd bootstrap; mutually exclusive with native E2B/guest engines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_opensandbox: bool,
+    /// Managed envd bootstrap; requires `e2b` and excludes other native engines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_e2b: bool,
+    /// Shared guest process/file engine, without an execd/envd process.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_guest: bool,
+    /// Absolute guest cwd without parent traversal; omission uses `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Optional inert template for this exact image. Admission persists its
+    /// immutable version; a mismatch fails without falling back to a cold VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<NativeTemplate>,
 }

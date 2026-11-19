@@ -1457,3 +1457,28 @@ directory, sets mode 0600, then atomically renames it to `control.sock`.
 Starters observe absence until publication; the published inode is already
 private. Startup locking still serializes starters, and unsafe existing
 endpoints remain fatal. Unpublished sockets are removed on setup failure.
+
+## Fixed node environments
+
+A prepared manifest may explicitly select `rafs_node` with `store`, immutable
+`handle` and a protected same-user Unix `endpoint`, instead of a pooled image or
+a directory template. Guest launch fields retain their existing meaning. Mixed
+sources are rejected. Creation pins the exact commit inode and node generation
+before allocating sandbox resources; the detached supervisor acquires that same
+binding. Node restart invalidates old handoffs and dependent reads. Cleanup uses
+the durable sandbox identity even if its image or service has disappeared.
+
+`template-prepare --rafs-node SELECTOR_JSON` captures static platform setup with
+an unused environment device. The catalog pins the image commit before publishing
+the template. A manifest's optional template must match that image and resource
+profile. Restore rebinds the unused device, then enters the image root after
+authenticated task handoff. Instances share immutable backing and retain private
+writable layers. Ordinary pooled images still require their pooled binding;
+explicit directory templates still require their catalog selection.
+
+`serve --cache --cache-rafs-config CONFIG_JSON` owns the shared reader under the
+cache worker. Readiness follows its handshake. Closing the owner pipe drains
+normal cleanup and reaps the reader; shutdown has a bounded kill fallback. The
+existing cache authentication, request queues and direct-image paths remain
+active. See [node configuration](../../scripts/images/NODE.md) for resource limits,
+origin requirements and supported management operations.

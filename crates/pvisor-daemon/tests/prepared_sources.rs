@@ -106,3 +106,34 @@ fn source_selection_survives_persistence_with_the_same_template_identity() {
     assert_eq!(restored.env["PATH"], "/bin");
     assert!(restored.native_guest);
 }
+
+#[test]
+fn node_sources_reject_mixed_or_missing_authority_and_preserve_persistence() {
+    let wire = json!({
+        "rafs_node": {"store": "/private/images", "handle": format!("pvisor-rafs-merged-v1:{}", "a".repeat(64)), "endpoint": "unix:///private/control/cache.sock"},
+        "entrypoint": ["/guest/bootstrap"], "template": directory()["template"].clone()
+    });
+    let source: PreparedImageSource = serde_json::from_value(wire.clone()).unwrap();
+    assert!(matches!(source, PreparedImageSource::RafsNode(_)));
+    assert_eq!(serde_json::to_value(&source).unwrap(), wire);
+    let restored: PreparedImageSource =
+        serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+    assert!(serde_json::from_value::<PreparedImage>(wire.clone()).is_err());
+    for (field, value) in [
+        ("rootfs", json!("/private/rootfs")),
+        ("pooled_image", pooled()["pooled_image"].clone()),
+        ("source", json!("directory_template")),
+        ("unexpected", json!(true)),
+    ] {
+        let mut invalid = wire.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<PreparedImageSource>(invalid).is_err(),
+            "{field}"
+        );
+    }
+    let mut missing = wire;
+    missing.as_object_mut().unwrap().remove("rafs_node");
+    assert!(serde_json::from_value::<PreparedImageSource>(missing).is_err());
+}

@@ -9,27 +9,21 @@ use tokio::{
 pub(super) struct RunningCache {
     child: Child,
     // Child::wait closes its own stdin; keep the owner lease outside Child.
-    _owner: ChildStdin,
+    owner: Option<ChildStdin>,
 }
 
-pub(super) fn worker(listen: String, image_store: Option<PathBuf>) -> anyhow::Result<()> {
-    // A pipe held only by our owner also stops the worker if the daemon crashes.
-    std::thread::Builder::new()
-        .name("cache-owner".into())
-        .spawn(|| {
-            let mut byte = [0];
-            loop {
-                match std::io::Read::read(&mut std::io::stdin().lock(), &mut byte) {
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    _ => break,
-                }
-            }
-            std::process::exit(0);
-        })?;
-    pvisor::cache::serve(
+pub(super) fn worker(
+    listen: String,
+    image_store: Option<PathBuf>,
+    rafs_config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // EOF on the daemon-owned pipe returns through normal resource cleanup.
+    pvisor::cache::serve_managed(
         listen,
         image_store,
         std::env::var("PVISOR_CACHE_TOKEN").ok(),
+        rafs_config,
+        Some(0),
         || {
             println!("ready");
             std::io::stdout().flush()?;
@@ -41,6 +35,7 @@ pub(super) fn worker(listen: String, image_store: Option<PathBuf>) -> anyhow::Re
 pub(super) async fn start(
     listen: Option<String>,
     image_store: Option<PathBuf>,
+    rafs_config: Option<PathBuf>,
 ) -> anyhow::Result<RunningCache> {
     let config = pvisor::cache::CacheConfig::from_options(
         Some(pvisor::cache::CacheBackend::Server),
@@ -55,6 +50,9 @@ pub(super) async fn start(
     command.args(["cache-worker", "--listen", &config.location]);
     if let Some(store) = config.image_store {
         command.arg("--image-store").arg(store);
+    }
+    if let Some(path) = rafs_config {
+        command.arg("--rafs-config").arg(path);
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -72,7 +70,7 @@ pub(super) async fn start(
     let owner = child.stdin.take().context("missing owner pipe")?;
     Ok(RunningCache {
         child,
-        _owner: owner,
+        owner: Some(owner),
     })
 }
 
@@ -119,11 +117,16 @@ fn worker_environment(
 }
 
 pub(super) async fn stop(service: &mut RunningCache) -> anyhow::Result<()> {
+    drop(service.owner.take());
     let child = &mut service.child;
-    if child.try_wait()?.is_none() {
-        child.start_kill()?;
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(status) => {
+            status?;
+        }
+        Err(_) => {
+            child.kill().await?;
+        }
     }
-    child.wait().await?;
     Ok(())
 }
 
