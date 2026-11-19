@@ -1380,6 +1380,7 @@ async fn execute_config(
     let workspace = resolve_execution_workspace(&config, stage_launch.is_some())?;
     policy_source.load_defaults(&mut config, &workspace, personal_config_root().as_deref())?;
     reject_ask_config(&config)?;
+    let _rafs_owner = open_rafs_rootfs(&mut config)?;
     if config.run.executor == RunExecutorKind::Vm {
         config.vm.memory_pool = config
             .vm
@@ -1852,6 +1853,24 @@ async fn execute_config(
                 "pvisor.vm.image_digest".into(),
                 serde_json::Value::String(image.digest.clone()),
             );
+        }
+        if let Some(source) = &config.vm.rafs {
+            spec.metadata
+                .insert("pvisor.vm.image_backend".into(), "rafs-v6-local".into());
+            spec.metadata.insert(
+                "pvisor.vm.image_digest".into(),
+                source.handle.clone().into(),
+            );
+        } else if let Some(source) = &config.vm.rafs_node {
+            spec.metadata
+                .insert("pvisor.vm.image_backend".into(), "rafs-v6-node".into());
+            spec.metadata.insert(
+                "pvisor.vm.image_digest".into(),
+                source.handle.clone().into(),
+            );
+        } else if prepared_image.is_some() {
+            spec.metadata
+                .insert("pvisor.vm.image_backend".into(), "oci-or-file-index".into());
         }
     }
     if config.run.policy == RunPolicy::Enforce {
@@ -2382,7 +2401,7 @@ fn apply_cli_unvalidated(config: &mut RunConfig, args: RunArgs) -> anyhow::Resul
         &args.overlayfs.workspace_base,
         &args.overlayfs.workspace_base_store,
     ) {
-        let selected = pvisor::PreparedBase {
+        let selected = pvisor::PreparedRootfs {
             store: store.clone(),
             base: pvisor::environment_snapshot::BaseReference { id: id.clone() },
         };
@@ -2799,6 +2818,84 @@ fn apply_cli_unvalidated(config: &mut RunConfig, args: RunArgs) -> anyhow::Resul
     }
 
     Ok(())
+}
+
+fn open_rafs_rootfs(config: &mut RunConfig) -> anyhow::Result<Option<pvisor::rafs::RafsView>> {
+    if config.vm.rafs.is_none() && config.vm.rafs_node.is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        cfg!(target_os = "linux") && config.run.executor == RunExecutorKind::Vm,
+        "vm.rafs requires the Linux VM executor"
+    );
+    anyhow::ensure!(
+        !(config.vm.rafs.is_some() && config.vm.rafs_node.is_some())
+            && config.vm.rootfs.is_none()
+            && config.vm.image.is_none()
+            && config.vm.prepared_rootfs.is_none()
+            && config.vm.template.is_none()
+            && config.vm.snapshot_filesystem_pool.is_none(),
+        "vm.rafs conflicts with other rootfs selectors, templates and execution snapshots"
+    );
+    anyhow::ensure!(
+        !config.run.command.is_empty(),
+        "vm.rafs requires an explicit workload command"
+    );
+    let mut private = Vec::new();
+    if let Some(source) = &mut config.vm.rafs {
+        source.store = source.store.canonicalize().context("resolve RAFS store")?;
+        source.reader = source
+            .reader
+            .canonicalize()
+            .context("resolve trusted RAFS reader")?;
+        private.extend([source.store.clone(), source.reader.clone()]);
+    }
+    if let Some(source) = &mut config.vm.rafs_node {
+        source.store = source.store.canonicalize().context("resolve RAFS store")?;
+        let endpoint = source
+            .endpoint
+            .strip_prefix("unix://")
+            .context("RAFS node requires Unix endpoint")?;
+        let endpoint = Path::new(endpoint).canonicalize()?;
+        private.extend([
+            source.store.clone(),
+            endpoint
+                .parent()
+                .context("RAFS endpoint has no parent")?
+                .to_owned(),
+        ]);
+        source.endpoint = format!("unix://{}", endpoint.display());
+    }
+    let independent = prepared_guest_sources(config)?
+        .iter()
+        .map(|p| canonical_candidate(p))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let check = |private: &[PathBuf]| -> anyhow::Result<()> {
+        super::host_service::reject_guest_exposure(private.iter().cloned())?;
+        for path in &independent {
+            anyhow::ensure!(
+                private.iter().all(|p| !paths_overlap(p, path)),
+                "RAFS input/tool/cache must be independent of workspace/stage/guest sources: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    };
+    check(&private)?;
+    let view = if let Some(source) = &config.vm.rafs {
+        source.prepare(&std::env::temp_dir())?
+    } else {
+        config
+            .vm
+            .rafs_node
+            .as_ref()
+            .context("missing RAFS node selector")?
+            .prepare(&std::env::temp_dir())?
+    };
+    check(view.private_sources())?;
+    config.vm.rootfs = Some(view.root().to_owned());
+    config.vm.rootfs_immutable = true;
+    Ok(Some(view))
 }
 
 fn open_prepared_rootfs(
@@ -3763,12 +3860,12 @@ mod tests {
         let mut config = RunConfig::default();
         config.run.executor = RunExecutorKind::Vm;
         config.run.workspace = Some(workspace.to_owned());
-        config.vm.prepared_rootfs = Some(pvisor::PreparedBase {
+        config.vm.prepared_rootfs = Some(pvisor::PreparedRootfs {
             store: root.join("root-store"),
             base: pvisor::BaseReference { id: "a".repeat(64) },
         });
         config.overlayfs = Some(OverlayFsSettings {
-            prepared_workspace: Some(pvisor::PreparedBase {
+            prepared_workspace: Some(pvisor::PreparedRootfs {
                 store: root.join("workspace-store"),
                 base: pvisor::BaseReference { id: "b".repeat(64) },
             }),
@@ -5846,6 +5943,121 @@ sandbox = "required""#
             );
             prop_assert!(parse_overlaynet_target(&input).is_err());
         }
+    }
+
+    #[test]
+    fn rafs_selector_rejects_conflicts_before_opening_sources() {
+        let selected = pvisor::rafs::RafsRootfs {
+            store: "/nonexistent-private-rafs-store".into(),
+            handle: format!("pvisor-rafs-merged-v1:{}", "a".repeat(64)),
+            reader: "/nonexistent-rafs-reader".into(),
+        };
+        let mut config = RunConfig::default();
+        config.vm.rafs = Some(selected.clone());
+        assert!(
+            open_rafs_rootfs(&mut config)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Linux VM")
+        );
+        config.run.executor = RunExecutorKind::Vm;
+        for variant in 0..4 {
+            let mut invalid = config.clone();
+            match variant {
+                0 => invalid.vm.rootfs = Some("/".into()),
+                1 => invalid.vm.image = Some("example.invalid/test:tag".into()),
+                2 => {
+                    invalid.vm.template = Some(pvisor::VmTemplate {
+                        catalog: "/missing".into(),
+                        version: "a".repeat(64),
+                    })
+                }
+                _ => invalid.vm.snapshot_filesystem_pool = Some("/missing".into()),
+            }
+            assert!(
+                open_rafs_rootfs(&mut invalid)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conflicts")
+            );
+        }
+        let json = serde_json::to_value(&config.vm).unwrap();
+        let decoded: pvisor::VmSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.rafs, Some(selected));
+        assert!(
+            toml::from_str::<RunConfig>(
+                "[vm.rafs]\nstore='/s'\nhandle='x'\nreader='/r'\nignore_corruption=true\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rafs_node_selector_is_explicit_and_rejects_conflicting_sources() {
+        let selected = pvisor::rafs::RafsNodeRootfs {
+            store: "/nonexistent-node-store".into(),
+            handle: format!("pvisor-rafs-merged-v1:{}", "a".repeat(64)),
+            endpoint: "unix:///nonexistent-node/cache.sock".into(),
+        };
+        let mut config = RunConfig::default();
+        config.vm.rafs_node = Some(selected.clone());
+        assert!(
+            open_rafs_rootfs(&mut config)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Linux VM")
+        );
+        config.run.executor = RunExecutorKind::Vm;
+        config.run.command = vec!["/bin/true".into()];
+        if cfg!(target_os = "linux") {
+            for variant in 0..6 {
+                let mut invalid = config.clone();
+                match variant {
+                    0 => invalid.vm.rootfs = Some("/".into()),
+                    1 => invalid.vm.image = Some("image:tag".into()),
+                    2 => {
+                        invalid.vm.template = Some(pvisor::VmTemplate {
+                            catalog: "/missing".into(),
+                            version: "a".repeat(64),
+                        })
+                    }
+                    3 => invalid.vm.snapshot_filesystem_pool = Some("/missing".into()),
+                    4 => {
+                        invalid.vm.prepared_rootfs = Some(pvisor::PreparedRootfs {
+                            store: "/missing".into(),
+                            base: pvisor::BaseReference { id: "a".repeat(64) },
+                        })
+                    }
+                    _ => {
+                        invalid.vm.rafs = Some(pvisor::rafs::RafsRootfs {
+                            store: "/missing".into(),
+                            handle: selected.handle.clone(),
+                            reader: "/missing".into(),
+                        })
+                    }
+                }
+                assert!(
+                    open_rafs_rootfs(&mut invalid)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("conflicts")
+                );
+            }
+        }
+        let encoded = serde_json::to_value(&config.vm).unwrap();
+        let decoded: pvisor::VmSettings = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.rafs_node, Some(selected));
+        assert!(
+            serde_json::to_value(pvisor::VmSettings::default())
+                .unwrap()
+                .get("rafs_node")
+                .is_none()
+        );
+        assert!(toml::from_str::<RunConfig>("[vm.rafs_node]\nstore='/s'\nhandle='x'\nendpoint='unix:///c'\norigin='https://other'\n").is_err());
     }
 
     #[test]

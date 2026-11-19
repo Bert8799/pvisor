@@ -134,7 +134,7 @@ fn run_and_spawn_help_match_their_pinned_baselines() {
         (
             "spawn",
             // Pin lifecycle/RAM wording and the outside-storage result export rule.
-            "be055fd50ddb3e41434bde7fd7b67d43fdb902f8744b4519f9d990e43ae2632c",
+            "9881c9e1c2b929f0fd3aca7f4667c314b287f080d47d9eb3cb9e0761797c23d9",
         ),
     ] {
         let text = help(root.path(), &[command, "--help"]);

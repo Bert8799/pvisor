@@ -1687,3 +1687,18 @@ silently falling back to host execution. See the
 See the [platform matrix](../../docs/src/en/reference/platforms.md),
 [binary inventory and implementation comparison](../../docs/src/en/reference/platforms.md#binaries)
 and [shared real-VM test driver](../../tests/vm_cli_contract.py).
+
+## Experimental fixed RAFS environments
+
+Native Linux `spawn` accepts one explicit `[vm.rafs]` local-reader source or
+`[vm.rafs_node]` shared-node source in its configuration. Both select an immutable
+merged handle and require an explicit command. Policy defaults and unsupported
+Ask rules are checked before a reader or image view is created. Keep the image
+store, trusted reader, cache and control endpoint outside guest sources.
+
+These selectors support private writes and ordinary workspace staging. They
+conflict with other rootfs selectors, prepared-workspace execution, CLI templates
+and execution-checkpoint restore. Authentication, corruption and node-generation
+failures abort the affected operation without changing the selected source.
+See [image tools](../../scripts/images/README.md) and
+[node configuration](../../scripts/images/NODE.md) for preparation and limits.
