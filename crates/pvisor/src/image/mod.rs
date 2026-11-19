@@ -7,3 +7,6 @@ pub(crate) mod store;
 
 #[cfg(unix)]
 pub mod rafs;
+
+#[cfg(unix)]
+pub(crate) mod archive;

@@ -2685,3 +2685,13 @@ the task root after authenticated handoff. The catalog pins the image commit
 with a hardlink; publication fails across filesystems. Each restored execution
 owns private writable layers. Ordinary directory templates keep their existing
 root and workspace device contracts.
+
+### Saving an edited image
+
+`rafs::export_image` saves a quiescent Core merged view as a flattened tar,
+reusing the container archive writer. It records logical UID/GID, permissions,
+nanosecond mtime, supported xattrs and links without changing host ownership.
+The caller retains reader/lower owners, excludes writers and owns output
+publication; export does not consume staged changes. Partial output after an
+error must not be published. Container export keeps its existing metadata profile.
+Host workspace apply continues to use native host ownership permissions.

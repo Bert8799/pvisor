@@ -485,125 +485,13 @@ pub(super) fn copy(
     Ok(())
 }
 
-// Read a logical lower without materializing its complete raw contents on disk.
-struct ImageReader {
-    path: PathBuf,
-    file: File,
-    offset: u64,
-}
-impl io::Read for ImageReader {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        let length = bytes.len().min(crate::image::cache::MAX_READ as usize) as u32;
-        let size = if let Some(body) =
-            pvisor_overlay_core::backend::read_at(&self.path, self.offset, length)?
-        {
-            bytes[..body.len()].copy_from_slice(&body);
-            body.len()
-        } else {
-            use std::os::unix::fs::FileExt;
-            self.file
-                .read_at(&mut bytes[..length as usize], self.offset)?
-        };
-        self.offset += size as u64;
-        Ok(size)
-    }
-}
-
 pub(super) fn export(core: &OverlayCore, output: &Path) -> anyhow::Result<()> {
-    let mut archive = tar::Builder::new(File::create(output)?);
-    let mut links = BTreeMap::new();
-    fn walk(
-        core: &OverlayCore,
-        archive: &mut tar::Builder<File>,
-        rel: &Path,
-        links: &mut BTreeMap<(u64, u64), PathBuf>,
-    ) -> anyhow::Result<()> {
-        let resolved = core.metadata_resolved(rel)?;
-        let m = resolved.metadata;
-        let backing = resolved.resolved.path;
-        let (uid, gid, mode) = identity(&backing, &m)?;
-        ensure!(
-            matches!(mode & 0o170000, 0o100000 | 0o040000 | 0o120000),
-            "unsupported image special file: {}",
-            rel.display()
-        );
-        let mut header = tar::Header::new_gnu();
-        header.set_uid(uid as u64);
-        header.set_gid(gid as u64);
-        header.set_mode(mode & 0o7777);
-        header.set_mtime(m.mtime().max(0) as u64);
-        let name = if rel.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            rel
-        };
-        let mut pax = Vec::new();
-        for key in sys::list_xattrs(&backing)? {
-            let key = OsStr::from_bytes(&key);
-            let text = key.to_string_lossy();
-            ensure!(
-                text != "security.capability",
-                "file capabilities cannot yet be safely exported"
-            );
-            if text.starts_with("user.")
-                && text != "user.containers.override_stat"
-                && !text.starts_with("user.overlay.")
-            {
-                pax.push((
-                    format!("SCHILY.xattr.{text}"),
-                    sys::get_xattr(&backing, key)?,
-                ));
-            }
-        }
-        if !pax.is_empty() {
-            archive.append_pax_extensions(pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())))?;
-        }
-        if m.is_dir() {
-            header.set_entry_type(tar::EntryType::Directory);
-            header.set_size(0);
-            header.set_cksum();
-            archive.append_data(&mut header, name, io::empty())?;
-            for child in core.list_names(rel)? {
-                walk(core, archive, &rel.join(child), links)?;
-            }
-        } else if m.file_type().is_symlink() {
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_size(0);
-            archive.append_link(&mut header, name, fs::read_link(&backing)?)?;
-        } else if m.is_file() {
-            let identity = (m.dev(), m.ino());
-            if m.nlink() > 1 && links.contains_key(&identity) {
-                header.set_entry_type(tar::EntryType::Link);
-                header.set_size(0);
-                archive.append_link(&mut header, name, &links[&identity])?;
-            } else {
-                links.insert(identity, rel.to_path_buf());
-                header.set_size(m.len());
-                header.set_entry_type(tar::EntryType::Regular);
-                header.set_cksum();
-                archive.append_data(
-                    &mut header,
-                    name,
-                    ImageReader {
-                        path: backing.clone(),
-                        offset: 0,
-                        file: OpenOptions::new()
-                            .read(true)
-                            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                            .open(&backing)?,
-                    },
-                )?;
-            }
-        } else {
-            bail!("cannot export special image file: {}", rel.display());
-        }
-        Ok(())
-    }
-    walk(core, &mut archive, Path::new(""), &mut links)?;
-    archive.finish()?;
-    archive.into_inner()?.sync_all()?;
+    let mut file = File::create(output)?;
+    crate::image::archive::write(
+        core,
+        &mut file,
+        crate::image::archive::MetadataProfile::Container(identity),
+    )?;
+    file.sync_all()?;
     Ok(())
 }

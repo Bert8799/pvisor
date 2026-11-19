@@ -641,3 +641,42 @@ impl Metadata {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+/// Save a quiescent merged image as a flattened tar with logical Unix metadata.
+///
+/// UID/GID, permissions, nanosecond mtime, supported xattrs, symlink targets and
+/// regular-file hardlinks are recorded in the archive without host chown. Whiteouts
+/// and internal ownership records are omitted. Existing container exports and
+/// host workspace apply retain their own contracts. No per-VM cache is allocated.
+///
+/// Retain every lower/reader owner and exclude all writers for the entire call.
+/// `output` must be independent of the source trees. This call neither applies
+/// nor consumes staged changes and does not freeze a VM or publish an image.
+/// The caller owns output flushing/publication; an error can leave partial bytes.
+/// Security capabilities, stored overlay-control xattrs, non-UTF-8 xattr names,
+/// negative timestamps and special files are rejected rather than approximated.
+///
+/// ```
+/// use std::{fs, path::Path};
+/// use pvisor_overlay_core::OverlayCore;
+/// let temp = tempfile::tempdir()?;
+/// let lower = temp.path().join("lower");
+/// fs::create_dir(&lower)?;
+/// fs::write(lower.join("file"), b"image bytes")?;
+/// let core = OverlayCore::new(vec![lower], temp.path().join("upper"), None)?;
+/// let mut archive = Vec::new();
+/// pvisor::rafs::export_image(&core, &mut archive)?;
+/// assert!(archive.len() >= 1024);
+/// assert_eq!(fs::read(core.metadata_resolved(Path::new("file"))?.resolved.path)?, b"image bytes");
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn export_image(
+    core: &pvisor_overlay_core::OverlayCore,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    crate::image::archive::write(
+        core,
+        output,
+        crate::image::archive::MetadataProfile::LogicalImage,
+    )
+}
