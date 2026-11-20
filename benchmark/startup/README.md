@@ -43,6 +43,58 @@ bounded output and deadlines. Failure retains evidence and cleans owned process
 groups. Disposable disks are removed only after successful validation; Docker
 cleanup requires exact cohort ownership labels.
 
+## Frozen CLI version comparisons
+
+`startup/revision` implements B-STARTUP-REVISION-ENG for ordinary, template and local RAFS VM startup.
+Use the same release build options, frozen userspace and firmware for both
+versions, and retain the source/build receipt beside the engineering evidence.
+Each invocation accepts exactly one binary and one typed source profile:
+
+```sh
+PVISOR_BENCH_REVISION_ROOTFS=/prepared/rootfs \
+PVISOR_BENCH_FIRMWARE=/prepared/libkrunfw.so.5 \
+PVISOR_BENCH_CPUS=0,1 \
+mise run benchmark -- startup/revision --binary /prepared/baseline/pvisor \
+  --output /absolute/path/target/.data/baseline \
+  --criterion-output /absolute/path/target/.data/criterion -- --save-baseline baseline
+```
+
+Repeat with the candidate binary, a new evidence directory and `--baseline
+baseline`. Paths must be absolute and available outside `/tmp`, which is private
+inside the worker. Linux user/mount/PID namespaces and `pivot_root`, KVM, `mount`
+and `unshare` are required. The harness copies the executable and firmware into
+its owned temporary root before timing, uses a fresh stage/Run store per
+operation and automatically destroys owned processes when the namespace exits.
+No existing Host or Daemon is stopped or reused; no shared memory pool is enabled.
+
+`PVISOR_BENCH_REVISION_SOURCE` selects `directory` (default), `template` or
+`rafs-local`. Every profile uses automatic networking, 2 vCPU / 128 MiB and the
+same shell Ready workload. For a fair matrix, the ordinary/template rootfs must
+be the exact native tree used to publish the RAFS image. `rafs-local` additionally
+requires `PVISOR_BENCH_RAFS_STORE`, `PVISOR_BENCH_RAFS_HANDLE` and
+`PVISOR_BENCH_RAFS_READER`; it validates the authenticated publication inventory
+against the reference rootfs before sampling (bytes, modes, namespace-mapped
+ownership, mtime, symlinks and hardlinks). This fixture profile requires no xattrs;
+unsupported inputs fail rather than silently dropping attributes.
+
+The template profile prepares a fresh immutable generation using the selected
+CLI's embedded guest before timing. `template-preparation.json` records that
+one-time cost separately. Each measured invocation restores a fresh instance;
+no live VM is reused. Source checks retain inode/content/permission/mtime and
+complete inventory checks. Directory ctime may change when SnapshotStore
+reapplies its existing permissions; reference-rootfs and file ctime checks stay
+strict. Local RAFS starts a fresh reader per invocation over already published
+blobs. Its result does not measure cold network pulls or shared-node caching.
+Publication, template preparation and source hashing remain outside Ready/Exit.
+
+Ready and Exit each use 60 Flat Criterion samples, following preflight and three
+correctness warmups. Calibration can add operations. `statistics-ready.json` and
+`statistics-exit.json` report median, mean, sample standard deviation, minimum
+and maximum from formal **operations**, uniquely joined to saved Criterion
+samples; ambiguous matching fails. Both clocks remain in every raw operation.
+Independent version calls are engineering comparisons, without paired causal
+confidence intervals. Preserve slow valid samples and failed cohorts.
+
 ## Image and same-stage comparisons {#stage-lazy}
 
 Select `startup/image_compare.json`, `startup/image_lazy_compare.json` or

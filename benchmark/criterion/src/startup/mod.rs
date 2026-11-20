@@ -9,6 +9,7 @@ mod evidence;
 mod images;
 mod observer;
 mod prepared;
+mod revision;
 mod subjects;
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,10 @@ use std::{env, path::PathBuf, time::Duration};
 /// overwrites entry environment variables. `None` means an ordinary CLI turn;
 /// `Some(code)` means the owned worker finished and the caller should exit.
 pub fn worker_dispatch() -> Option<i32> {
+    if let Err(error) = revision::enter_worker() {
+        eprintln!("revision namespace setup: {error:#}");
+        return Some(1);
+    }
     images::worker_dispatch()
 }
 
@@ -41,6 +46,9 @@ fn register_checked(criterion: &mut Criterion) -> Result<()> {
         "image_compare.json" | "image_lazy_compare.json" | "stage_lazy_compare.json"
     ) {
         return images::register(criterion);
+    }
+    if name == "revision.json" {
+        return revision::register(criterion);
     }
     let backends = if name == "timing.json" {
         subjects::BACKENDS.to_vec()

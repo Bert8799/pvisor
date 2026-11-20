@@ -57,7 +57,7 @@ B-STARTUP,user-facing,startup/fc_system_timing.json,criterion-rust,criterion/src
 B-STARTUP,user-facing,startup/qemu_timing.json,criterion-rust,criterion/src/startup/mod.rs
 B-STARTUP,user-facing,startup/qemu_microvm_timing.json,criterion-rust,criterion/src/startup/mod.rs
 B-STARTUP,user-facing,startup/timing.json,criterion-rust,criterion/src/startup/mod.rs
-B-STARTUP-REVISION-ENG,engineering A/B,startup/revision.json,requires-single-condition-command,
+B-STARTUP-REVISION-ENG,engineering A/B,startup/revision.json,criterion-rust,criterion/src/startup/revision.rs
 B-SWE-RESIDENT-ENG,engineering A/B,agent/swe_resident.json,requires-single-condition-command,
 B-IMAGE-STORAGE-ENG,engineering A/B,storage/image_storage.json,criterion-rust,criterion/src/storage/mod.rs
 B-IMAGE-FORMAT-ENG,engineering A/B,storage/image_format.json,criterion-rust,criterion/src/storage/mod.rs

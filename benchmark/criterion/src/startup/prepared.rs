@@ -18,9 +18,9 @@ use std::{
 
 const CANARY: &[u8] = b"unchanged startup input\n";
 
-struct Affinity(libc::cpu_set_t);
+pub(super) struct Affinity(libc::cpu_set_t);
 impl Affinity {
-    fn set(request: Option<String>) -> Result<(Self, String)> {
+    pub(super) fn set(request: Option<String>) -> Result<(Self, String)> {
         let mut original: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         ensure!(
             unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&original), &mut original) }

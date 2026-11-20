@@ -36,9 +36,9 @@ class CriterionRegistrationContracts(unittest.TestCase):
             if line.startswith("### B-")
         } - {"B-OVERVIEW / B-METHOD", "B-COMPARE", "B-CLUSTER"}
         self.assertEqual({row["benchmark_id"] for row in rows}, expected_ids)
-        self.assertEqual(sum(row["status"] == "criterion-rust" for row in rows), 30)
+        self.assertEqual(sum(row["status"] == "criterion-rust" for row in rows), 31)
         self.assertEqual(
-            sum(row["status"] == "requires-single-condition-command" for row in rows), 33
+            sum(row["status"] == "requires-single-condition-command" for row in rows), 32
         )
         for row in rows:
             with self.subTest(entry=row["entry"]):
@@ -67,7 +67,7 @@ class CriterionRegistrationContracts(unittest.TestCase):
                         )
                     )
 
-    def test_all_thirty_active_descriptors_point_to_rust_not_python_commands(self):
+    def test_all_active_descriptors_point_to_rust_not_python_commands(self):
         _, rows = registry()
         for row in rows:
             if row["status"] != "criterion-rust":

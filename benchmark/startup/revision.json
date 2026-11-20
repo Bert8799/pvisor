@@ -1,4 +1,14 @@
 {
-  "baseline": {"Ready median ms": null, "Exit median ms": null},
-  "candidate": {"Ready median ms": null, "Exit median ms": null}
+  "engine": "criterion",
+  "entry": "startup/revision.json",
+  "implementation": "../criterion/src/startup/revision.rs",
+  "config_env": [
+    "PVISOR_BENCH_REVISION_SOURCE",
+    "PVISOR_BENCH_REVISION_ROOTFS",
+    "PVISOR_BENCH_FIRMWARE",
+    "PVISOR_BENCH_CPUS",
+    "PVISOR_BENCH_RAFS_STORE",
+    "PVISOR_BENCH_RAFS_HANDLE",
+    "PVISOR_BENCH_RAFS_READER"
+  ]
 }

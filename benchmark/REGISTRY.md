@@ -10,8 +10,8 @@
 本地制品清理后，历史来源清单不再代表可在本机完整复核原始测量。
 
 **活动测量实现：** `registry.csv` 的 `entry` 保留原实验键，新增 `implementation`
-指向 Rust/Criterion 注册模块。30 个原活动入口使用锁定的 Criterion 0.7.0；
-33 个 `requires-single-condition-command` 条目仍拒绝执行。以下设计说明保留原协议、
+指向 Rust/Criterion 注册模块。31 个入口使用锁定的 Criterion 0.7.0；
+32 个 `requires-single-condition-command` 条目仍拒绝执行。以下设计说明保留原协议、
 旧 Python 文件名和固定计数，作为实验出处及历史口径，不再是可执行入口。
 当前采样由 Criterion 自适应控制，统计样本不等于操作次数；必要预热、随机 pair、
 正确性、隔离与原始证据要求不因采样迁移而取消。新 cohort 不与旧计时器合并。
@@ -794,6 +794,14 @@ Design: 负载、对照、控制变量与有效样本判据。
 
 
 ### B-STARTUP-REVISION-ENG：提交版本的启动与收尾对照 {#b-startup-revision-eng}
+
+- **当前入口：** `startup/revision.json`，Rust/Criterion 实现为 `criterion/src/startup/revision.rs`。每次接受一个 `--binary` 和显式的 `directory`、`template` 或 `rafs-local` 条件；各条件独立保存。Host、远端冷节点与共享节点结果不冒充本地 RAFS 条件。
+- **当前协议：** 相同构建参数、原始用户态文件、固件、自动网络、两颗宿主 CPU、2 vCPU / 128 MiB；使用 B-STARTUP 的 shell Ready 负载和同一 Rust observer。预检和三次正确性预热后，Ready、Exit 各使用 Flat 60 个 Criterion 统计样本。每次操作保留两个原始时钟；每条统计流运行新的操作。私有 user/mount/PID namespace 与私有根目录隔离服务，namespace 退出自动销毁自有进程。所有操作验证输出、零退出、VM Bundle、暂存 upper、canary 与输入不变。
+- **统计边界：** Criterion 校准和预热也会调用操作，不能称为恰好 60 次 CLI。用保存样本的迭代数/时长唯一匹配 callback，单列正式操作的中位数、均值、样本标准差、最小/最大值。独立版本调用属于工程回归对照，不提供随机配对因果区间，不与历史固定次数 cohort 混合。
+- **条件准备：** 模板通过指定 CLI 的内置 guest 在计时前创建，单独保留准备耗时；每次恢复新的私有 COW 实例。本地 RAFS 显式绑定固定 handle/reader，在采样前将认证发布清单与普通 rootfs 的文件内容及属性核对；该工程夹具遇到 xattr 输入会明确拒绝。镜像发布、模板制作、输入校验都不计入 Ready/Exit。完整来源清单保持不变；SnapshotStore 打开时对目录重复设置相同权限造成的纯 ctime 更新不算输入内容改变，文件身份/时钟和目录内容/权限/mtime 仍校验。
+- **当前证据：** 新的 `.data/` 目录（可在 `target/` 中），保存源码、二进制/固件摘要、输入清单、逐次原始输出、时钟、Criterion 样本映射及 namespace 清理结果。源码到制品的对应关系由单独构建收据证明；测量时不构建、不下载，不修改用户水位。
+
+以下为历史固定次数设计，不能用当前 Criterion 结果声称已经满足：
 
 - **角色：** engineering A/B；结果独立保存在 `benchmark/startup/.data/`，不更新用户启动水位。
 - **Motivation：** 定位指定提交与父提交或已归档历史版本是否改变首条有效输出和正常退出等待。

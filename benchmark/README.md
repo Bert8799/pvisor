@@ -6,17 +6,17 @@
 ## 活动范围与入口
 
 [registry.csv](registry.csv) 的 63 个键保留原有身份；`implementation` 指向当前 Rust
-实现。30 个原活动入口迁入 [criterion/](criterion/README.md)，33 个原未准备条目仍为
+实现。31 个入口由 [criterion/](criterion/README.md) 执行，32 个未准备条目仍为
 `requires-single-condition-command`，在执行任何实验之前拒绝测量。`criterion-rust`
 表示已有实现，不表示当前机器具备 KVM、macOS、固件、镜像、委派 cgroup 等实验前提。
 JSON 仅为非执行的定位信息，Markdown 仅说明设计；不再通过 Markdown/JSON 运行 Python
 行命令。历史退役脚本不因仍存在于 checkout 而成为活动入口。
 逐入口实现、smoke 与未验证环境清单见 [MIGRATION.md](MIGRATION.md)。
 
-| 实验族 | 原活动键数 | Rust 实现与复现手册 |
+| 实验族 | 已实现键数 | Rust 实现与复现手册 |
 | --- | ---: | --- |
 | Process smoke/nightly | 2 | [`process.rs`](criterion/src/process.rs)、[smoke](process/smoke.md) |
-| Ready/Exit 与三种镜像对照 | 12 | [`startup/`](criterion/src/startup/mod.rs)、[startup README](startup/README.md) |
+| Ready/Exit、版本与三种镜像对照 | 13 | [`startup/`](criterion/src/startup/mod.rs)、[startup README](startup/README.md) |
 | 原生文件、九运行时与 DAX | 3 | [`filesystem/`](criterion/src/filesystem/mod.rs)、[filesystem README](filesystem/README.md) |
 | 网络 profile A/B | 1 | [`network/`](criterion/src/network/mod.rs)、[network README](network/README.md) |
 | 七种轨迹格式准备 | 1 | [`replay/`](criterion/src/replay/mod.rs)、[replay README](replay/README.md) |

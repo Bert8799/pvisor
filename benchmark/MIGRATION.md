@@ -4,7 +4,7 @@ This is an engineering workflow inventory, not a new performance publication.
 The source of entry identity/readiness remains `registry.csv`. Historical
 measurements, raw data, public tables and approval records are not changed.
 
-## Thirty implemented entries
+## Thirty-one implemented entries
 
 All entries below route to the standalone Rust crate pinned to Criterion 0.7.0.
 “Contracts” means compilation and bounded fixture/validator/lifecycle tests,
@@ -30,6 +30,7 @@ silently skipped or reported as zero samples.
 | `memory/scanner_compare.json` | `src/memory/` | SDK report/placement/lifecycle contracts; real scanner VM cohort unrun |
 | `memory/pool_compare.json` | `src/memory/` | Native fixture/probe/preparation contracts; real memory/cgroup cohort unrun |
 | `memory/library_compare.json` | `src/memory/` | Native dlopen/oracle/preparation contracts; real DAX/PTE/VM cohort unrun |
+| `startup/revision.json` | `src/startup/revision.rs` | One frozen CLI/source condition per invocation; ordinary/template/local RAFS profiles, private namespace cleanup, correctness and exact Criterion/raw-operation mapping |
 | `startup/pvisor_vm_timing.json` | `src/startup/` | Ready/Exit contracts; real firmware/KVM backend unrun |
 | `process/smoke.md` | `src/process.rs` | Actual four-condition Criterion workflow smoke using debug product; not release performance evidence |
 | `process/nightly.md` | `src/process.rs` | Shared implementation/contracts; larger formal nightly run intentionally unrun |
@@ -51,9 +52,9 @@ Product-linked probes are behind `vm-probes`, so default tool tests do not build
 unrelated product crates. Linux and macOS capabilities are explicit in family
 READMEs; Linux tests do not qualify Apple Silicon or stock-kernel/DAX behavior.
 
-## Thirty-three intentionally unprepared entries
+## Thirty-two intentionally unprepared entries
 
-These were unprepared before the migration and remain rejected before execution.
+These entries remain unprepared and are rejected before execution.
 No arbitrary workload or old summary has been substituted.
 
 | Benchmark ID | Registry entry |
@@ -89,7 +90,6 @@ No arbitrary workload or old summary has been substituted.
 | B-COLD-STORAGE-DIAG | `memory/cold_storage.json` |
 | B-MACOS | `agent/macos.json` |
 | B-MACOS-ENG | `agent/macos_ab.json` |
-| B-STARTUP-REVISION-ENG | `startup/revision.json` |
 | B-SWE-RESIDENT-ENG | `agent/swe_resident.json` |
 
 ## Statistical and publication boundary
