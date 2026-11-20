@@ -21,7 +21,7 @@ impl Source {
     pub fn prepare(
         binary: &Path,
         rootfs: &Path,
-        firmware: &Path,
+        firmware: Option<&Path>,
         output: &Path,
         private: &Path,
     ) -> Result<Self> {
@@ -40,10 +40,12 @@ impl Source {
                     .arg(&catalog)
                     .arg("--work-dir")
                     .arg(private)
-                    .args(["--cpus", "2", "--memory-mib", "128", "--library-dir"])
-                    .arg(firmware)
+                    .args(["--cpus", "2", "--memory-mib", "128"])
                     .env("PVISOR_KRUN_ENOMEM_WORKAROUND", "0")
                     .env("PVISOR_STARTUP_PROFILE", "0");
+                if let Some(firmware) = firmware {
+                    command.arg("--library-dir").arg(firmware);
+                }
                 let result = crate::command::observe(&mut command, Duration::from_secs(120))?;
                 save(output.join("template-preparation.json"), &result)?;
                 ensure!(

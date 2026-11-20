@@ -46,13 +46,16 @@ cleanup requires exact cohort ownership labels.
 ## Frozen CLI version comparisons
 
 `startup/revision` implements B-STARTUP-REVISION-ENG for ordinary, template and local RAFS VM startup.
-Use the same release build options, frozen userspace and firmware for both
-versions, and retain the source/build receipt beside the engineering evidence.
+Build each source revision with the upstream product entry,
+`mise run build release product`, without changing its target, features or firmware
+selection. On Linux x86_64 this produces the static musl executable. Retain the
+source archive, build log and `libkrunfw.SOURCE` beside each frozen binary; require
+the same firmware identity across compared revisions. Dynamic GNU builds are a
+separate experiment, not a replacement for the default product configuration.
 Each invocation accepts exactly one binary and one typed source profile:
 
 ```sh
 PVISOR_BENCH_REVISION_ROOTFS=/prepared/rootfs \
-PVISOR_BENCH_FIRMWARE=/prepared/libkrunfw.so.5 \
 PVISOR_BENCH_CPUS=0,1 \
 mise run benchmark -- startup/revision --binary /prepared/baseline/pvisor \
   --output /absolute/path/target/.data/baseline \
@@ -60,18 +63,27 @@ mise run benchmark -- startup/revision --binary /prepared/baseline/pvisor \
 ```
 
 Repeat with the candidate binary, a new evidence directory and `--baseline
-baseline`. Paths must be absolute and available outside `/tmp`, which is private
-inside the worker. Linux user/mount/PID namespaces and `pivot_root`, KVM, `mount`
+baseline`. The default embedded-firmware mode requires the official
+`libkrunfw.SOURCE` next to the binary. For a separately labelled dynamic experiment,
+set `PVISOR_BENCH_FIRMWARE` to the frozen library; all compared arms must use that
+same build and firmware mode. Paths must be absolute and available outside `/tmp`,
+which is private inside the worker. Linux user/mount/PID namespaces and `pivot_root`, KVM, `mount`
 and `unshare` are required. The harness copies the executable and firmware into
 its owned temporary root before timing, uses a fresh stage/Run store per
 operation and automatically destroys owned processes when the namespace exits.
 No existing Host or Daemon is stopped or reused; no shared memory pool is enabled.
+Unset product tuning variables before invoking compared versions; keep the same
+shell environment and record it with the build and experiment receipts.
 
 `PVISOR_BENCH_REVISION_SOURCE` selects `directory` (default), `template` or
 `rafs-local`. Every profile uses automatic networking, 2 vCPU / 128 MiB and the
-same shell Ready workload. For a fair matrix, the ordinary/template rootfs must
-be the exact native tree used to publish the RAFS image. `rafs-local` additionally
-requires `PVISOR_BENCH_RAFS_STORE`, `PVISOR_BENCH_RAFS_HANDLE` and
+same shell Ready workload. Before Ready, the shell reads and prints a fresh token
+from the workspace and prints its instance identity. A template must supply a
+nonempty restored identity. Each operation checks the token, ordering and unchanged
+workspace. Freeze the same small prepared rootfs for ordinary/template comparisons;
+do not add a runtime or enlarge that input just to accommodate a separate image test.
+An ordinary/RAFS comparison instead requires the exact native tree used to publish
+that image. `rafs-local` additionally requires `PVISOR_BENCH_RAFS_STORE`, `PVISOR_BENCH_RAFS_HANDLE` and
 `PVISOR_BENCH_RAFS_READER`; it validates the authenticated publication inventory
 against the reference rootfs before sampling (bytes, modes, namespace-mapped
 ownership, mtime, symlinks and hardlinks). This fixture profile requires no xattrs;
@@ -85,7 +97,9 @@ complete inventory checks. Directory ctime may change when SnapshotStore
 reapplies its existing permissions; reference-rootfs and file ctime checks stay
 strict. Local RAFS starts a fresh reader per invocation over already published
 blobs. Its result does not measure cold network pulls or shared-node caching.
-Publication, template preparation and source hashing remain outside Ready/Exit.
+Publication, template preparation and the harness's input checks remain outside
+Ready/Exit. The product's own startup authentication and validation stay inside
+the measured CLI invocation, including template file and RAM verification.
 
 Ready and Exit each use 60 Flat Criterion samples, following preflight and three
 correctness warmups. Calibration can add operations. `statistics-ready.json` and
@@ -93,7 +107,16 @@ correctness warmups. Calibration can add operations. `statistics-ready.json` and
 and maximum from formal **operations**, uniquely joined to saved Criterion
 samples; ambiguous matching fails. Both clocks remain in every raw operation.
 Independent version calls are engineering comparisons, without paired causal
-confidence intervals. Preserve slow valid samples and failed cohorts.
+confidence intervals. Repeat the full comparison in reverse order to check temporal
+drift; report each cohort separately. Use the same CPUs, keep their SMT siblings
+idle and record host load before measuring. Do not build subjects or run tests
+during sampling. Preserve slow valid samples and failed cohorts.
+
+For phase diagnosis only, set `PVISOR_BENCH_REVISION_DIAGNOSTIC=1`. This runs
+three checked operations with startup tracing enabled and returns
+`diagnostic-complete`, without registering Criterion samples. Keep those results
+separate from uninstrumented performance cohorts; absent phases are not zero-cost
+measurements. Formal sampling explicitly disables startup tracing.
 
 ## Image and same-stage comparisons {#stage-lazy}
 

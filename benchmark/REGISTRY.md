@@ -796,10 +796,11 @@ Design: 负载、对照、控制变量与有效样本判据。
 ### B-STARTUP-REVISION-ENG：提交版本的启动与收尾对照 {#b-startup-revision-eng}
 
 - **当前入口：** `startup/revision.json`，Rust/Criterion 实现为 `criterion/src/startup/revision.rs`。每次接受一个 `--binary` 和显式的 `directory`、`template` 或 `rafs-local` 条件；各条件独立保存。Host、远端冷节点与共享节点结果不冒充本地 RAFS 条件。
-- **当前协议：** 相同构建参数、原始用户态文件、固件、自动网络、两颗宿主 CPU、2 vCPU / 128 MiB；使用 B-STARTUP 的 shell Ready 负载和同一 Rust observer。预检和三次正确性预热后，Ready、Exit 各使用 Flat 60 个 Criterion 统计样本。每次操作保留两个原始时钟；每条统计流运行新的操作。私有 user/mount/PID namespace 与私有根目录隔离服务，namespace 退出自动销毁自有进程。所有操作验证输出、零退出、VM Bundle、暂存 upper、canary 与输入不变。
+- **当前协议：** 各版本通过上游默认 `mise run build release product` 构建，不改 target、features 或固件选择，保留构建日志与源码收据。Linux x86_64 默认 musl 静态内嵌固件，须附相同固件身份的 `libkrunfw.SOURCE`；显式动态固件构建另列 cohort。冻结相同小型用户态目录、自动网络、两颗宿主 CPU、2 vCPU / 128 MiB；shell 在 Ready 前读取并输出每次新建的工作区 token 和实例身份，模板必须提供恢复实例身份。沿用同一 Rust observer。预检和三次正确性预热后，Ready、Exit 各使用 Flat 60 个 Criterion 统计样本。每次操作保留两个原始时钟；每条统计流运行新的操作。私有 user/mount/PID namespace 与私有根目录隔离服务，namespace 退出自动销毁自有进程。所有操作验证输出、零退出、VM Bundle、暂存 upper、canary 与输入不变。
 - **统计边界：** Criterion 校准和预热也会调用操作，不能称为恰好 60 次 CLI。用保存样本的迭代数/时长唯一匹配 callback，单列正式操作的中位数、均值、样本标准差、最小/最大值。独立版本调用属于工程回归对照，不提供随机配对因果区间，不与历史固定次数 cohort 混合。
 - **条件准备：** 模板通过指定 CLI 的内置 guest 在计时前创建，单独保留准备耗时；每次恢复新的私有 COW 实例。本地 RAFS 显式绑定固定 handle/reader，在采样前将认证发布清单与普通 rootfs 的文件内容及属性核对；该工程夹具遇到 xattr 输入会明确拒绝。镜像发布、模板制作、输入校验都不计入 Ready/Exit。完整来源清单保持不变；SnapshotStore 打开时对目录重复设置相同权限造成的纯 ctime 更新不算输入内容改变，文件身份/时钟和目录内容/权限/mtime 仍校验。
 - **当前证据：** 新的 `.data/` 目录（可在 `target/` 中），保存源码、二进制/固件摘要、输入清单、逐次原始输出、时钟、Criterion 样本映射及 namespace 清理结果。源码到制品的对应关系由单独构建收据证明；测量时不构建、不下载，不修改用户水位。
+- **顺序与诊断：** 同样条件按相反顺序再跑一轮，各轮独立报告，检查时间漂移；固定 CPU 并保持 SMT 同胞空闲。`PVISOR_BENCH_REVISION_DIAGNOSTIC=1` 只做三次带阶段日志的正确性运行，不生成性能统计样本；正式 cohort 关闭插桩，缺失阶段不记作零耗时。
 
 以下为历史固定次数设计，不能用当前 Criterion 结果声称已经满足：
 

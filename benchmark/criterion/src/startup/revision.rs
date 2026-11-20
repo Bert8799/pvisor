@@ -8,7 +8,6 @@ use super::{
     evidence::{self, digest, read, save},
     observer::{self, Observation},
     prepared::Affinity,
-    subjects::PAYLOAD,
 };
 use anyhow::{Context, Result, ensure};
 use criterion::{Criterion, SamplingMode};
@@ -23,6 +22,7 @@ use std::{
 };
 
 const WORKER: &str = "PVISOR_BENCH_REVISION_WORKER";
+const PAYLOAD: &str = "IFS= read -r token < startup-token || exit 81; printf 'REFERENCE_TOKEN %s\\n' \"$token\"; printf 'REFERENCE_INSTANCE %s\\n' \"${PVISOR_INSTANCE_ID:-cold}\"; printf 'REFERENCE_READY\\nREFERENCE_RESULT {\"mode\":\"ready\",\"correctness\":\"passed\"}\\n'";
 const CANARY: &[u8] = b"unchanged startup input\n";
 
 struct Namespace(Option<Child>);
@@ -260,11 +260,12 @@ struct Cohort {
     output: PathBuf,
     binary: PathBuf,
     rootfs: PathBuf,
-    firmware: PathBuf,
+    firmware: Option<PathBuf>,
     artifacts: BTreeMap<PathBuf, String>,
     inputs: BTreeMap<PathBuf, Value>,
     observations: Vec<Observation>,
     source: source::Source,
+    diagnostic: bool,
 }
 impl Cohort {
     fn check_inputs(&self) -> Result<()> {
@@ -288,6 +289,14 @@ impl Cohort {
             fs::create_dir(directory.join(name))?;
         }
         fs::write(directory.join("workspace/startup-canary"), CANARY)?;
+        use std::io::Read;
+        let mut entropy = [0u8; 16];
+        fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+        let token: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(
+            directory.join("workspace/startup-token"),
+            format!("{token}\n"),
+        )?;
         fs::write(directory.join("config.toml"), &self.source.config)?;
         let path = |name: &str| directory.join(name).to_string_lossy().into_owned();
         let mut argv = vec![
@@ -305,8 +314,6 @@ impl Cohort {
             "--stage".into(),
             path("stage"),
             "--vm".into(),
-            "--vm-library-dir".into(),
-            self.firmware.display().to_string(),
             "--cpu".into(),
             "2".into(),
             "--memory".into(),
@@ -316,6 +323,16 @@ impl Cohort {
             "-c".into(),
             PAYLOAD.into(),
         ];
+        if let Some(firmware) = &self.firmware {
+            let command = argv
+                .iter()
+                .position(|s| s == "--")
+                .context("workload delimiter")?;
+            argv.splice(
+                command..command,
+                ["--vm-library-dir".into(), firmware.display().to_string()],
+            );
+        }
         if let Some(rootfs) = &self.source.rootfs {
             let command = argv
                 .iter()
@@ -329,8 +346,14 @@ impl Cohort {
         let environment = BTreeMap::from([
             ("PVISOR_RUN_HOME".into(), path("runs")),
             ("PVISOR_KRUN_ENOMEM_WORKAROUND".into(), "0".into()),
-            ("PVISOR_STARTUP_TIMING".into(), "0".into()),
-            ("PVISOR_STARTUP_PROFILE".into(), "0".into()),
+            (
+                "PVISOR_STARTUP_TIMING".into(),
+                if self.diagnostic { "1" } else { "0" }.into(),
+            ),
+            (
+                "PVISOR_STARTUP_PROFILE".into(),
+                if self.diagnostic { "1" } else { "0" }.into(),
+            ),
             ("PVISOR_FS_PROFILE".into(), "0".into()),
             ("XDG_RUNTIME_DIR".into(), "/tmp/pvisor-revision".into()),
         ]);
@@ -351,6 +374,16 @@ impl Cohort {
             ensure!(
                 fs::read(directory.join("workspace/startup-canary"))? == CANARY,
                 "canary changed"
+            );
+            validate_probe(
+                &fs::read_to_string(directory.join("stdout"))?,
+                &token,
+                self.source.name == "template",
+            )?;
+            ensure!(
+                fs::read_to_string(directory.join("workspace/startup-token"))?
+                    == format!("{token}\n"),
+                "workspace token changed"
             );
             let bundle = read(directory.join("stage/run-bundle.json"))?;
             validate_bundle(&bundle)?;
@@ -379,6 +412,43 @@ impl Cohort {
     }
 }
 
+fn validate_probe(stdout: &str, token: &str, template: bool) -> Result<()> {
+    let tokens: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("REFERENCE_TOKEN "))
+        .collect();
+    let instances: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("REFERENCE_INSTANCE "))
+        .collect();
+    ensure!(tokens == [token], "wrong or duplicate workspace token");
+    ensure!(
+        instances.len() == 1 && !instances[0].is_empty(),
+        "missing or duplicate instance identity"
+    );
+    if template {
+        ensure!(
+            instances[0] != "cold",
+            "template did not deliver instance identity"
+        );
+    }
+    let ready = stdout
+        .lines()
+        .position(|line| line == "REFERENCE_READY")
+        .context("missing Ready")?;
+    for prefix in ["REFERENCE_TOKEN ", "REFERENCE_INSTANCE "] {
+        ensure!(
+            stdout
+                .lines()
+                .position(|line| line.starts_with(prefix))
+                .unwrap()
+                < ready,
+            "probe must finish before Ready"
+        );
+    }
+    Ok(())
+}
+
 fn validate_bundle(bundle: &Value) -> Result<()> {
     ensure!(
         bundle["run"]["state"] == "completed"
@@ -401,43 +471,66 @@ fn run(criterion: &mut Criterion, output: &Path) -> Result<()> {
     )?;
     let source_binary = required_path("PVISOR_BENCH_BINARY")?;
     let rootfs = required_path("PVISOR_BENCH_REVISION_ROOTFS")?;
-    let source_firmware = required_path("PVISOR_BENCH_FIRMWARE")?;
+    let source_firmware = env::var_os("PVISOR_BENCH_FIRMWARE")
+        .map(|_| required_path("PVISOR_BENCH_FIRMWARE"))
+        .transpose()?;
     let private = Path::new("/tmp/pvisor-revision");
     fs::create_dir(private)?;
     fs::set_permissions(private, fs::Permissions::from_mode(0o700))?;
     let binary = private.join("pvisor");
     fs::copy(&source_binary, &binary)?;
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
-    let firmware = private.join("firmware");
-    fs::create_dir(&firmware)?;
-    fs::copy(&source_firmware, firmware.join("libkrunfw.so.5"))?;
     let mut artifacts = BTreeMap::new();
-    for path in [
-        &source_binary,
-        &binary,
-        &source_firmware,
-        &firmware.join("libkrunfw.so.5"),
-    ] {
+    for path in [&source_binary, &binary] {
         artifacts.insert(path.clone(), digest(path)?);
     }
     ensure!(
         digest(&source_binary)? == digest(&binary)?,
         "executable copy differs"
     );
-    ensure!(
-        digest(&source_firmware)? == digest(&firmware.join("libkrunfw.so.5"))?,
-        "firmware copy differs"
-    );
+    let firmware = if let Some(source) = &source_firmware {
+        let directory = private.join("firmware");
+        fs::create_dir(&directory)?;
+        let copy = directory.join("libkrunfw.so.5");
+        fs::copy(source, &copy)?;
+        ensure!(digest(source)? == digest(&copy)?, "firmware copy differs");
+        artifacts.insert(source.clone(), digest(source)?);
+        artifacts.insert(copy.clone(), digest(&copy)?);
+        Some(directory)
+    } else {
+        let receipt = source_binary
+            .parent()
+            .context("binary directory")?
+            .join("libkrunfw.SOURCE");
+        let provenance = read(&receipt)?;
+        ensure!(
+            provenance["firmware_sha256"].as_str().is_some(),
+            "embedded firmware requires the official libkrunfw.SOURCE receipt"
+        );
+        artifacts.insert(receipt.clone(), digest(&receipt)?);
+        save(output.join("embedded-firmware.json"), &provenance)?;
+        None
+    };
+    let diagnostic = match env::var("PVISOR_BENCH_REVISION_DIAGNOSTIC").as_deref() {
+        Ok("1") => true,
+        Err(env::VarError::NotPresent) => false,
+        _ => anyhow::bail!("diagnostic selector must be absent or 1"),
+    };
     let inputs = tree(&rootfs)?;
     save(output.join("inputs.json"), &inputs)?;
     let executable = env::current_exe()?;
+    let sampling = if diagnostic {
+        "diagnostic only; 3 checked operations; no statistical samples"
+    } else {
+        "Criterion 0.7.0; Flat; 60 statistical samples per metric; operations include calibration"
+    };
     save(
         output.join("provenance.json"),
         &json!({"source_binary":source_binary,"source_firmware":source_firmware,
         "artifacts":artifacts,"rootfs":rootfs,"host_cpus":cpus,"guest_cpus":2,"guest_memory_mib":128,
-        "payload":PAYLOAD,"harness_binary_sha256":digest(&executable)?,
+        "payload":PAYLOAD,"instrumented":diagnostic,"harness_binary_sha256":digest(&executable)?,
         "host_kernel":Command::new("uname").arg("-a").output()?.stdout,
-        "sampling":"Criterion 0.7.0; Flat; 60 statistical samples per metric; operations include calibration",
+        "sampling":sampling,
         "clock":"shared observer; immediately before spawn to complete Ready line and normal zero exit",
         "build_correspondence":"external build receipt required; binary digest alone does not prove source origin",
         "environment": (["PATH","LD_LIBRARY_PATH","LANG","TZ","PVISOR_BENCH_CPUS"].into_iter().map(|key| (key,env::var(key).ok())).collect::<BTreeMap<_,_>>())}),
@@ -455,7 +548,7 @@ fn run(criterion: &mut Criterion, output: &Path) -> Result<()> {
     ] {
         fs::write(frozen.join(name), source)?;
     }
-    let source = source::Source::prepare(&binary, &rootfs, &firmware, output, private)?;
+    let source = source::Source::prepare(&binary, &rootfs, firmware.as_deref(), output, private)?;
     let mut cohort = Cohort {
         output: output.to_path_buf(),
         binary,
@@ -465,7 +558,17 @@ fn run(criterion: &mut Criterion, output: &Path) -> Result<()> {
         inputs,
         observations: Vec::new(),
         source,
+        diagnostic,
     };
+    if diagnostic {
+        for _ in 0..3 {
+            cohort.trial("diagnostic")?;
+        }
+        return save(
+            output.join("status.json"),
+            &json!({"status":"diagnostic-complete","operations":cohort.observations.len(),"performance_cohort":false}),
+        );
+    }
     cohort.trial("preflight")?;
     for _ in 0..3 {
         cohort.trial("protocol-warmup")?;
@@ -518,6 +621,25 @@ fn run(criterion: &mut Criterion, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_probe_rejects_wrong_tokens_stale_templates_and_wrong_order() {
+        let valid = "REFERENCE_TOKEN abc\nREFERENCE_INSTANCE instance-1\nREFERENCE_READY\n";
+        validate_probe(valid, "abc", true).unwrap();
+        assert!(validate_probe(valid, "wrong", true).is_err());
+        assert!(validate_probe(&valid.replace("instance-1", "cold"), "abc", true).is_err());
+        assert!(
+            validate_probe(&(valid.to_string() + "REFERENCE_TOKEN abc\n"), "abc", true).is_err()
+        );
+        assert!(
+            validate_probe(
+                "REFERENCE_READY\nREFERENCE_TOKEN abc\nREFERENCE_INSTANCE instance-1\n",
+                "abc",
+                true
+            )
+            .is_err()
+        );
+        validate_probe(&valid.replace("instance-1", "cold"), "abc", false).unwrap();
+    }
     #[test]
     fn snapshot_detects_empty_directory_mode_and_symlink_changes() {
         let root = tempfile::tempdir().unwrap();
